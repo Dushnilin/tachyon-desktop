@@ -3021,7 +3021,7 @@
     if (typeof pendingBannerAction === 'function') pendingBannerAction();
   });
 
-  window.API.onCoreVersion(ver => {
+  function applyVersionBadges(ver) {
     if (!ver) return;
     const clean = String(ver).replace(/^v/i, '');
     if (coreVerBadge) coreVerBadge.textContent = 'v' + clean;
@@ -3031,7 +3031,11 @@
     if (ab) ab.textContent = 'v' + clean;
     const fc = $('#footerCoreVer');
     if (fc) fc.textContent = 'tachyon-core ' + clean;
-  });
+  }
+
+  applyVersionBadges(window.__tachyonVersion || window.TACHYON_CONFIG?.version);
+  window.API.onCoreVersion(ver => applyVersionBadges(ver));
+  window.API.requestCoreVersion?.();
 
   checkCoreUpdBtn?.addEventListener('click', () => {
     if (coreUpdStatus) coreUpdStatus.textContent = 'Проверка релизов Dushnilin/tachyon-desktop…';
@@ -3052,6 +3056,7 @@
     checkCoreUpdBtn?.classList.remove('is-busy');
     if (ev.type === 'available' && ev.info) {
       const { current, latest, size } = ev.info;
+      if (current) applyVersionBadges(current);
       const mb = size ? ` (${(size / (1024 * 1024)).toFixed(1)} МБ)` : '';
       if (coreUpdStatus) coreUpdStatus.textContent = `Доступна новая версия v${latest}${mb}`;
       if (installCoreUpdBtn) {
@@ -3061,8 +3066,8 @@
       if (installCoreUpdTxt) installCoreUpdTxt.textContent = `Обновить до v${latest}`;
 
       if (updBar && updText && updAction) {
-        updText.textContent = `Доступно обновление ядра tachyon-core v${latest} (установлено v${current})`;
-        updAction.textContent = 'Обновить ядро';
+        updText.textContent = `Доступно обновление Tachyon v${latest} (установлено v${current})`;
+        updAction.textContent = 'Обновить';
         updBar.hidden = false;
         pendingBannerAction = () => {
           updAction.textContent = 'Загрузка…';
@@ -3071,6 +3076,7 @@
       }
     } else if (ev.type === 'up-to-date') {
       const ver = ev.info?.current || '';
+      if (ver) applyVersionBadges(ver);
       if (coreUpdStatus) coreUpdStatus.textContent = `Установлена актуальная версия (v${ver})`;
       if (installCoreUpdBtn) installCoreUpdBtn.hidden = true;
       toast(`Tachyon v${ver} — установлена актуальная версия`);
@@ -3870,7 +3876,7 @@
   /* Экспорт и Импорт полной конфигурации в JSON */
   $('#exportConfigBtn')?.addEventListener('click', () => {
     const payload = {
-      version: '0.3.0',
+      version: window.__tachyonVersion || window.TACHYON_CONFIG?.version || '0.3.2',
       exportedAt: new Date().toISOString(),
       vpnPrefs,
       desyncPrefs,

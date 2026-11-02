@@ -8,5 +8,6 @@
 *.css text eol=lf
 *.html text eol=lf
 *.md text eol=lf
+*.patch text eol=lf
 *.ico binary
 *.dll binary

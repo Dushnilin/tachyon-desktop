@@ -1,0 +1,390 @@
+diff --git a/crates/core-runtime/src/clash_api.rs b/crates/core-runtime/src/clash_api.rs
+index 4483a05..68b1452 100644
+--- a/crates/core-runtime/src/clash_api.rs
++++ b/crates/core-runtime/src/clash_api.rs
+@@ -512,7 +512,7 @@ async fn handle_request(
+             respond_json(stream, 200, "OK", &body, &cors).await?;
+         }
+         Route::Configs => {
+-            return handle_configs(stream, method, &headers, api, &cors).await;
++            return handle_configs(stream, method, &headers, api, router, &cors).await;
+         }
+         Route::Providers => {
+             return handle_proxy_providers(stream, router, &cors).await;
+@@ -1160,12 +1160,13 @@ fn rules_view(router: &Router) -> Value {
+     json!({ "rules": rules })
+ }
+ 
+-/// `GET /configs` and `PATCH /configs {"log-level": "debug"}`.
++/// `GET /configs`, `PATCH /configs {"log-level": "debug"}`, and `PUT /configs {"path": "..."}`.
+ async fn handle_configs(
+     stream: &mut TcpStream,
+     method: &str,
+     headers: &[(String, String)],
+     api: &ClashApi,
++    router: &Arc<Router>,
+     cors: &[String],
+ ) -> std::io::Result<bool> {
+     match method {
+@@ -1243,8 +1244,98 @@ async fn handle_configs(
+             }
+             respond_no_content(stream, cors).await?;
+         }
+-        // The reference answers a config upload with 204 and changes nothing:
+-        // it has no reload path either.
++        "PUT" => {
++            let len: usize = header_get(headers, "content-length")
++                .and_then(|v| v.parse().ok())
++                .unwrap_or(0);
++            if len > 1024 * 1024 {
++                respond_json(stream, 400, "Bad Request", &bad_request(), cors).await?;
++                return Ok(false);
++            }
++            let mut body = vec![0u8; len];
++            if len > 0 && stream.read_exact(&mut body).await.is_err() {
++                return Ok(false);
++            }
++            if let Ok(value) = serde_json::from_slice::<Value>(&body) {
++                let path_opt = value
++                    .get("path")
++                    .and_then(Value::as_str)
++                    .filter(|s| !s.is_empty());
++                let payload_opt = value
++                    .get("payload")
++                    .and_then(Value::as_str)
++                    .filter(|s| !s.is_empty());
++                if path_opt.is_some() || payload_opt.is_some() {
++                    let raw = match (path_opt, payload_opt) {
++                        (_, Some(p)) => p.to_string(),
++                        (Some(path), None) => match std::fs::read_to_string(path) {
++                            Ok(r) => r,
++                            Err(err) => {
++                                respond_json(
++                                    stream,
++                                    400,
++                                    "Bad Request",
++                                    &json!({"message": format!("read {path}: {err}")}),
++                                    cors,
++                                )
++                                .await?;
++                                return Ok(true);
++                            }
++                        },
++                        _ => unreachable!(),
++                    };
++                    if let Err(err) = core_config::check_str(&raw) {
++                        respond_json(
++                            stream,
++                            400,
++                            "Bad Request",
++                            &json!({"message": format!("check: {err}")}),
++                            cors,
++                        )
++                        .await?;
++                        return Ok(true);
++                    }
++                    let new_root: Value = match serde_json::from_str(&raw) {
++                        Ok(v) => v,
++                        Err(err) => {
++                            respond_json(
++                                stream,
++                                400,
++                                "Bad Request",
++                                &json!({"message": format!("parse: {err}")}),
++                                cors,
++                            )
++                            .await?;
++                            return Ok(true);
++                        }
++                    };
++                    match crate::reload_router_in_place(router, &new_root).await {
++                        Ok(()) => {
++                            logging::info(format_args!(
++                                "clash-api: configuration hot-reloaded in-place without downtime"
++                            ));
++                            respond_no_content(stream, cors).await?;
++                            return Ok(true);
++                        }
++                        Err(err) => {
++                            logging::warn(format_args!(
++                                "clash-api: in-place hot reload rejected ({err:#})"
++                            ));
++                            respond_json(
++                                stream,
++                                400,
++                                "Bad Request",
++                                &json!({"message": format!("{err:#}")}),
++                                cors,
++                            )
++                            .await?;
++                            return Ok(true);
++                        }
++                    }
++                }
++            }
++            respond_no_content(stream, cors).await?;
++        }
+         _ => respond_no_content(stream, cors).await?,
+     }
+     Ok(true)
+diff --git a/crates/core-runtime/src/lib.rs b/crates/core-runtime/src/lib.rs
+index fbbc473..3139890 100644
+--- a/crates/core-runtime/src/lib.rs
++++ b/crates/core-runtime/src/lib.rs
+@@ -195,75 +195,9 @@ impl BoxInstance {
+             can_reload_in_place(&self.root, new_root),
+             "cannot reload in-place: inbounds, clash_api, netns, ntp or cache_file configuration changed"
+         );
+-        warn_unhonored_options(new_root);
+-
+-        // 1. Build and validate new router inner BEFORE mutating anything running
+-        let mut new_inner = self.router.build_inner_for_reload(new_root)?;
+-
+-        // 2. Build and validate new DNS service BEFORE mutating anything running
+-        let new_dns = dns::DnsService::build_with_registry(new_root, new_inner.rule_sets())
+-            .context("dns section")?;
+-
+-        // 3. Stage state inheritance, remote rule sets, and endpoints BEFORE swapping live state
+-        self.router.prepare_staging(&mut new_inner);
+-        let new_inner = Arc::new(new_inner);
+-        let staging_router = Router::stage_from_inner(Arc::clone(&new_inner));
+-        if let Some(service) = &new_dns {
+-            service.attach_cache(self.cache_file.clone());
+-            service.set_router(Arc::clone(&staging_router));
+-        }
+-        let stage_res: anyhow::Result<()> = async {
+-            new_inner
+-                .rule_sets()
+-                .start_remote(&staging_router, self.cache_file.clone())
+-                .await?;
+-            new_inner
+-                .start_endpoints()
+-                .await
+-                .map_err(anyhow::Error::from)?;
+-            Ok(())
+-        }
+-        .await;
+-        if let Err(err) = stage_res {
+-            for task in new_inner.take_probe_tasks() {
+-                task.abort();
+-            }
+-            return Err(err);
+-        }
+-
+-        // 4. Migrate active DNS cache, server addrs, reverse mappings, and fakeip pools
+-        if let (Some(new_svc), Some(old_svc)) = (&new_dns, &self.dns) {
+-            new_svc.migrate_from(old_svc);
+-        }
+-
+-        // 5. Atomically commit the staged router inner
+-        self.router.commit_staged(new_inner).await;
+-
+-        // 6. Connect DNS service to the live shared router and publish globally
+-        if let Some(service) = &new_dns {
+-            service.set_router(Arc::clone(&self.router));
+-        }
+-        dns::set_service(new_dns.clone());
+-        self.dns = new_dns;
+-
+-        // 7. Hot-apply log settings
+-        let log = new_root.get("log");
+-        let level = log.and_then(|l| l.get("level")).and_then(Value::as_str);
+-        let disabled = log
+-            .and_then(|l| l.get("disabled"))
+-            .and_then(Value::as_bool)
+-            .unwrap_or(false);
+-        if let Some(lvl) = level {
+-            logging::set_level(lvl);
+-        }
+-        logging::set_enabled(!disabled);
+-
++        reload_router_with_cache(&self.router, &self.cache_file, new_root).await?;
++        self.dns = dns::current();
+         self.root = new_root.clone();
+-        if let Some(sub_rt) = self.router.subscription_runtime() {
+-            let _ = sub_rt.reexpand(new_root);
+-        }
+-        // only a successful in-place swap moves the applied-config revision
+-        self.router.record_config(new_root);
+         Ok(())
+     }
+ 
+@@ -349,6 +283,95 @@ fn flush_cache(cache: &Option<cache_file::SharedCacheFile>) {
+     }
+ }
+ 
++/// Perform in-place hot reload against a live `Router` (used both by `BoxInstance::reload_in_place`
++/// and by Clash REST API `PUT /configs`).
++pub async fn reload_router_in_place(router: &Arc<Router>, new_root: &Value) -> anyhow::Result<()> {
++    if let Some(old_root) = router.live_root() {
++        anyhow::ensure!(
++            can_reload_in_place(&old_root, new_root),
++            "cannot reload in-place: inbounds, clash_api, netns, ntp or cache_file configuration changed"
++        );
++    }
++    let cache_file = router.cache_file();
++    reload_router_with_cache(router, &cache_file, new_root).await
++}
++
++async fn reload_router_with_cache(
++    router: &Arc<Router>,
++    cache_file: &Option<cache_file::SharedCacheFile>,
++    new_root: &Value,
++) -> anyhow::Result<()> {
++    warn_unhonored_options(new_root);
++
++    // 1. Build and validate new router inner BEFORE mutating anything running
++    let mut new_inner = router.build_inner_for_reload(new_root)?;
++
++    // 2. Build and validate new DNS service BEFORE mutating anything running
++    let new_dns = dns::DnsService::build_with_registry(new_root, new_inner.rule_sets())
++        .context("dns section")?;
++
++    // 3. Stage state inheritance, remote rule sets, and endpoints BEFORE swapping live state
++    router.prepare_staging(&mut new_inner);
++    let new_inner = Arc::new(new_inner);
++    let staging_router = Router::stage_from_inner(Arc::clone(&new_inner));
++    if let Some(service) = &new_dns {
++        service.attach_cache(cache_file.clone());
++        service.set_router(Arc::clone(&staging_router));
++    }
++    let stage_res: anyhow::Result<()> = async {
++        new_inner
++            .rule_sets()
++            .start_remote(&staging_router, cache_file.clone())
++            .await?;
++        new_inner
++            .start_endpoints()
++            .await
++            .map_err(anyhow::Error::from)?;
++        Ok(())
++    }
++    .await;
++    if let Err(err) = stage_res {
++        for task in new_inner.take_probe_tasks() {
++            task.abort();
++        }
++        return Err(err);
++    }
++
++    // 4. Migrate active DNS cache, server addrs, reverse mappings, and fakeip pools
++    let old_dns = dns::current();
++    if let (Some(new_svc), Some(old_svc)) = (&new_dns, &old_dns) {
++        new_svc.migrate_from(old_svc);
++    }
++
++    // 5. Atomically commit the staged router inner
++    router.commit_staged(new_inner).await;
++
++    // 6. Connect DNS service to the live shared router and publish globally
++    if let Some(service) = &new_dns {
++        service.set_router(Arc::clone(router));
++    }
++    dns::set_service(new_dns);
++
++    // 7. Hot-apply log settings
++    let log = new_root.get("log");
++    let level = log.and_then(|l| l.get("level")).and_then(Value::as_str);
++    let disabled = log
++        .and_then(|l| l.get("disabled"))
++        .and_then(Value::as_bool)
++        .unwrap_or(false);
++    if let Some(lvl) = level {
++        logging::set_level(lvl);
++    }
++    logging::set_enabled(!disabled);
++
++    if let Some(sub_rt) = router.subscription_runtime() {
++        let _ = sub_rt.reexpand(new_root);
++    }
++    // only a successful in-place swap moves the applied-config revision
++    router.record_config(new_root);
++    Ok(())
++}
++
+ impl Drop for BoxInstance {
+     fn drop(&mut self) {
+         self.shutdown();
+@@ -413,6 +436,7 @@ async fn start_inner(root: &Value, guard: &mut TaskGuard) -> anyhow::Result<BoxI
+     clash_mode::attach_store(cache_file.clone());
+     outbound::desync::attach_store(cache_file.clone());
+     let router = Router::new(root)?;
++    router.set_cache_file(cache_file.clone());
+     // remote rule sets fetch before the instance is up: a failed first fetch
+     // aborts the start, exactly like `RemoteRuleSet.StartContext`
+     router
+diff --git a/crates/core-runtime/src/route/mod.rs b/crates/core-runtime/src/route/mod.rs
+index 1d180cd..25b4fee 100644
+--- a/crates/core-runtime/src/route/mod.rs
++++ b/crates/core-runtime/src/route/mod.rs
+@@ -1037,12 +1037,14 @@ pub struct Router {
+     /// fingerprint. Lives on the router so it survives `commit_staged`, and
+     /// starts over on a fresh instance the way a restarted box starts over.
+     live_config: std::sync::Mutex<Option<LiveConfig>>,
++    cache_file: std::sync::Mutex<Option<crate::cache_file::SharedCacheFile>>,
+     subscription_rt: std::sync::RwLock<Option<Arc<crate::subscription::SubscriptionRuntime>>>,
+ }
+ 
+ struct LiveConfig {
+     revision: u64,
+     digest: String,
++    root: Value,
+ }
+ 
+ tokio::task_local! {
+@@ -1839,6 +1841,7 @@ impl Router {
+             inner: std::sync::RwLock::new(Arc::new(inner)),
+             self_weak: std::sync::OnceLock::new(),
+             live_config: std::sync::Mutex::new(None),
++            cache_file: std::sync::Mutex::new(None),
+             subscription_rt: std::sync::RwLock::new(Some(sub_rt)),
+         });
+         let _ = router.self_weak.set(Arc::downgrade(&router));
+@@ -1877,9 +1880,26 @@ impl Router {
+         *guard = Some(LiveConfig {
+             revision,
+             digest: crate::config_digest(root),
++            root: root.clone(),
+         });
+     }
+ 
++    pub fn live_root(&self) -> Option<Value> {
++        let guard = self.live_config.lock().unwrap_or_else(|e| e.into_inner());
++        guard.as_ref().map(|cfg| cfg.root.clone())
++    }
++
++    pub fn set_cache_file(&self, cache_file: Option<crate::cache_file::SharedCacheFile>) {
++        *self.cache_file.lock().unwrap_or_else(|e| e.into_inner()) = cache_file;
++    }
++
++    pub fn cache_file(&self) -> Option<crate::cache_file::SharedCacheFile> {
++        self.cache_file
++            .lock()
++            .unwrap_or_else(|e| e.into_inner())
++            .clone()
++    }
++
+     /// The applied-configuration view for `GET /tachyon/config-state`:
+     /// `ready` is false (revision 0, no digest) until the first record.
+     pub fn config_state(&self) -> serde_json::Value {
+@@ -2211,6 +2231,7 @@ impl Router {
+             inner: std::sync::RwLock::new(inner),
+             self_weak: std::sync::OnceLock::new(),
+             live_config: std::sync::Mutex::new(None),
++            cache_file: std::sync::Mutex::new(None),
+             subscription_rt: std::sync::RwLock::new(None),
+         });
+         let _ = router.self_weak.set(Arc::downgrade(&router));
+diff --git a/crates/core-runtime/src/tls_client.rs b/crates/core-runtime/src/tls_client.rs
+index 20fac46..a33f46b 100644
+--- a/crates/core-runtime/src/tls_client.rs
++++ b/crates/core-runtime/src/tls_client.rs
+@@ -1018,7 +1018,7 @@ pub(crate) fn parse_short_id(value: &str) -> Result<Vec<u8>, String> {
+ 
+ /// TLS wrap for runtime fetches without an explicit `tls` block: verified
+ /// against the embedded Mozilla root store.
+-pub(crate) async fn wrap_probe_stream<S>(stream: S, server_name: &str) -> io::Result<AnyStream>
++pub async fn wrap_probe_stream<S>(stream: S, server_name: &str) -> io::Result<AnyStream>
+ where
+     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+ {

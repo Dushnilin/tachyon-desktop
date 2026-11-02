@@ -415,8 +415,9 @@ fn main() {
     };
 
     let platform_init = format!(
-        "window.__tachyonPlatform = {:?};\n{}{}",
+        "window.__tachyonPlatform = {:?};\nwindow.__tachyonVersion = {:?};\n{}{}",
         current_platform_tag(),
+        env!("CARGO_PKG_VERSION"),
         migrated_js,
         INIT_BRIDGE_JS
     );

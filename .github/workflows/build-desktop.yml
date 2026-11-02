@@ -29,8 +29,13 @@ jobs:
       - name: Checkout tachyon-core
         uses: actions/checkout@v4
         with:
-          repository: Dushnilin/tachyon-core
+          repository: Dushnilin/tachyon-core-src
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
           path: tachyon-core
+
+      - name: Apply desktop runtime patch to tachyon-core
+        run: |
+          git -C tachyon-core apply --ignore-whitespace ../tachyon-desktop/desktop-rs/patches/tachyon-core-desktop.patch
 
       - name: Install WebKitGTK & GTK3 dependencies
         run: |
@@ -75,8 +80,13 @@ jobs:
       - name: Checkout tachyon-core
         uses: actions/checkout@v4
         with:
-          repository: Dushnilin/tachyon-core
+          repository: Dushnilin/tachyon-core-src
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
           path: tachyon-core
+
+      - name: Apply desktop runtime patch to tachyon-core
+        run: |
+          git -C tachyon-core apply --ignore-whitespace ../tachyon-desktop/desktop-rs/patches/tachyon-core-desktop.patch
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -111,8 +121,13 @@ jobs:
       - name: Checkout tachyon-core
         uses: actions/checkout@v4
         with:
-          repository: Dushnilin/tachyon-core
+          repository: Dushnilin/tachyon-core-src
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
           path: tachyon-core
+
+      - name: Apply desktop runtime patch to tachyon-core
+        run: |
+          git -C tachyon-core apply --ignore-whitespace ../tachyon-desktop/desktop-rs/patches/tachyon-core-desktop.patch
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
