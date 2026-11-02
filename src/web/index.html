@@ -7,7 +7,7 @@
   <link rel="icon" href="favicon.ico" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
@@ -53,6 +53,7 @@
     <symbol id="ic-code" viewBox="0 0 24 24"><path d="m8 8-4 4 4 4M16 8l4 4-4 4M13.5 6l-3 12"/></symbol>
     <symbol id="ic-ban" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m5.7 5.7 12.6 12.6"/></symbol>
     <symbol id="ic-ext" viewBox="0 0 24 24"><path d="M7 17 17 7M9 7h8v8"/></symbol>
+    <symbol id="ic-heart" viewBox="0 0 24 24"><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/></symbol>
   </defs></svg>
 
   <!-- ===== ЕДИНАЯ ШАПКА TACHYON + НАВИГАЦИЯ ===== -->
@@ -67,10 +68,10 @@
         </span>
         <div class="wordmark-stack">
           <div class="wordmark-line">
-            <span class="topbar__title">TACHYON</span>
+            <span class="topbar__title">Tachyon</span>
             <span class="topbar__ver">—</span>
           </div>
-          <span class="wordmark-sub">ЗАЩИТА СОЕДИНЕНИЯ</span>
+          <span class="wordmark-sub">Маршрутизация и обход DPI</span>
         </div>
       </div>
 
@@ -132,8 +133,6 @@
 
         <!-- Центральный блок: Тахионный реактор (_PowerDial из tachyon-proxy) -->
         <div class="hero" id="heroCard">
-          <canvas id="rainCanvas" class="hero-precip" aria-hidden="true"></canvas>
-
           <div class="hero__top">
             <div class="status-chip" id="statusChip">
               <span class="dot"></span>
@@ -158,7 +157,7 @@
                       <polygon points="13.8,1.8 12.4,10.2 11.4,13.4 9.5,22.2 19.8,10.6 13.5,10.6" fill="currentColor"/>
                     </svg>
                   </span>
-                  <span class="orb__live-rate" id="orbLiveRate">ГОТОВ</span>
+                  <span class="orb__live-rate" id="orbLiveRate">Готов</span>
                 </span>
               </button>
             </div>
@@ -193,9 +192,8 @@
         <div class="bento-row-2">
           <!-- Выходной узел (IP / Гео / Провайдер + спарклайн пинга) -->
           <div class="hairline-card exit-node-card" id="exitNodeCard">
-            <canvas id="pingSparklineCanvas" width="220" height="54" aria-hidden="true"></canvas>
             <div class="exit-node__head">
-              <span class="t-stat__lbl"><i class="dot dot--accent"></i>ВЫХОДНОЙ УЗЕЛ</span>
+              <span class="t-stat__lbl"><i class="dot dot--accent"></i>Выходной узел</span>
               <button type="button" class="mini-link-btn" id="refreshExitGeoBtn" title="Обновить внешний IP и геолокацию"><svg class="ic"><use href="#ic-refresh"/></svg><span>Проверить</span></button>
             </div>
             <div class="exit-node__main">
@@ -203,23 +201,24 @@
               <span class="tachyon-pill" id="exitNodeCc">IP</span>
             </div>
             <div class="exit-node__sub" id="exitNodeMeta">Нажмите «Проверить» или включите туннель</div>
+            <canvas id="pingSparklineCanvas" width="240" height="32" aria-hidden="true"></canvas>
           </div>
 
           <!-- Живая телеметрия трафика со спарклайном -->
           <div class="telemetry-card">
-            <canvas id="trafficChart" width="260" height="58" aria-hidden="true"></canvas>
             <div class="telemetry-grid telemetry-grid--2col">
               <div class="t-stat">
-                <span class="t-stat__lbl"><i class="dot dot--blue"></i>СКАЧАНО</span>
+                <span class="t-stat__lbl"><i class="dot dot--blue"></i>Приём</span>
                 <span class="t-stat__val"><b id="mDown">0.0</b> <small>МБ/с</small></span>
                 <span class="t-stat__sub">Всего: <b id="totalDown">0 КБ</b></span>
               </div>
               <div class="t-stat">
-                <span class="t-stat__lbl"><i class="dot dot--emerald"></i>ОТПРАВЛЕНО</span>
+                <span class="t-stat__lbl"><i class="dot dot--emerald"></i>Отдача</span>
                 <span class="t-stat__val"><b id="mUp">0.0</b> <small>МБ/с</small></span>
                 <span class="t-stat__sub">Всего: <b id="totalUp">0 КБ</b></span>
               </div>
             </div>
+            <canvas id="trafficChart" width="260" height="32" aria-hidden="true"></canvas>
             <div style="display:none"><span id="ipChip"><span id="ipText">TUN</span></span><span id="modeHint"></span></div>
           </div>
         </div>
@@ -228,7 +227,7 @@
         <div class="route-card">
           <div class="route-card__bar">
             <div class="route-card__head">
-              <span class="route-card__title">РЕЖИМ МАРШРУТИЗАЦИИ</span>
+              <span class="route-card__title">Режим маршрутизации</span>
               <button class="link-btn" id="openRoutingViewBtn" type="button"><span>Списки и Desync</span><svg class="ic"><use href="#ic-ext"/></svg></button>
             </div>
             <div class="seg seg--compact seg--routes" id="routeSwitch">
@@ -282,7 +281,7 @@
         <div class="connect-servers-dock hairline-card" id="connectServersDock">
           <div class="csd-head">
             <div class="csd-head__title">
-              <span class="t-stat__lbl"><i class="dot dot--accent"></i>СЕРВЕРЫ И ЛОКАЦИИ</span>
+              <span class="t-stat__lbl"><i class="dot dot--accent"></i>Серверы и локации</span>
               <span class="drawer__count" id="homeServerCountBadge">0</span>
             </div>
             <div class="csd-head__tools">
@@ -333,7 +332,7 @@
 
             <!-- 1. Автоматика и самообучение ядра -->
             <div class="desync-section">
-              <div class="desync-sec-title">АВТОМАТИКА ЯДРА (ADAPTIVE BRAIN)</div>
+              <div class="desync-sec-title">Автоматика ядра · AdaptiveBrain</div>
               <div class="desync-auto-list">
                 <label class="desync-switch-row">
                   <div class="desync-switch-row__txt">
@@ -361,7 +360,7 @@
 
             <!-- 2. Профиль / Пресет обхода -->
             <div class="desync-section">
-              <div class="desync-sec-title">ПРОФИЛЬ ОБХОДА (PRESET)</div>
+              <div class="desync-sec-title">Профиль обхода</div>
               <div class="preset-chips" id="desyncPresetsBar">
                 <button type="button" class="p-chip is-active" data-dpreset="auto" title="Автоматический выбор из 8 рецептов AdaptiveBrain под провайдера"><svg class="ic"><use href="#ic-bolt"/></svg><span>Авто (Adaptive)</span></button>
                 <button type="button" class="p-chip" data-dpreset="youtube_discord" title="Fake + Split по SLD + UDP Fake для голоса Discord и YouTube GGC"><svg class="ic"><use href="#ic-play"/></svg><span>YouTube + Discord</span></button>
@@ -379,7 +378,7 @@
 
             <!-- 3. Параметры TCP / TLS десинхронизации -->
             <div class="desync-section">
-              <div class="desync-sec-title">ПАРАМЕТРЫ TCP И TLS ФРАГМЕНТАЦИИ</div>
+              <div class="desync-sec-title">Параметры TCP и TLS фрагментации</div>
               <div class="desync-adv-grid">
                 <label class="d-field">
                   <span>Базовый метод TCP (mode)</span>
@@ -459,7 +458,7 @@
 
             <!-- 4. Параметры UDP / QUIC / Discord Voice -->
             <div class="desync-section">
-              <div class="desync-sec-title">UDP, QUIC И ГОЛОСОВЫЕ ПРОТОКОЛЫ (DISCORD VOICE / STUN / ИГРЫ)</div>
+              <div class="desync-sec-title">UDP, QUIC и голосовые протоколы</div>
               <div class="desync-auto-list">
                 <label class="desync-switch-row">
                   <div class="desync-switch-row__txt">
@@ -841,19 +840,19 @@
 
             <div class="speedtest-stats speedtest-stats--4" id="speedtestStatsBox">
               <div class="sp-metric">
-                <span>СКОРОСТЬ (Мбит/с)</span>
+                <span>Скорость, Мбит/с</span>
                 <b id="spMbpsVal">—</b>
               </div>
               <div class="sp-metric">
-                <span>ПИК (Мбит/с)</span>
+                <span>Пик, Мбит/с</span>
                 <b id="spPeakVal">—</b>
               </div>
               <div class="sp-metric">
-                <span>ПОТОК (МБ/с)</span>
+                <span>Поток, МБ/с</span>
                 <b id="spMbsVal">—</b>
               </div>
               <div class="sp-metric">
-                <span>ОТКЛИК (TTFB)</span>
+                <span>Отклик, TTFB</span>
                 <b id="spTtfbVal">—</b>
               </div>
             </div>
@@ -892,17 +891,13 @@
                 <div class="s-row">
                   <div class="s-row__txt">
                     <b>Цветовая тема</b>
-                    <small>Строгая графитовая (#0B0B0D) или чистая бумажная (#FAFAFA)</small>
+                    <small>Тёмная графитовая (#0B0B0D) или светлая бумажная (#F6F6F4)</small>
                   </div>
                   <div class="seg seg--compact" id="themeSelectSeg">
                     <button type="button" class="is-active" data-theme-val="dark">Тёмная</button>
                     <button type="button" data-theme-val="light">Светлая</button>
                   </div>
                 </div>
-                <label class="toggle">
-                  <span><b>Фоновые частицы</b><small>Атмосферный эффект на карточке реактора</small></span>
-                  <input type="checkbox" id="precipToggle"/><span class="track"></span>
-                </label>
               </div>
             </div>
 
@@ -989,6 +984,26 @@
                 </div>
                 <div class="core-upd__prog" id="coreUpdProgressWrap" hidden>
                   <div class="core-upd__bar" id="coreUpdProgressBar" style="width:0%"></div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Секция 5: Поддержка разработки -->
+            <div class="s-group">
+              <div class="s-group__title">Поддержка разработки</div>
+              <div class="s-card s-card--pad core-upd-card">
+                <div class="core-upd__row">
+                  <div class="core-upd__info">
+                    <div class="core-upd__title">
+                      <b>Развитие проекта Tachyon</b>
+                    </div>
+                    <small>Карты РФ / СБП (CloudTips), Boosty и криптовалюта</small>
+                  </div>
+                  <div class="core-upd__actions">
+                    <button class="btn-act btn-act--primary" id="openDonateBtn" type="button">
+                      <svg class="ic"><use href="#ic-heart"/></svg><span>Поддержать проект</span>
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>
@@ -1115,7 +1130,10 @@
                 <div class="checksum" id="selfCheckSum" hidden></div>
                 <div class="about-bar">
                   <span>Tachyon Core <b id="aboutVersion">—</b></span>
-                  <button class="link-btn" id="githubBtn" type="button"><span>GitHub</span><svg class="ic"><use href="#ic-ext"/></svg></button>
+                  <div class="about-bar__links">
+                    <button class="link-btn" id="aboutDonateBtn" type="button"><svg class="ic"><use href="#ic-heart"/></svg><span>Поддержать</span></button>
+                    <button class="link-btn" id="githubBtn" type="button"><span>GitHub</span><svg class="ic"><use href="#ic-ext"/></svg></button>
+                  </div>
                 </div>
               </div>
             </div>
@@ -1208,6 +1226,74 @@
     </div>
   </div>
 
+  <!-- Модальное окно поддержки проекта (Донат) -->
+  <div class="cmodal" id="donateModal" hidden>
+    <div class="cmodal__backdrop" id="donateBackdrop"></div>
+    <div class="cmodal__box cmodal__box--donate" role="dialog" aria-labelledby="donateModalTitle">
+      <div class="donate-head">
+        <div class="donate-head__title">
+          <span class="donate-head__icon"><svg class="ic"><use href="#ic-heart"/></svg></span>
+          <div>
+            <b id="donateModalTitle">Поддержать разработку</b>
+            <small>Если Tachyon делает вашу работу в сети комфортной</small>
+          </div>
+        </div>
+        <button type="button" class="btn-icon" id="donateCloseBtn" title="Закрыть"><svg class="ic"><use href="#ic-close"/></svg></button>
+      </div>
+
+      <div class="donate-links">
+        <button type="button" class="donate-link-card" data-donate-url="https://pay.cloudtips.ru/p/449c5ef9">
+          <div class="donate-link-card__txt">
+            <b>CloudTips · Карты РФ / СБП / T-Pay</b>
+            <small>Мгновенный перевод по СБП или банковской карте</small>
+          </div>
+          <svg class="ic"><use href="#ic-ext"/></svg>
+        </button>
+
+        <button type="button" class="donate-link-card" data-donate-url="https://boosty.to/tachyon">
+          <div class="donate-link-card__txt">
+            <b>Boosty · Подписка и донаты</b>
+            <small>Регулярная поддержка проекта и ранние сборки</small>
+          </div>
+          <svg class="ic"><use href="#ic-ext"/></svg>
+        </button>
+      </div>
+
+      <div class="donate-crypto">
+        <div class="donate-crypto__title">Криптовалюта (нажмите, чтобы скопировать адрес)</div>
+        <div class="donate-crypto__list">
+          <button type="button" class="donate-wallet" data-wallet-net="BTC" data-wallet-addr="bc1q9ehdv7y9g948jejyflkq7xmau3tytgunxgh35h">
+            <span class="donate-wallet__net">BTC</span>
+            <code class="donate-wallet__addr">bc1q9ehdv7y9g948jejyflkq7xmau3tytgunxgh35h</code>
+            <svg class="ic"><use href="#ic-copy"/></svg>
+          </button>
+          <button type="button" class="donate-wallet" data-wallet-net="ETH / ERC-20" data-wallet-addr="0x6CB7a4547eD62EF64990D5C6B5D9fdA58EB223E6">
+            <span class="donate-wallet__net">ETH</span>
+            <code class="donate-wallet__addr">0x6CB7a4547eD62EF64990D5C6B5D9fdA58EB223E6</code>
+            <svg class="ic"><use href="#ic-copy"/></svg>
+          </button>
+          <button type="button" class="donate-wallet" data-wallet-net="TON" data-wallet-addr="UQDPhLRjMz5KltDLACAT3YXXHDVEtIDOHky2i33ZIOtsMEoR">
+            <span class="donate-wallet__net">TON</span>
+            <code class="donate-wallet__addr">UQDPhLRjMz5KltDLACAT3YXXHDVEtIDOHky2i33ZIOtsMEoR</code>
+            <svg class="ic"><use href="#ic-copy"/></svg>
+          </button>
+          <button type="button" class="donate-wallet" data-wallet-net="SOL" data-wallet-addr="3csTGaNeU9KjhCKHEKAU3XLS5UfVjEeBVhXihpsETZwh">
+            <span class="donate-wallet__net">SOL</span>
+            <code class="donate-wallet__addr">3csTGaNeU9KjhCKHEKAU3XLS5UfVjEeBVhXihpsETZwh</code>
+            <svg class="ic"><use href="#ic-copy"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="donate-foot">
+        <button type="button" class="link-btn" data-donate-url="https://t.me/tachyon_proxy">
+          <svg class="ic"><use href="#ic-chat"/></svg><span>Telegram-канал @tachyon_proxy</span><svg class="ic"><use href="#ic-ext"/></svg>
+        </button>
+        <button type="button" class="btn-act btn-act--sm" id="donateDoneBtn">Закрыть</button>
+      </div>
+    </div>
+  </div>
+
   <div class="toast" id="toast"></div>
 
   <!-- Модальные окна подтверждения и ввода -->
@@ -1236,7 +1322,6 @@
 
   <script src="config.js"></script>
   <script src="api.js"></script>
-  <script src="rain.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

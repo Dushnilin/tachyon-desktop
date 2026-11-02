@@ -130,3 +130,21 @@ chmod +x desktop-rs/scripts/package-macos.sh
 - [**Dushnilin/tachyon-core**](https://github.com/Dushnilin/tachyon-core) — высокопроизводительное Pure-Rust ядро маршрутизации, проксирования и обхода DPI (`AdaptiveBrain`).
 - [**Dushnilin/tachyon-proxy**](https://github.com/Dushnilin/tachyon-proxy) — нативный Android-клиент Tachyon (`Flutter` + `Kotlin VpnService` + `tachyon-core`).
 - [**Dushnilin/tachyon-lists**](https://github.com/Dushnilin/tachyon-lists) — автоматически обновляемый каталог бинарных гео-баз и списков маршрутизации (`.trs`).
+
+---
+
+## 💖 Поддержать разработку
+
+Если Tachyon помогает вам и делает работу в сети комфортной, вы можете поддержать проект и автора! ☕ 🧀 🌭
+
+⭐ **Boosty (подписки, донаты, эксклюзив):**  
+👉 [**Поддержать на Boosty**](https://boosty.to/tachyon)
+
+💳 **Карты РФ / СБП / Tinkoff Pay:**  
+👉 [**Поддержать проект на CloudTips**](https://pay.cloudtips.ru/p/449c5ef9)
+
+🪙 **Криптовалюта:**
+* **Bitcoin (BTC):** `bc1q9ehdv7y9g948jejyflkq7xmau3tytgunxgh35h`
+* **Ethereum (ETH / ERC-20):** `0x6CB7a4547eD62EF64990D5C6B5D9fdA58EB223E6`
+* **TON:** `UQDPhLRjMz5KltDLACAT3YXXHDVEtIDOHky2i33ZIOtsMEoR`
+* **Solana (SOL):** `3csTGaNeU9KjhCKHEKAU3XLS5UfVjEeBVhXihpsETZwh`

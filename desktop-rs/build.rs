@@ -80,6 +80,7 @@ fn main() {
     writeln!(f, "    match key {{").unwrap();
 
     for (rel, abs) in &files {
+        println!("cargo:rerun-if-changed={}", abs.display());
         let abs_escaped = abs.to_string_lossy().replace('\\', "/");
         let mime = mime_for(rel);
         writeln!(

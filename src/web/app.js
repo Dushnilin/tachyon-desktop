@@ -135,18 +135,7 @@
     });
   });
 
-  const precipToggle = $('#precipToggle');
-  if (precipToggle) {
-    precipToggle.checked = localStorage.getItem('tachyon.precip') === '1';
-    if (precipToggle.checked) window.Sky?.set('snow');
-    precipToggle.addEventListener('change', () => {
-      const on = precipToggle.checked;
-      try { localStorage.setItem('tachyon.precip', on ? '1' : '0'); } catch {}
-      window.Sky?.set(on ? 'snow' : 'none');
-    });
-  }
-
-  /* ---------- Тема оформления (исключительно Dark Mode) ---------- */
+  /* ---------- Тема оформления ---------- */
   document.documentElement.dataset.theme = 'dark';
   try { localStorage.setItem('tachyon.theme', 'dark'); } catch {}
 
@@ -2798,17 +2787,17 @@
       statusChip?.classList.add('is-connecting');
       if (statusText) statusText.textContent = 'Подключение…';
       if (orbLabel) orbLabel.textContent = 'Установка защищённого канала… Нажмите для отмены';
-      if (liveRateEl) { liveRateEl.hidden = false; liveRateEl.textContent = 'ПОДКЛ…'; }
+      if (liveRateEl) { liveRateEl.hidden = false; liveRateEl.textContent = 'Канал…'; }
     } else if (st === 'on') {
       orb?.classList.add('is-on');
       statusChip?.classList.add('is-on');
       heroCard?.classList.add('is-on');
       const isDesyncOnly = vpnPrefs.route === 'desync-only' || !activeServer();
       if (statusText) statusText.textContent = isDesyncOnly ? 'Desync активен' : 'Защищено';
-      if (orbLabel) orbLabel.textContent = 'Активно · Нажмите для откл.';
+      if (orbLabel) orbLabel.textContent = 'Активно · Нажмите для отключения';
       $('#ipChip')?.classList.add('is-on');
       $('#ipText').textContent = isDesyncOnly ? 'DPI Bypass' : 'IP скрыт';
-      if (liveRateEl) { liveRateEl.hidden = false; liveRateEl.textContent = 'ЗАЩИЩЕНО'; }
+      if (liveRateEl) { liveRateEl.hidden = false; liveRateEl.textContent = 'Активно'; }
       triggerReactorShockwave();
       setTimeout(() => refreshExitNodeInfo(), 900);
     } else {
@@ -2816,7 +2805,7 @@
       if (orbLabel) orbLabel.textContent = 'Нажмите для включения защиты';
       $('#ipChip')?.classList.remove('is-on');
       $('#ipText').textContent = 'TUN · Rust';
-      if (liveRateEl) { liveRateEl.hidden = false; liveRateEl.textContent = 'ГОТОВ'; }
+      if (liveRateEl) { liveRateEl.hidden = false; liveRateEl.textContent = 'Готов'; }
     }
   }
 
@@ -2985,9 +2974,16 @@
       ctx.fill();
     };
 
-    drawArea(histD, '#60a5fa', 'rgba(96, 165, 250, 0.16)');
-    drawArea(histU, '#34d399', 'rgba(52, 211, 153, 0.14)');
+    const isLight = document.documentElement.dataset.theme === 'light';
+    const downStroke = isLight ? '#5440C4' : '#B9A8FF';
+    const downFill = isLight ? 'rgba(84, 64, 196, 0.10)' : 'rgba(185, 168, 255, 0.10)';
+    const upStroke = isLight ? '#1F7A4C' : '#4CC38A';
+    const upFill = isLight ? 'rgba(31, 122, 76, 0.10)' : 'rgba(76, 195, 138, 0.10)';
+
+    drawArea(histD, downStroke, downFill);
+    drawArea(histU, upStroke, upFill);
   }
+  drawChart();
 
   /* ---------- Диагностика и Логи ---------- */
   $('#openLogBtnCore')?.addEventListener('click', () => window.API.openLog());
@@ -3117,6 +3113,46 @@
 
   $('#githubBtn')?.addEventListener('click', () => {
     window.API.openExternal('https://github.com/Dushnilin/tachyon-desktop');
+  });
+
+  const donateModal = $('#donateModal');
+  const openDonateModal = () => {
+    if (donateModal) donateModal.hidden = false;
+  };
+  const closeDonateModal = () => {
+    if (donateModal) donateModal.hidden = true;
+  };
+  $('#openDonateBtn')?.addEventListener('click', openDonateModal);
+  $('#aboutDonateBtn')?.addEventListener('click', openDonateModal);
+  $('#donateCloseBtn')?.addEventListener('click', closeDonateModal);
+  $('#donateDoneBtn')?.addEventListener('click', closeDonateModal);
+  $('#donateBackdrop')?.addEventListener('click', closeDonateModal);
+
+  donateModal?.addEventListener('click', async e => {
+    const urlBtn = e.target.closest('[data-donate-url]');
+    if (urlBtn) {
+      const url = urlBtn.getAttribute('data-donate-url');
+      if (url) window.API.openExternal(url);
+      return;
+    }
+    const walletBtn = e.target.closest('[data-wallet-addr]');
+    if (walletBtn) {
+      const addr = walletBtn.getAttribute('data-wallet-addr') || '';
+      const net = walletBtn.getAttribute('data-wallet-net') || '';
+      if (!addr) return;
+      try {
+        await navigator.clipboard.writeText(addr);
+        toast(`Адрес ${net} скопирован в буфер обмена`);
+      } catch (_) {
+        toast('Не удалось скопировать адрес', true);
+      }
+    }
+  });
+
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && donateModal && !donateModal.hidden) {
+      closeDonateModal();
+    }
   });
 
   $('#selfCheckBtn')?.addEventListener('click', () => {
@@ -3736,6 +3772,7 @@
     if (qIcon) qIcon.setAttribute('href', t === 'light' ? '#ic-moon' : '#ic-sun');
     window.API.setTheme(t);
     drawPingSparkline();
+    drawChart();
   }
 
   $$('#themeSelectSeg button[data-theme-val]').forEach(btn => {
