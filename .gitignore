@@ -5,6 +5,7 @@ dist/
 *.pdb
 
 # IDE & OS
+.agents/
 .vs/
 .vscode/
 .idea/

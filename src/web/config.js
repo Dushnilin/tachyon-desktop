@@ -2,7 +2,7 @@
    Tachyon Client – Конфигурация приложения
    ============================================================ */
 window.TACHYON_CONFIG = {
-  version: "0.3.0",
+  version: "0.3.2",
   core: "tachyon-core (pure-Rust)",
   github: "https://github.com/Dushnilin/tachyon-desktop",
 

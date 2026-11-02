@@ -3071,18 +3071,19 @@
       }
     } else if (ev.type === 'up-to-date') {
       const ver = ev.info?.current || '';
-      if (coreUpdStatus) coreUpdStatus.textContent = `Установлена актуальная версия ядра (v${ver})`;
+      if (coreUpdStatus) coreUpdStatus.textContent = `Установлена актуальная версия (v${ver})`;
       if (installCoreUpdBtn) installCoreUpdBtn.hidden = true;
-      toast(`Ядро tachyon-core v${ver} актуально`);
+      toast(`Tachyon v${ver} — установлена актуальная версия`);
     } else if (ev.type === 'progress') {
       if (coreUpdProgressWrap) coreUpdProgressWrap.hidden = false;
       if (coreUpdProgressBar) coreUpdProgressBar.style.width = `${ev.percent}%`;
-      if (coreUpdStatus) coreUpdStatus.textContent = `Обновление tachyon-core… ${ev.percent}%`;
+      if (coreUpdStatus) coreUpdStatus.textContent = `Загрузка обновления… ${ev.percent}%`;
       if (updBar && !updBar.hidden && updAction) {
         updAction.textContent = `${ev.percent}%`;
       }
     } else if (ev.type === 'done') {
       const newVer = ev.info?.version || '';
+      const restarting = !!ev.info?.restarting;
       if (coreUpdProgressWrap) coreUpdProgressWrap.hidden = true;
       if (installCoreUpdBtn) installCoreUpdBtn.hidden = true;
       if (updBar) updBar.hidden = true;
@@ -3093,14 +3094,18 @@
         const ab = $('#aboutVersion');
         if (ab) ab.textContent = 'v' + newVer;
       }
-      if (coreUpdStatus) coreUpdStatus.textContent = `Ядро успешно обновлено до v${newVer}`;
-      toast(`Движок tachyon-core обновлён до v${newVer}!`);
+      if (coreUpdStatus) {
+        coreUpdStatus.textContent = restarting
+          ? `Обновлено до v${newVer} — перезапуск приложения…`
+          : `Успешно обновлено до v${newVer}`;
+      }
+      toast(restarting ? `Обновлено до v${newVer}! Перезапуск…` : `Tachyon обновлён до v${newVer}!`);
     } else if (ev.type === 'error') {
       if (coreUpdProgressWrap) coreUpdProgressWrap.hidden = true;
       if (installCoreUpdBtn) installCoreUpdBtn.disabled = false;
       if (installCoreUpdTxt) installCoreUpdTxt.textContent = 'Повторить';
       if (coreUpdStatus) coreUpdStatus.textContent = 'Ошибка: ' + (ev.message || 'Сбой обновления');
-      toast('Ошибка обновления ядра: ' + (ev.message || ''), true);
+      toast('Ошибка обновления: ' + (ev.message || ''), true);
     }
   });
 

@@ -187,7 +187,24 @@ pub async fn fetch_url(
     proxy_port: Option<u16>,
     timeout: Duration,
 ) -> io::Result<HttpResponse> {
-    let mut current = Url::parse(raw_url)?;
+    fetch_url_with_progress(raw_url, method, extra_headers, body, proxy_port, timeout, |_, _| {}).await
+}
+
+pub async fn fetch_url_with_progress<F>(
+    raw_url: &str,
+    method: &str,
+    extra_headers: &[(&str, &str)],
+    body: Option<&[u8]>,
+    proxy_port: Option<u16>,
+    timeout: Duration,
+    mut on_progress: F,
+) -> io::Result<HttpResponse>
+where
+    F: FnMut(usize, Option<usize>),
+{
+    let initial_url = Url::parse(raw_url)?;
+    let initial_host = initial_url.host.clone();
+    let mut current = initial_url;
     let mut cur_method = method.to_string();
     let mut cur_body = body.map(|b| b.to_vec());
 
@@ -206,7 +223,11 @@ pub async fn fetch_url(
             current.authority()
         );
         let mut has_ua = false;
+        let same_host = current.host.eq_ignore_ascii_case(&initial_host);
         for (k, v) in extra_headers {
+            if !same_host && k.eq_ignore_ascii_case("authorization") {
+                continue;
+            }
             if k.eq_ignore_ascii_case("user-agent") {
                 has_ua = true;
             }
@@ -261,8 +282,10 @@ pub async fn fetch_url(
             if len > max_bytes {
                 return Err(io::Error::other("HTTP body too large"));
             }
+            on_progress(leftover.len(), Some(len));
+            let mut last_tick = Instant::now();
             while leftover.len() < len {
-                let mut tmp = [0u8; 8192];
+                let mut tmp = [0u8; 16384];
                 let to_read = (len - leftover.len()).min(tmp.len());
                 let n = tokio::time::timeout(timeout, stream.read(&mut tmp[..to_read]))
                     .await
@@ -271,15 +294,27 @@ pub async fn fetch_url(
                     break;
                 }
                 leftover.extend_from_slice(&tmp[..n]);
+                if last_tick.elapsed() >= Duration::from_millis(120) {
+                    on_progress(leftover.len(), Some(len));
+                    last_tick = Instant::now();
+                }
             }
             leftover.truncate(len);
+            on_progress(leftover.len(), Some(len));
             leftover
         } else {
-            let mut tmp = [0u8; 8192];
+            let mut tmp = [0u8; 16384];
+            let mut last_tick = Instant::now();
             while leftover.len() < max_bytes {
                 match tokio::time::timeout(timeout, stream.read(&mut tmp)).await {
                     Ok(Ok(0)) => break,
-                    Ok(Ok(n)) => leftover.extend_from_slice(&tmp[..n]),
+                    Ok(Ok(n)) => {
+                        leftover.extend_from_slice(&tmp[..n]);
+                        if last_tick.elapsed() >= Duration::from_millis(120) {
+                            on_progress(leftover.len(), None);
+                            last_tick = Instant::now();
+                        }
+                    }
                     Ok(Err(e)) => return Err(e),
                     Err(_) => break,
                 }

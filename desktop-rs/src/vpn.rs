@@ -17,7 +17,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::http::{clash_api_request, fetch_url, run_speedtest_stream};
+use crate::http::{clash_api_request, fetch_url, fetch_url_with_progress, run_speedtest_stream};
 
 pub const API_PORT: u16 = 9090;
 pub const PROXY_PORT: u16 = 7897;
@@ -2413,7 +2413,15 @@ impl VpnManager {
             return;
         }
 
-        self.emit("core-update:progress:35");
+        let target_exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                self.emit(format!("core-update:error:Не удалось определить путь: {e}"));
+                return;
+            }
+        };
+
+        self.emit("core-update:progress:15");
         let mut headers = vec![
             ("Accept", "application/octet-stream"),
             ("User-Agent", "Tachyon-Desktop-Updater/1.0"),
@@ -2426,24 +2434,36 @@ impl VpnManager {
             headers.push(("Authorization", auth.as_str()));
         }
 
-        let dl_res = match fetch_url(
+        let expected_size = rel.asset_size as usize;
+        let send_prog = self.send_js.clone();
+        let report_dl = move |got: usize, total_opt: Option<usize>| {
+            let total = total_opt.unwrap_or(expected_size);
+            if total > 0 {
+                let pct = 15 + ((got.saturating_mul(75)) / total).min(75);
+                (send_prog)(format!("core-update:progress:{pct}"));
+            }
+        };
+
+        let dl_res = match fetch_url_with_progress(
             &rel.download_url,
             "GET",
             &headers,
             None,
             pport,
             Duration::from_secs(180),
+            &report_dl,
         )
         .await
         {
             Ok(r) if (200..300).contains(&r.status) => Ok(r.body),
-            Ok(_) | Err(_) if pport.is_some() => fetch_url(
+            Ok(_) | Err(_) if pport.is_some() => fetch_url_with_progress(
                 &rel.download_url,
                 "GET",
                 &headers,
                 None,
                 None,
                 Duration::from_secs(180),
+                &report_dl,
             )
             .await
             .and_then(|r| {
@@ -2470,12 +2490,20 @@ impl VpnManager {
             return;
         }
 
-        self.emit("core-update:progress:85");
-        match apply_self_binary_update(&bytes, &rel.asset_name) {
-            Ok(()) => {
+        self.emit("core-update:progress:92");
+        match apply_self_binary_update(&target_exe, &bytes, &rel.asset_name) {
+            Ok(replaced_in_place) => {
                 self.emit("core-update:progress:100");
-                let payload = json!({ "version": rel.version });
+                let payload = json!({
+                    "version": rel.version,
+                    "restarting": replaced_in_place
+                });
                 self.emit(format!("core-update:done:{payload}"));
+                if replaced_in_place {
+                    self.disconnect().await;
+                    tokio::time::sleep(Duration::from_millis(900)).await;
+                    schedule_relaunch_and_exit(&target_exe);
+                }
             }
             Err(e) => {
                 self.emit(format!("core-update:error:{e}"));
@@ -2513,7 +2541,6 @@ fn is_newer_semver(candidate: &str, current: &str) -> bool {
 async fn fetch_latest_github_release(proxy_port: Option<u16>) -> Result<GithubReleaseInfo, String> {
     let endpoints = [
         "https://api.github.com/repos/Dushnilin/tachyon-desktop/releases/latest",
-        "https://api.github.com/repos/Dushnilin/tachyon-core/releases/latest",
     ];
 
     let mut headers = vec![
@@ -2682,8 +2709,7 @@ fn score_release_asset_for_current_os(name: &str) -> i32 {
     }
 }
 
-fn apply_self_binary_update(bytes: &[u8], asset_name: &str) -> Result<(), String> {
-    let exe_path = std::env::current_exe().map_err(|e| format!("Не удалось определить путь: {e}"))?;
+fn apply_self_binary_update(exe_path: &Path, bytes: &[u8], asset_name: &str) -> Result<bool, String> {
     let lower = asset_name.to_ascii_lowercase();
 
     #[cfg(target_os = "windows")]
@@ -2694,13 +2720,13 @@ fn apply_self_binary_update(bytes: &[u8], asset_name: &str) -> Result<(), String
             let _ = fs::remove_file(&old_path);
             fs::write(&tmp_path, bytes)
                 .map_err(|e| format!("Не удалось записать обновление: {e}"))?;
-            fs::rename(&exe_path, &old_path)
+            fs::rename(exe_path, &old_path)
                 .map_err(|e| format!("Не удалось переименовать текущий исполняемый файл: {e}"))?;
-            if let Err(e) = fs::rename(&tmp_path, &exe_path) {
-                let _ = fs::rename(&old_path, &exe_path);
+            if let Err(e) = fs::rename(&tmp_path, exe_path) {
+                let _ = fs::rename(&old_path, exe_path);
                 return Err(format!("Не удалось заменить исполняемый файл: {e}"));
             }
-            return Ok(());
+            return Ok(true);
         }
     }
 
@@ -2711,8 +2737,8 @@ fn apply_self_binary_update(bytes: &[u8], asset_name: &str) -> Result<(), String
             let tmp_path = exe_path.with_extension("new");
             if fs::write(&tmp_path, bytes).is_ok() {
                 let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o755));
-                if fs::rename(&tmp_path, &exe_path).is_ok() {
-                    return Ok(());
+                if fs::rename(&tmp_path, exe_path).is_ok() {
+                    return Ok(true);
                 }
                 let _ = fs::remove_file(&tmp_path);
             }
@@ -2732,7 +2758,7 @@ fn apply_self_binary_update(bytes: &[u8], asset_name: &str) -> Result<(), String
                 .map_err(|e| format!("Ошибка pkexec при обновлении: {e}"))?;
             let _ = fs::remove_file(&staged);
             if status.success() {
-                return Ok(());
+                return Ok(true);
             }
             return Err("Не удалось обновить системный бинарный файл (отказ pkexec)".to_string());
         }
@@ -2754,9 +2780,9 @@ fn apply_self_binary_update(bytes: &[u8], asset_name: &str) -> Result<(), String
             fs::write(&tmp_path, bytes)
                 .map_err(|e| format!("Не удалось записать обновление: {e}"))?;
             let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o755));
-            fs::rename(&tmp_path, &exe_path)
+            fs::rename(&tmp_path, exe_path)
                 .map_err(|e| format!("Не удалось обновить Tachyon.app: {e}"))?;
-            return Ok(());
+            return Ok(true);
         }
     }
 
@@ -2770,7 +2796,32 @@ fn apply_self_binary_update(bytes: &[u8], asset_name: &str) -> Result<(), String
     };
     let dest = updates_dir.join(safe_name);
     fs::write(&dest, bytes).map_err(|e| format!("Не удалось сохранить пакет обновления: {e}"))?;
-    Ok(())
+    Ok(false)
+}
+
+fn schedule_relaunch_and_exit(target_exe: &Path) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        let cmd_str = format!(
+            "ping 127.0.0.1 -n 2 > nul & start \"\" \"{}\"",
+            target_exe.display()
+        );
+        let _ = Command::new("cmd")
+            .args(["/C", &cmd_str])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let escaped = target_exe.to_string_lossy().replace('\'', "'\\''");
+        let _ = Command::new("sh")
+            .args(["-c", &format!("sleep 1 && exec '{escaped}'")])
+            .spawn();
+    }
+
+    std::process::exit(0);
 }
 
 async fn probe_proxy_delay(secret: &str) -> Option<u64> {
