@@ -1,0 +1,173 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1200" height="390" viewBox="0 0 1200 390"
+     role="img" aria-labelledby="title desc">
+  <title id="title">tachyon-desktop — Нативный кроссплатформенный клиент VPN и обхода DPI (Windows, Linux, macOS)</title>
+  <desc id="desc">Шапка репозитория tachyon-desktop: десктопный клиент на чистом Rust (Wry/Tao + встроенное ядро tachyon-core) с поддержкой VLESS REALITY, XHTTP, Hysteria2, TUIC, AmneziaWG и самообучающегося пакетного десинка ТСПУ AdaptiveBrain.</desc>
+
+  <defs>
+    <pattern id="dotGrid" width="28" height="28" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1" fill="#26262B" opacity="0.65"/>
+    </pattern>
+    <linearGradient id="cardEdge" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#B9A8FF" stop-opacity="0.45"/>
+      <stop offset="50%" stop-color="#26262B" stop-opacity="0.9"/>
+      <stop offset="100%" stop-color="#6FD08C" stop-opacity="0.35"/>
+    </linearGradient>
+    <linearGradient id="sparkFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#6FD08C" stop-opacity="0.28"/>
+      <stop offset="100%" stop-color="#6FD08C" stop-opacity="0.0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Main Canvas -->
+  <rect width="1200" height="390" rx="24" fill="#0B0B0D"/>
+  <rect width="1200" height="390" rx="24" fill="url(#dotGrid)"/>
+  <rect x="1" y="1" width="1198" height="388" rx="23" fill="none" stroke="#26262B" stroke-width="2"/>
+
+  <!-- Left Column: Brand & Architecture Summary -->
+  <g transform="translate(64, 56)">
+    <!-- Eyebrow Pill -->
+    <rect x="0" y="0" width="352" height="30" rx="15" fill="#141417" stroke="#26262B" stroke-width="1"/>
+    <circle cx="16" cy="15" r="4" fill="#6FD08C"/>
+    <text x="30" y="20"
+          font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+          font-size="12" font-weight="600" letter-spacing="1.2" fill="#A8A8AD">WINDOWS · LINUX · MACOS · PURE RUST</text>
+
+    <!-- Repository Title -->
+    <text x="0" y="88"
+          font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Roboto, Helvetica, Arial, sans-serif"
+          font-size="54" font-weight="800" letter-spacing="-1.2" fill="#F2F2F3">tachyon-desktop</text>
+
+    <!-- Subtitle -->
+    <text x="0" y="128"
+          font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Roboto, Helvetica, Arial, sans-serif"
+          font-size="18.5" font-weight="400" fill="#A8A8AD">Нативный десктопный клиент проксирования и обхода DPI</text>
+    <text x="0" y="154"
+          font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Roboto, Helvetica, Arial, sans-serif"
+          font-size="18.5" font-weight="400" fill="#A8A8AD">со встроенным ядром <tspan fill="#F2F2F3" font-weight="600">tachyon-core</tspan> и самообучением <tspan fill="#E5C07B" font-weight="600">AdaptiveBrain</tspan></text>
+
+    <!-- Protocol & Stack Chips -->
+    <g transform="translate(0, 186)">
+      <rect x="0" y="0" width="150" height="32" rx="8" fill="#2A2440" stroke="#B9A8FF" stroke-opacity="0.45"/>
+      <text x="75" y="21" text-anchor="middle"
+            font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+            font-size="13" font-weight="600" fill="#B9A8FF">VLESS · REALITY</text>
+
+      <rect x="160" y="0" width="166" height="32" rx="8" fill="#141417" stroke="#26262B"/>
+      <text x="243" y="21" text-anchor="middle"
+            font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+            font-size="13" font-weight="600" fill="#F2F2F3">Hy2 · TUIC · AWG</text>
+
+      <rect x="336" y="0" width="174" height="32" rx="8" fill="#141417" stroke="#26262B"/>
+      <text x="423" y="21" text-anchor="middle"
+            font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+            font-size="13" font-weight="600" fill="#F2F2F3">Wintun · TUN · utun</text>
+
+      <rect x="520" y="0" width="144" height="32" rx="8" fill="#292218" stroke="#E5C07B" stroke-opacity="0.45"/>
+      <text x="592" y="21" text-anchor="middle"
+            font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+            font-size="13" font-weight="600" fill="#E5C07B">DPI Desync L1-L3</text>
+    </g>
+
+    <!-- Technical Metadata -->
+    <g transform="translate(0, 248)">
+      <line x1="0" y1="0" x2="664" y2="0" stroke="#26262B" stroke-width="1"/>
+      <text x="0" y="26"
+            font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+            font-size="13.5" fill="#70707A">FakeIP 198.18.0.0/15   ·   Multi-Hop Detour   ·   Sing-Box .trs   ·   Single Binary</text>
+    </g>
+  </g>
+
+  <!-- Right Column: Desktop Window Preview Card -->
+  <g transform="translate(756, 30)">
+    <rect x="0" y="0" width="388" height="330" rx="18" fill="#141417" stroke="url(#cardEdge)" stroke-width="1.5"/>
+
+    <!-- Window Titlebar -->
+    <rect x="14" y="12" width="22" height="22" rx="6" fill="#2A2440" stroke="#B9A8FF" stroke-opacity="0.45"/>
+    <path d="M26.5 16L21 23.5h4l-1 5.5 5.5-7.5h-4L26.5 16z" fill="#B9A8FF"/>
+    <text x="44" y="27"
+          font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+          font-size="12" font-weight="800" letter-spacing="1.4" fill="#F2F2F3">TACHYON</text>
+    <rect x="116" y="15" width="40" height="16" rx="5" fill="#1E1E22" stroke="#26262B"/>
+    <text x="136" y="26" text-anchor="middle"
+          font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+          font-size="10" font-weight="600" fill="#A8A8AD">0.3.0</text>
+
+    <!-- Window Buttons -->
+    <g transform="translate(324, 18)" stroke="#70707A" stroke-width="1.4" stroke-linecap="round">
+      <line x1="0" y1="5" x2="8" y2="5"/>
+      <rect x="20" y="1" width="8" height="8" rx="1.5" fill="none"/>
+      <line x1="40" y1="1" x2="48" y2="9"/>
+      <line x1="48" y1="1" x2="40" y2="9"/>
+    </g>
+    <line x1="0" y1="44" x2="388" y2="44" stroke="#26262B" stroke-width="1"/>
+
+    <!-- Active Tunnel Header -->
+    <rect x="18" y="56" width="164" height="24" rx="7" fill="#192B20"/>
+    <circle cx="30" cy="68" r="3.5" fill="#6FD08C"/>
+    <text x="40" y="72"
+          font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+          font-size="11" font-weight="700" fill="#6FD08C">ЗАЩИЩЕНО · TUN</text>
+
+    <text x="370" y="72" text-anchor="end"
+          font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+          font-size="12.5" font-weight="600" fill="#A8A8AD">02:18:45</text>
+
+    <!-- Reactor Ring + Active Node -->
+    <g transform="translate(18, 92)">
+      <rect x="0" y="0" width="352" height="82" rx="14" fill="#0B0B0D" stroke="#26262B"/>
+      <circle cx="42" cy="41" r="24" fill="#141417" stroke="#6FD08C" stroke-width="2" stroke-opacity="0.75"/>
+      <circle cx="42" cy="41" r="17" fill="#192B20"/>
+      <!-- Power Symbol -->
+      <path d="M42 30v10M35.5 34.5a10 10 0 1 0 13 0" fill="none" stroke="#6FD08C" stroke-width="2" stroke-linecap="round"/>
+
+      <text x="80" y="30"
+            font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Roboto, sans-serif"
+            font-size="15" font-weight="700" fill="#F2F2F3">Финляндия · Helsinki #1</text>
+      <text x="80" y="50"
+            font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+            font-size="12" fill="#A8A8AD">VLESS · REALITY · XHTTP · 8 мс</text>
+      <text x="80" y="68"
+            font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+            font-size="11" fill="#6FD08C">AdaptiveBrain: midsld + TTL 6 · Auto-Direct .ru</text>
+    </g>
+
+    <!-- Mode Selector Strip -->
+    <g transform="translate(18, 186)">
+      <rect x="0" y="0" width="112" height="28" rx="7" fill="#1E1E22" stroke="#26262B"/>
+      <text x="56" y="18" text-anchor="middle"
+            font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
+            font-size="11.5" font-weight="600" fill="#A8A8AD">Прокси</text>
+
+      <rect x="120" y="0" width="112" height="28" rx="7" fill="#2A2440" stroke="#B9A8FF" stroke-opacity="0.6"/>
+      <text x="176" y="18" text-anchor="middle"
+            font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
+            font-size="11.5" font-weight="700" fill="#B9A8FF">Гибрид + Desync</text>
+
+      <rect x="240" y="0" width="112" height="28" rx="7" fill="#1E1E22" stroke="#26262B"/>
+      <text x="296" y="18" text-anchor="middle"
+            font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
+            font-size="11.5" font-weight="600" fill="#A8A8AD">Только Desync</text>
+    </g>
+
+    <!-- Telemetry & Sparkline -->
+    <g transform="translate(18, 226)">
+      <rect x="0" y="0" width="352" height="86" rx="12" fill="#0B0B0D" stroke="#26262B"/>
+      <text x="14" y="22"
+            font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+            font-size="11" fill="#70707A">СКОРОСТЬ ПОТОКА</text>
+      <text x="150" y="22"
+            font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+            font-size="12" font-weight="700" fill="#6FD08C">↓ 184.6 Мбит/с</text>
+      <text x="262" y="22"
+            font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+            font-size="12" font-weight="700" fill="#B9A8FF">↑ 42.1 Мбит/с</text>
+
+      <path d="M 14 72 L 14 58 L 52 54 L 90 60 L 128 44 L 166 48 L 204 36 L 242 42 L 280 32 L 318 37 L 338 30 L 338 72 Z"
+            fill="url(#sparkFill)"/>
+      <path d="M 14 58 L 52 54 L 90 60 L 128 44 L 166 48 L 204 36 L 242 42 L 280 32 L 318 37 L 338 30"
+            fill="none" stroke="#6FD08C" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="338" cy="30" r="3.5" fill="#6FD08C"/>
+    </g>
+  </g>
+</svg>

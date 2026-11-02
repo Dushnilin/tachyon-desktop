@@ -1,0 +1,121 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1200" height="320" viewBox="0 0 1200 320"
+     role="img" aria-labelledby="title desc">
+  <title id="title">Архитектура конвейера трафика tachyon-desktop</title>
+  <desc id="desc">Схема прохождения пакетов в tachyon-desktop: от нативного окна Wry/Tao через VpnManager и системный интерфейс TUN (Wintun / Linux TUN / macOS utun) во встроенное Rust-ядро tachyon-core с разделением на прокси-протоколы, самообучающийся DPI Desync (AdaptiveBrain), прямое соединение для РФ и блокировщик.</desc>
+
+  <rect width="1200" height="320" rx="22" fill="#0B0B0D"/>
+  <rect x="1" y="1" width="1198" height="318" rx="21" fill="none" stroke="#26262B" stroke-width="2"/>
+
+  <!-- Step 1: Native WebView UI & Config Builder -->
+  <g transform="translate(40, 44)">
+    <rect x="0" y="0" width="250" height="232" rx="16" fill="#141417" stroke="#26262B" stroke-width="1.5"/>
+    <text x="22" y="34"
+          font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+          font-size="15" font-weight="700" fill="#B9A8FF">01 · WRY / TAO DESKTOP</text>
+    <text x="22" y="64"
+          font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
+          font-size="21" font-weight="700" fill="#F2F2F3">UI &amp; RuntimeConfig</text>
+
+    <text x="22" y="100"
+          font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
+          font-size="16" fill="#A8A8AD">• Парсер подписок и URI</text>
+    <text x="22" y="128"
+          font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
+          font-size="16" fill="#A8A8AD">• Каталог .trs (Sing-Box v2/v3)</text>
+    <text x="22" y="156"
+          font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
+          font-size="16" fill="#A8A8AD">• Матрица ТСПУ и Спидтест</text>
+    <text x="22" y="184"
+          font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
+          font-size="16" fill="#A8A8AD">• Split-Tunnel по процессам</text>
+    <text x="22" y="212"
+          font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+          font-size="14" fill="#70707A">src/web/ (embedded)</text>
+  </g>
+
+  <!-- Arrow 1 -> 2 -->
+  <g transform="translate(290, 148)">
+    <line x1="6" y1="12" x2="54" y2="12" stroke="#B9A8FF" stroke-width="2"/>
+    <polygon points="54,6 66,12 54,18" fill="#B9A8FF"/>
+  </g>
+
+  <!-- Step 2: OS Network Stack & VpnManager -->
+  <g transform="translate(362, 44)">
+    <rect x="0" y="0" width="246" height="232" rx="16" fill="#141417" stroke="#26262B" stroke-width="1.5"/>
+    <text x="22" y="34"
+          font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+          font-size="15" font-weight="700" fill="#B9A8FF">02 · OS TUN &amp; IPC HOST</text>
+    <text x="22" y="64"
+          font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
+          font-size="21" font-weight="700" fill="#F2F2F3">VpnManager (Rust)</text>
+
+    <text x="22" y="100"
+          font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
+          font-size="16" fill="#A8A8AD">• Wintun / Linux TUN / utun</text>
+    <text x="22" y="128"
+          font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
+          font-size="16" fill="#A8A8AD">• FakeIP 198.18.0.0/15 + DoH</text>
+    <text x="22" y="156"
+          font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
+          font-size="16" fill="#A8A8AD">• Firewall Kill Switch</text>
+    <text x="22" y="184"
+          font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
+          font-size="16" fill="#A8A8AD">• Автоапдейт с GitHub</text>
+    <text x="22" y="212"
+          font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+          font-size="14" fill="#70707A">desktop-rs/src/vpn.rs</text>
+  </g>
+
+  <!-- Arrow 2 -> 3 -->
+  <g transform="translate(608, 148)">
+    <line x1="6" y1="12" x2="54" y2="12" stroke="#6FD08C" stroke-width="2"/>
+    <polygon points="54,6 66,12 54,18" fill="#6FD08C"/>
+  </g>
+
+  <!-- Step 3: Embedded Rust Core & Outbounds -->
+  <g transform="translate(680, 44)">
+    <rect x="0" y="0" width="480" height="232" rx="16" fill="#141417" stroke="#6FD08C" stroke-opacity="0.45" stroke-width="1.5"/>
+    <text x="24" y="34"
+          font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+          font-size="15" font-weight="700" fill="#6FD08C">03 · EMBEDDED RUST ENGINE (IN-PROCESS)</text>
+    <text x="24" y="64"
+          font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
+          font-size="21" font-weight="700" fill="#F2F2F3">tachyon-core · Маршрутизатор и аутбаунды</text>
+
+    <!-- 4 Outbound boxes inside Rust Core -->
+    <g transform="translate(24, 86)">
+      <rect x="0" y="0" width="210" height="56" rx="10" fill="#2A2440" stroke="#B9A8FF" stroke-opacity="0.55"/>
+      <text x="14" y="24"
+            font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+            font-size="15" font-weight="700" fill="#B9A8FF">PROXY + DETOUR</text>
+      <text x="14" y="44"
+            font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
+            font-size="14" fill="#F2F2F3">VLESS / XHTTP / Hy2 / AWG</text>
+
+      <rect x="222" y="0" width="210" height="56" rx="10" fill="#292218" stroke="#E5C07B" stroke-opacity="0.55"/>
+      <text x="236" y="24"
+            font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+            font-size="15" font-weight="700" fill="#E5C07B">DESYNC OUTBOUND</text>
+      <text x="236" y="44"
+            font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
+            font-size="14" fill="#F2F2F3">AdaptiveBrain L1/L2/L3</text>
+
+      <rect x="0" y="68" width="210" height="56" rx="10" fill="#17281E" stroke="#6FD08C" stroke-opacity="0.55"/>
+      <text x="14" y="92"
+            font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+            font-size="15" font-weight="700" fill="#6FD08C">DIRECT (.RU / БАНКИ)</text>
+      <text x="14" y="112"
+            font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
+            font-size="14" fill="#F2F2F3">Прямой выход мимо прокси</text>
+
+      <rect x="222" y="68" width="210" height="56" rx="10" fill="#2B191C" stroke="#E06C75" stroke-opacity="0.55"/>
+      <text x="236" y="92"
+            font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+            font-size="15" font-weight="700" fill="#E06C75">BLOCK / QUIC REJECT</text>
+      <text x="236" y="112"
+            font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
+            font-size="14" fill="#F2F2F3">Реклама, трекеры и UDP:443</text>
+    </g>
+  </g>
+</svg>

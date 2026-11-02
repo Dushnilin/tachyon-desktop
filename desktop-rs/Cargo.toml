@@ -1,0 +1,57 @@
+[package]
+name = "tachyon-desktop"
+version = "0.3.1"
+edition = "2024"
+description = "Tachyon Cross-Platform Desktop Client (Linux, macOS, Windows) with embedded tachyon-core"
+license = "LicenseRef-Proprietary"
+repository = "https://github.com/Dushnilin/tachyon-desktop"
+
+[[bin]]
+name = "tachyon"
+path = "src/main.rs"
+
+[dependencies]
+core-config = { path = "../../tachyon-core/crates/core-config", default-features = false, features = ["full"] }
+core-runtime = { path = "../../tachyon-core/crates/core-runtime", default-features = false, features = ["full"] }
+anyhow = "1"
+base64 = "0.22"
+flate2 = "1"
+getrandom = "0.3"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+tao = { version = "0.30", features = ["rwh_06"] }
+tokio = { version = "1", features = ["full"] }
+wry = { version = "0.47", default-features = false, features = ["protocol", "os-webview", "drag-drop"] }
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Graphics_Dwm",
+] }
+
+[patch.crates-io]
+h2 = { path = "../../tachyon-core/vendor/h2" }
+quinn = { path = "../../tachyon-core/vendor/quinn" }
+quinn-proto = { path = "../../tachyon-core/vendor/quinn-proto" }
+smoltcp = { path = "../../tachyon-core/vendor/smoltcp" }
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+overflow-checks = false

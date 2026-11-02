@@ -1,0 +1,20 @@
+# Rust build artifacts
+target/
+desktop-rs/target/
+dist/
+*.pdb
+
+# IDE & OS
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs & temporary files
+*.log
+*.bak
+*.tmp
+*.old
+*~
+

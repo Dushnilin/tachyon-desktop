@@ -1,0 +1,1242 @@
+<!DOCTYPE html>
+<html lang="ru" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tachyon</title>
+  <link rel="icon" href="favicon.ico" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- ===== SVG-спрайт иконок (Tachyon Precision 1.75px) ===== -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+    <symbol id="ic-power" viewBox="0 0 24 24"><path d="M12 3v8"/><path d="M6.8 6.8a7.5 7.5 0 1 0 10.4 0"/></symbol>
+    <symbol id="ic-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18"/></symbol>
+    <symbol id="ic-settings" viewBox="0 0 24 24"><path d="M4 7h9M19 7h1"/><circle cx="16" cy="7" r="2.2"/><path d="M4 12h2M12 12h8"/><circle cx="9" cy="12" r="2.2"/><path d="M4 17h9M19 17h1"/><circle cx="16" cy="17" r="2.2"/></symbol>
+    <symbol id="ic-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></symbol>
+    <symbol id="ic-bolt" viewBox="0 0 24 24"><path d="M13 2 4 14h6l-1 8 9-12h-6l1-8Z"/></symbol>
+    <symbol id="ic-shield" viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.6 3 7.6 7 9 4-1.4 7-4.4 7-9V6l-7-3Z"/></symbol>
+    <symbol id="ic-brand" viewBox="0 0 24 24">
+      <path d="M13.8 1.8 4.2 13.4h6.3l-1.3 8.8 10.6-11.6h-6.3l.3-8.8Z" fill="currentColor"/>
+    </symbol>
+    <symbol id="ic-check" viewBox="0 0 24 24"><path d="m5 12.5 4.2 4.2L19 7"/></symbol>
+    <symbol id="ic-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-.9 4.5M20 5v6h-6"/></symbol>
+    <symbol id="ic-activity" viewBox="0 0 24 24"><path d="M3 12h4l2.5 7 5-14 2.5 7h4"/></symbol>
+    <symbol id="ic-lock" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="2.2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></symbol>
+    <symbol id="ic-chevron" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
+    <symbol id="ic-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+    <symbol id="ic-server" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></symbol>
+    <symbol id="ic-apps" viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="7" height="7" rx="1.8"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.8"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.8"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.8"/></symbol>
+    <symbol id="ic-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="ic-pc" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></symbol>
+    <symbol id="ic-trash" viewBox="0 0 24 24"><path d="M4 6h16M18 6v13a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V6m3 0V4a1.5 1.5 0 0 1 1.5-1.5h3A1.5 1.5 0 0 1 15 4v2"/></symbol>
+    <symbol id="ic-edit" viewBox="0 0 24 24"><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></symbol>
+    <symbol id="ic-filter" viewBox="0 0 24 24"><path d="M3 5h18l-7 8v6l-4-2v-4L3 5z"/></symbol>
+    <symbol id="ic-sort" viewBox="0 0 24 24"><path d="M4 7h10M4 12h7M4 17h4M17 5v14m0 0-3-3m3 3 3-3"/></symbol>
+    <symbol id="ic-route" viewBox="0 0 24 24"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="M8.5 6h7M7.5 8l3.5 7.5M16.5 8 13 15.5"/></symbol>
+    <symbol id="ic-qr" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3zM18 18h3v3h-3zM14 19h2v2h-2zM19 14h2v2h-2z"/></symbol>
+    <symbol id="ic-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></symbol>
+    <symbol id="ic-moon" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></symbol>
+    <symbol id="ic-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+    <symbol id="ic-play" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2.5"/><path d="m10 9 5 3-5 3V9Z"/></symbol>
+    <symbol id="ic-split" viewBox="0 0 24 24"><path d="M12 4v16"/><path d="M8 8l-4 4 4 4M16 8l4 4-4 4"/></symbol>
+    <symbol id="ic-shuffle" viewBox="0 0 24 24"><path d="M16 3h5v5M4 20 21 3M21 16v5h-5M15 15l6 6M4 4l5 5"/></symbol>
+    <symbol id="ic-layers" viewBox="0 0 24 24"><path d="m12 3 9 4.5-9 4.5-9-4.5L12 3Z"/><path d="m3 12 9 4.5 9-4.5"/><path d="m3 16.5 9 4.5 9-4.5"/></symbol>
+    <symbol id="ic-mask" viewBox="0 0 24 24"><path d="M12 3a8 8 0 0 0-8 8v7l2.5-2 2.5 2 3-2 3 2 2.5-2 2.5 2v-7a8 8 0 0 0-8-8Z"/><path d="M9 11h.01M15 11h.01"/></symbol>
+    <symbol id="ic-radio" viewBox="0 0 24 24"><circle cx="12" cy="12" r="2"/><path d="M8.5 8.5a5 5 0 0 0 0 7M15.5 8.5a5 5 0 0 1 0 7M5.5 5.5a9 9 0 0 0 0 13M18.5 5.5a9 9 0 0 1 0 13"/></symbol>
+    <symbol id="ic-chat" viewBox="0 0 24 24"><path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 8.6 8.6 0 0 1-3.8-.9L3 20.5l1.6-4.8A8.3 8.3 0 0 1 3 11.5 8.5 8.5 0 0 1 11.5 3h1A8.5 8.5 0 0 1 21 11.5Z"/></symbol>
+    <symbol id="ic-cpu" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/><rect x="9.5" y="9.5" width="5" height="5" rx="1"/><path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3"/></symbol>
+    <symbol id="ic-gamepad" viewBox="0 0 24 24"><rect x="2" y="6" width="20" height="12" rx="4"/><path d="M6 12h4M8 10v4M15 11h.01M18 13h.01"/></symbol>
+    <symbol id="ic-code" viewBox="0 0 24 24"><path d="m8 8-4 4 4 4M16 8l4 4-4 4M13.5 6l-3 12"/></symbol>
+    <symbol id="ic-ban" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m5.7 5.7 12.6 12.6"/></symbol>
+    <symbol id="ic-ext" viewBox="0 0 24 24"><path d="M7 17 17 7M9 7h8v8"/></symbol>
+  </defs></svg>
+
+  <!-- ===== ЕДИНАЯ ШАПКА TACHYON + НАВИГАЦИЯ ===== -->
+  <header class="topbar" id="titlebar">
+    <div class="topbar__row">
+      <div class="topbar__brand">
+        <span class="topbar__logo" aria-hidden="true">
+          <svg viewBox="0 0 24 24" class="tachyon-bolt-svg">
+            <polygon points="13.8,1.8 4.2,13.4 11.4,13.4 12.4,10.2" fill="#FFFFFF"/>
+            <polygon points="13.8,1.8 12.4,10.2 11.4,13.4 9.5,22.2 19.8,10.6 13.5,10.6" fill="currentColor"/>
+          </svg>
+        </span>
+        <div class="wordmark-stack">
+          <div class="wordmark-line">
+            <span class="topbar__title">TACHYON</span>
+            <span class="topbar__ver">0.3.0</span>
+          </div>
+          <span class="wordmark-sub">ЗАЩИТА СОЕДИНЕНИЯ</span>
+        </div>
+      </div>
+
+      <div class="topbar__controls" id="winControls">
+        <button class="wbtn" id="themeQuickBtn" type="button" title="Переключить тему (Тёмная / Светлая)">
+          <svg class="ic" id="themeQuickIcon"><use href="#ic-sun"/></svg>
+        </button>
+        <button class="wbtn" data-win="mini" id="miniBtn" title="Мини-виджет" hidden><svg viewBox="0 0 12 12"><rect x="1.5" y="2.5" width="9" height="7" rx="1"/><rect x="5.5" y="5.5" width="4" height="3" rx=".5"/></svg></button>
+        <button class="wbtn" data-win="min" title="Свернуть"><svg viewBox="0 0 12 12"><path d="M2.5 6h7"/></svg></button>
+        <button class="wbtn" data-win="max" title="Развернуть"><svg viewBox="0 0 12 12"><rect x="2.2" y="2.2" width="7.6" height="7.6" rx="1.2"/></svg></button>
+        <button class="wbtn wbtn--close" data-win="close" title="Закрыть"><svg viewBox="0 0 12 12"><path d="M3 3l6 6M9 3l-6 6"/></svg></button>
+      </div>
+    </div>
+
+    <nav class="nav-dock" aria-label="Разделы">
+      <button class="rail__item is-active" data-view="connect">
+        <svg class="ic"><use href="#ic-power"/></svg>
+        <span>Туннель</span>
+      </button>
+      <button class="rail__item" data-view="desync">
+        <svg class="ic"><use href="#ic-bolt"/></svg>
+        <span>Desync</span>
+      </button>
+      <button class="rail__item" data-view="routing">
+        <svg class="ic"><use href="#ic-route"/></svg>
+        <span>Маршруты</span>
+        <em class="nav-badge" id="routeRulesBadge">0</em>
+      </button>
+      <button class="rail__item" data-view="subscriptions">
+        <svg class="ic"><use href="#ic-server"/></svg>
+        <span>Узлы</span>
+        <em class="nav-badge" id="locCount">0</em>
+      </button>
+      <button class="rail__item" data-view="connections">
+        <svg class="ic"><use href="#ic-activity"/></svg>
+        <span>Трафик</span>
+      </button>
+      <button class="rail__item" data-view="settings">
+        <svg class="ic"><use href="#ic-settings"/></svg>
+        <span>Опции</span>
+      </button>
+    </nav>
+  </header>
+
+  <!-- ===== Баннер обновления ===== -->
+  <div class="updbar" id="updBar" hidden>
+    <svg class="ic updbar__ic"><use href="#ic-bolt"/></svg>
+    <span class="updbar__txt" id="updText">Доступно обновление</span>
+    <button class="updbar__btn" id="updAction" type="button">Обновить</button>
+    <button class="updbar__x" id="updClose" type="button" title="Скрыть">&times;</button>
+  </div>
+
+  <!-- ===== ОСНОВНОЙ КОНТЕЙНЕР ===== -->
+  <div class="shell" id="appShell">
+    <main class="content">
+
+      <!-- ===== 1. ТУННЕЛЬ (ГЛАВНЫЙ ЭКРАН) ===== -->
+      <section class="view is-active" data-view="connect">
+
+        <!-- Центральный блок: Тахионный реактор (_PowerDial из tachyon-proxy) -->
+        <div class="hero" id="heroCard">
+          <canvas id="rainCanvas" class="hero-precip" aria-hidden="true"></canvas>
+
+          <div class="hero__top">
+            <div class="status-chip" id="statusChip">
+              <span class="dot"></span>
+              <span id="statusText">Отключено</span>
+            </div>
+            <div class="hero__top-right">
+              <span class="tachyon-pill" id="heroModePill">TUN · WINTUN</span>
+              <div class="session-pill" title="Время активной сессии">
+                <span id="mTime">00:00</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="orb-wrap">
+            <div class="reactor-stage">
+              <canvas id="reactorCanvas" width="156" height="156" aria-hidden="true"></canvas>
+              <button class="orb" id="connectOrb" aria-label="Переключить защиту Tachyon">
+                <span class="orb__core">
+                  <span class="orb__icon">
+                    <svg viewBox="0 0 24 24" class="reactor-bolt-svg">
+                      <polygon points="13.8,1.8 4.2,13.4 11.4,13.4 12.4,10.2" fill="#FFFFFF" fill-opacity="0.95"/>
+                      <polygon points="13.8,1.8 12.4,10.2 11.4,13.4 9.5,22.2 19.8,10.6 13.5,10.6" fill="currentColor"/>
+                    </svg>
+                  </span>
+                  <span class="orb__live-rate" id="orbLiveRate">ГОТОВ</span>
+                </span>
+              </button>
+            </div>
+            <span class="orb__caption" id="orbLabel">Нажмите для включения защиты</span>
+          </div>
+
+          <!-- Карточка активного профиля с быстрым HTTP-тестом и QR -->
+          <div class="server-pick-wrap">
+            <button class="server-pick" id="serverPick" type="button">
+              <img class="flag-slot" id="pickFlag" src="flags/globe.svg" alt="" />
+              <span class="server-pick__txt">
+                <b id="currentServerName">Выберите локацию</b>
+                <small id="currentServerSub">Нажмите для выбора сервера</small>
+              </span>
+              <span class="server-pick__right">
+                <span class="ping-pill"><b id="mPing">–</b> <small>мс</small></span>
+                <svg class="ic server-pick__chev"><use href="#ic-chevron"/></svg>
+              </span>
+            </button>
+            <div class="server-pick__tools">
+              <button type="button" class="icon-btn" id="quickProbeBtn" title="Измерить реальный задержку (TCP/HTTP) до выбранного узла">
+                <svg class="ic"><use href="#ic-bolt"/></svg>
+              </button>
+              <button type="button" class="icon-btn" id="quickQrBtn" title="Показать QR-код и скопировать ключ профиля">
+                <svg class="ic"><use href="#ic-qr"/></svg>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- ВЫХОДНОЙ УЗЕЛ И ТЕЛЕМЕТРИЯ В ОДИН РЯД -->
+        <div class="bento-row-2">
+          <!-- Выходной узел (IP / Гео / Провайдер + спарклайн пинга) -->
+          <div class="hairline-card exit-node-card" id="exitNodeCard">
+            <canvas id="pingSparklineCanvas" width="220" height="54" aria-hidden="true"></canvas>
+            <div class="exit-node__head">
+              <span class="t-stat__lbl"><i class="dot dot--accent"></i>ВЫХОДНОЙ УЗЕЛ</span>
+              <button type="button" class="mini-link-btn" id="refreshExitGeoBtn" title="Обновить внешний IP и геолокацию"><svg class="ic"><use href="#ic-refresh"/></svg><span>Проверить</span></button>
+            </div>
+            <div class="exit-node__main">
+              <b id="exitNodeIp">Не проверено</b>
+              <span class="tachyon-pill" id="exitNodeCc">IP</span>
+            </div>
+            <div class="exit-node__sub" id="exitNodeMeta">Нажмите «Проверить» или включите туннель</div>
+          </div>
+
+          <!-- Живая телеметрия трафика со спарклайном -->
+          <div class="telemetry-card">
+            <canvas id="trafficChart" width="260" height="58" aria-hidden="true"></canvas>
+            <div class="telemetry-grid telemetry-grid--2col">
+              <div class="t-stat">
+                <span class="t-stat__lbl"><i class="dot dot--blue"></i>СКАЧАНО</span>
+                <span class="t-stat__val"><b id="mDown">0.0</b> <small>МБ/с</small></span>
+                <span class="t-stat__sub">Всего: <b id="totalDown">0 КБ</b></span>
+              </div>
+              <div class="t-stat">
+                <span class="t-stat__lbl"><i class="dot dot--emerald"></i>ОТПРАВЛЕНО</span>
+                <span class="t-stat__val"><b id="mUp">0.0</b> <small>МБ/с</small></span>
+                <span class="t-stat__sub">Всего: <b id="totalUp">0 КБ</b></span>
+              </div>
+            </div>
+            <div style="display:none"><span id="ipChip"><span id="ipText">TUN</span></span><span id="modeHint"></span></div>
+          </div>
+        </div>
+
+        <!-- Компактная панель маршрутизации -->
+        <div class="route-card">
+          <div class="route-card__bar">
+            <div class="route-card__head">
+              <span class="route-card__title">РЕЖИМ МАРШРУТИЗАЦИИ</span>
+              <button class="link-btn" id="openRoutingViewBtn" type="button"><span>Списки и Desync</span><svg class="ic"><use href="#ic-ext"/></svg></button>
+            </div>
+            <div class="seg seg--compact seg--routes" id="routeSwitch">
+              <button class="is-active" data-route="all" type="button" title="Весь трафик через VPN + активные списки и Desync">Весь ПК</button>
+              <button data-route="selective" type="button" title="В VPN и Desync идут только выбранные списки и правила, остальное — напрямую">Точечно</button>
+              <button data-route="desync-only" type="button" title="Обход DPI без VPN-сервера (напрямую через Desync)">Только Desync</button>
+              <button data-route="apps" type="button" title="Раздельное туннелирование по процессам (.exe)">Приложения</button>
+            </div>
+          </div>
+
+          <div class="app-routes" id="appRoutes" hidden>
+            <div class="seg seg--split" id="splitSwitch">
+              <button class="is-active" data-split="include" type="button">Только выбранные → VPN</button>
+              <button data-split="exclude" type="button">Все, кроме выбранных</button>
+            </div>
+            <ul class="app-list" id="appList"></ul>
+            <button class="btn btn--ghost btn--sm" id="addAppBtn" type="button">
+              <svg class="ic"><use href="#ic-plus"/></svg>Добавить процесс (.exe)
+            </button>
+          </div>
+        </div>
+
+        <!-- Быстрые тумблеры на главном экране -->
+        <div class="quick-dock">
+          <button type="button" class="q-tile is-on" id="quickDesyncTile" title="Быстрое включение/выключение обхода DPI Tachyon Desync">
+            <span class="q-tile__ic"><svg class="ic"><use href="#ic-bolt"/></svg></span>
+            <span class="q-tile__txt">
+              <b>Desync DPI</b>
+              <small id="quickDesyncVal">Активен · Авто</small>
+            </span>
+          </button>
+
+          <button type="button" class="q-tile is-on" id="quickModeTile" title="Переключить режим захвата трафика: Wintun TUN ↔ Системный прокси">
+            <span class="q-tile__ic"><svg class="ic"><use href="#ic-globe"/></svg></span>
+            <span class="q-tile__txt">
+              <b>Сетевой стек</b>
+              <small id="quickModeVal">TUN · Wintun</small>
+            </span>
+          </button>
+
+          <button type="button" class="q-tile" id="quickKillTile" title="Блокировать выход в сеть в обход VPN (Kill Switch)">
+            <span class="q-tile__ic"><svg class="ic"><use href="#ic-lock"/></svg></span>
+            <span class="q-tile__txt">
+              <b>Kill Switch</b>
+              <small id="quickKillVal">Выключен</small>
+            </span>
+          </button>
+        </div>
+
+        <!-- Встроенная панель серверов с прокруткой (появляется при растягивании окна) -->
+        <div class="connect-servers-dock hairline-card" id="connectServersDock">
+          <div class="csd-head">
+            <div class="csd-head__title">
+              <span class="t-stat__lbl"><i class="dot dot--accent"></i>СЕРВЕРЫ И ЛОКАЦИИ</span>
+              <span class="drawer__count" id="homeServerCountBadge">0</span>
+            </div>
+            <div class="csd-head__tools">
+              <label class="csd-search">
+                <svg class="ic"><use href="#ic-search"/></svg>
+                <input type="text" id="homeServerSearch" placeholder="Поиск страны или узла…" autocomplete="off" />
+              </label>
+              <button type="button" class="btn-act btn-act--sm" id="homePingBtn" title="Измерить пинг отфильтрованных узлов">
+                <svg class="ic"><use href="#ic-bolt"/></svg><span id="homePingBtnTxt">Пинг</span>
+              </button>
+              <button type="button" class="btn-act btn-act--sm" id="homeOpenSubsViewBtn" title="Управление подписками и фильтрами">
+                <svg class="ic"><use href="#ic-server"/></svg><span>Подписки</span>
+              </button>
+            </div>
+          </div>
+          <ul class="server-list server-list--home-dock" id="homeServerList"></ul>
+        </div>
+
+      </section>
+
+      <!-- ===== 2. ОТДЕЛЬНЫЙ РАЗДЕЛ DESYNC (TACHYON ADAPTIVE BRAIN & DPI BYPASS) ===== -->
+      <section class="view" data-view="desync">
+
+        <!-- Главная карточка движка Desync -->
+        <div class="desync-card" id="desyncCard">
+          <div class="desync-card__head">
+            <div class="desync-card__title-wrap">
+              <span class="desync-badge-icon"><svg class="ic"><use href="#ic-bolt"/></svg></span>
+              <div>
+                <h2>Tachyon Desync <span class="core-ver-pill">AdaptiveBrain L1/L2/L3</span></h2>
+                <small id="desyncSubtitle">Встроенный самообучающийся движок обхода ТСПУ в ядре tachyon-core</small>
+              </div>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <button type="button" class="btn-act btn-act--sm" id="resetDesyncBtn" title="Сбросить параметры Desync к оптимальным значениям ядра">Сброс</button>
+              <label class="toggle toggle--inline" title="Включить встроенный в ядро движок обхода DPI Tachyon Desync">
+                <input type="checkbox" id="desyncEnableToggle" checked />
+                <span class="track"></span>
+              </label>
+            </div>
+          </div>
+
+          <div class="desync-body" id="desyncBody">
+            <!-- Живая сводка текущей конфигурации -->
+            <div class="desync-status-strip">
+              <span class="desync-foot__summary" id="desyncTechSummary">Пресет: auto · md5 · split:midsld · TTL 6 · UDP Fake · Блок QUIC</span>
+            </div>
+
+            <!-- 1. Автоматика и самообучение ядра -->
+            <div class="desync-section">
+              <div class="desync-sec-title">АВТОМАТИКА ЯДРА (ADAPTIVE BRAIN)</div>
+              <div class="desync-auto-list">
+                <label class="desync-switch-row">
+                  <div class="desync-switch-row__txt">
+                    <b>Автоматический перехват прямых соединений (Auto-Desync)</b>
+                    <small>Весь зарубежный трафик мимо VPN автоматически проходит через AdaptiveBrain; сайты .ru / .рф идут напрямую</small>
+                  </div>
+                  <label class="toggle toggle--inline">
+                    <input type="checkbox" id="desyncAutoDirectToggle" checked />
+                    <span class="track"></span>
+                  </label>
+                </label>
+
+                <label class="desync-switch-row">
+                  <div class="desync-switch-row__txt">
+                    <b>3-уровневое самообучение L1/L2/L3 + Анти-ТСПУ 32 КБ (auto_tune)</b>
+                    <small>Автоподбор из 8 рецептов ядра, пробитие 16 КБ блока ТСПУ (окно 32 КБ) и сохранение стратегий в cache.db</small>
+                  </div>
+                  <label class="toggle toggle--inline">
+                    <input type="checkbox" id="desyncAutoTuneToggle" checked />
+                    <span class="track"></span>
+                  </label>
+                </label>
+              </div>
+            </div>
+
+            <!-- 2. Профиль / Пресет обхода -->
+            <div class="desync-section">
+              <div class="desync-sec-title">ПРОФИЛЬ ОБХОДА (PRESET)</div>
+              <div class="preset-chips" id="desyncPresetsBar">
+                <button type="button" class="p-chip is-active" data-dpreset="auto" title="Автоматический выбор из 8 рецептов AdaptiveBrain под провайдера"><svg class="ic"><use href="#ic-bolt"/></svg><span>Авто (Adaptive)</span></button>
+                <button type="button" class="p-chip" data-dpreset="youtube_discord" title="Fake + Split по SLD + UDP Fake для голоса Discord и YouTube GGC"><svg class="ic"><use href="#ic-play"/></svg><span>YouTube + Discord</span></button>
+                <button type="button" class="p-chip" data-dpreset="fake_split" title="Отправка фейкового ClientHello + разрез реального пакета"><svg class="ic"><use href="#ic-split"/></svg><span>Fake + Split</span></button>
+                <button type="button" class="p-chip" data-dpreset="fake_disorder" title="Fake-пакет + отправка сегментов с обратным порядком/TTL"><svg class="ic"><use href="#ic-shuffle"/></svg><span>Fake + Disorder</span></button>
+                <button type="button" class="p-chip" data-dpreset="tlsrec" title="Фрагментация на уровне TLS Record Layer до заголовка SNI"><svg class="ic"><use href="#ic-lock"/></svg><span>TLS Record</span></button>
+                <button type="button" class="p-chip" data-dpreset="multi_split" title="Каскадное разрезание ClientHello на 3 сегмента (2-й байт + SLD)"><svg class="ic"><use href="#ic-layers"/></svg><span>Multi-Split</span></button>
+                <button type="button" class="p-chip" data-dpreset="split" title="Чистый TCP Split без отправки фейковых пакетов"><svg class="ic"><use href="#ic-split"/></svg><span>Split</span></button>
+                <button type="button" class="p-chip" data-dpreset="disorder" title="Разрез + занижение TTL первого сегмента без фейка"><svg class="ic"><use href="#ic-shuffle"/></svg><span>Disorder</span></button>
+                <button type="button" class="p-chip" data-dpreset="fake" title="Инъекция фейкового пакета без разрезания полезной нагрузки"><svg class="ic"><use href="#ic-mask"/></svg><span>Только Fake</span></button>
+                <button type="button" class="p-chip" data-dpreset="oob" title="Внеполосный байт TCP Urgent (MSG_OOB) на границе разреза"><svg class="ic"><use href="#ic-radio"/></svg><span>TCP OOB</span></button>
+                <button type="button" class="p-chip" data-dpreset="custom" title="Ручная конфигурация всех параметров TCP/UDP десинхронизации"><svg class="ic"><use href="#ic-settings"/></svg><span>Свой профиль</span></button>
+              </div>
+            </div>
+
+            <!-- 3. Параметры TCP / TLS десинхронизации -->
+            <div class="desync-section">
+              <div class="desync-sec-title">ПАРАМЕТРЫ TCP И TLS ФРАГМЕНТАЦИИ</div>
+              <div class="desync-adv-grid">
+                <label class="d-field">
+                  <span>Базовый метод TCP (mode)</span>
+                  <select id="desyncModeSelect">
+                    <option value="auto">Авто (AdaptiveBrain)</option>
+                    <option value="fake_split">Fake + Split</option>
+                    <option value="fake_disorder">Fake + Disorder</option>
+                    <option value="tlsrec">TLS Record Split</option>
+                    <option value="multi_split">Multi-Split (3 сегмента)</option>
+                    <option value="split">Split (без фейка)</option>
+                    <option value="disorder">Disorder (без фейка)</option>
+                    <option value="fake">Только Fake</option>
+                    <option value="oob">TCP OOB (Urgent)</option>
+                  </select>
+                </label>
+
+                <label class="d-field">
+                  <span>Метод обмана ТСПУ (fooling)</span>
+                  <select id="desyncFoolingSelect">
+                    <option value="md5">TCP MD5 Option 19 (дефолт ядра)</option>
+                    <option value="badseq">BadSeq (сдвиг Sequence)</option>
+                    <option value="timestamp">Timestamp (PAWS RFC 7323)</option>
+                    <option value="badsum">BadSum (битая контрольная сумма)</option>
+                    <option value="autottl">AutoTTL (отсечка по хопам)</option>
+                  </select>
+                </label>
+
+                <label class="d-field">
+                  <span>Точка разреза (split_pos)</span>
+                  <select id="desyncSplitPosSelect">
+                    <option value="midsld">Середина домена (midsld)</option>
+                    <option value="sni">Начало поля SNI (sni)</option>
+                    <option value="1">1-й байт (byte 1)</option>
+                    <option value="2">2-й байт (byte 2)</option>
+                    <option value="custom_offset">Своё смещение (байт)…</option>
+                  </select>
+                </label>
+
+                <label class="d-field" id="desyncCustomOffsetField" hidden>
+                  <span>Смещение разреза (1–1400 байт)</span>
+                  <input type="number" id="desyncSplitOffsetInput" min="1" max="1400" value="3" />
+                </label>
+
+                <label class="d-field">
+                  <span>TTL фейка (fake_ttl: 1–128)</span>
+                  <input type="number" id="desyncFakeTtlInput" min="1" max="128" value="6" />
+                </label>
+
+                <label class="d-field">
+                  <span>Повторы TCP-фейка (repeats: 1–100)</span>
+                  <input type="number" id="desyncRepeatsInput" min="1" max="100" value="2" />
+                </label>
+
+                <label class="d-field">
+                  <span>Пауза между сегментами (0–1000 мс)</span>
+                  <input type="number" id="desyncSplitDelayInput" min="0" max="1000" value="1" />
+                </label>
+              </div>
+
+              <!-- Подменный SNI + пул белых доменов ядра -->
+              <div class="desync-sni-box">
+                <label class="d-field">
+                  <span>Подменный SNI в фейковом ClientHello (fake_sni)</span>
+                  <input type="text" id="desyncFakeSniInput" value="www.google.com" placeholder="www.google.com" autocomplete="off" />
+                </label>
+                <div class="sni-pool-chips" id="desyncSniPoolBar">
+                  <span class="sni-pool-lbl">Белый пул ядра:</span>
+                  <button type="button" class="sni-chip" data-sni="www.google.com">www.google.com</button>
+                  <button type="button" class="sni-chip" data-sni="vk.com">vk.com</button>
+                  <button type="button" class="sni-chip" data-sni="max.ru">max.ru</button>
+                  <button type="button" class="sni-chip" data-sni="gosuslugi.ru">gosuslugi.ru</button>
+                  <button type="button" class="sni-chip" data-sni="ya.ru">ya.ru</button>
+                  <button type="button" class="sni-chip" data-sni="ozon.ru">ozon.ru</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- 4. Параметры UDP / QUIC / Discord Voice -->
+            <div class="desync-section">
+              <div class="desync-sec-title">UDP, QUIC И ГОЛОСОВЫЕ ПРОТОКОЛЫ (DISCORD VOICE / STUN / ИГРЫ)</div>
+              <div class="desync-auto-list">
+                <label class="desync-switch-row">
+                  <div class="desync-switch-row__txt">
+                    <b>Инъекция UDP Fake (udp_fake)</b>
+                    <small>Отправка фейковых STUN Binding Request / QUIC Initial перед реальным UDP-пакетом (звонки Discord, игры)</small>
+                  </div>
+                  <label class="toggle toggle--inline">
+                    <input type="checkbox" id="desyncUdpFakeToggle" checked />
+                    <span class="track"></span>
+                  </label>
+                </label>
+
+                <label class="desync-switch-row">
+                  <div class="desync-switch-row__txt">
+                    <b>Принудительная блокировка QUIC (UDP 443 → TCP 443)</b>
+                    <small>Мгновенный сброс исходящего UDP 443 для перевода браузера на TCP/TLS (дополняет авто-детектор quic_dead)</small>
+                  </div>
+                  <label class="toggle toggle--inline">
+                    <input type="checkbox" id="desyncBlockQuicToggle" checked />
+                    <span class="track"></span>
+                  </label>
+                </label>
+              </div>
+
+              <div class="desync-adv-grid" style="margin-top:8px">
+                <label class="d-field">
+                  <span>Повторы UDP-фейка (udp_repeats: 1–50)</span>
+                  <input type="number" id="desyncUdpRepeatsInput" min="1" max="50" value="6" />
+                </label>
+                <label class="d-field">
+                  <span>TTL UDP-фейка (udp_fake_ttl: 1–128)</span>
+                  <input type="number" id="desyncUdpFakeTtlInput" min="1" max="128" value="6" />
+                </label>
+              </div>
+            </div>
+
+          </div>
+        </div>
+
+      </section>
+
+      <!-- ===== 3. МАРШРУТЫ (ТОЧЕЧНАЯ МАРШРУТИЗАЦИЯ + TACHYON-LISTS + DETOUR) ===== -->
+      <section class="view" data-view="routing">
+
+        <!-- Верхняя инженерная панель: Быстрые сценарии + Каскад (Detour) + Обновление .trs -->
+        <div class="routing-top-card hairline-card">
+          <div class="routing-top__row">
+            <div class="routing-top__title">
+              <span class="routing-top__icon"><svg class="ic"><use href="#ic-route"/></svg></span>
+              <div>
+                <h2>Маршрутизация трафика <span class="core-ver-pill">tachyon-lists .trs</span></h2>
+                <small>Направляйте сервисы, домены и процессы в VPN, через обход ТСПУ (Desync), напрямую или в блок</small>
+              </div>
+            </div>
+            <div class="routing-top__controls">
+              <label class="detour-inline" title="Цепочка прокси (Каскад / Detour): шифровать трафик к основному серверу через промежуточный узел">
+                <svg class="ic"><use href="#ic-layers"/></svg>
+                <span class="detour-inline__lbl">Каскад:</span>
+                <select id="detourNodeSelect" class="c-select c-select--sm detour-select">
+                  <option value="">Напрямую (без каскада)</option>
+                </select>
+              </label>
+              <button type="button" class="btn-act btn-act--sm" id="refreshListsBtn" title="Скачать свежие .trs списки из репозитория Dushnilin/tachyon-lists">
+                <svg class="ic"><use href="#ic-refresh"/></svg><span id="refreshListsTxt">Обновить .trs</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="routing-presets-bar" id="quickBundlesBar">
+            <span class="routing-presets__lbl">Сценарии:</span>
+            <button type="button" class="r-preset-btn" data-bundle="ru_smart" title="Сайты РФ напрямую, YouTube и Discord через Desync, заблокированные сервисы и ИИ через VPN">
+              <svg class="ic"><use href="#ic-shield"/></svg><span>РФ мимо + РКН в VPN</span>
+            </button>
+            <button type="button" class="r-preset-btn" data-bundle="desync_media" title="Работа без VPN-сервера: обход ТСПУ для YouTube, Discord и заблокированных сайтов">
+              <svg class="ic"><use href="#ic-bolt"/></svg><span>YT + Discord (Desync)</span>
+            </button>
+            <button type="button" class="r-preset-btn" data-bundle="selective_vpn" title="Точечный режим: весь трафик напрямую, кроме выбранных списков">
+              <svg class="ic"><use href="#ic-split"/></svg><span>Только выбранные</span>
+            </button>
+            <button type="button" class="r-preset-btn" data-bundle="adblock" title="Включить блокировку рекламы, трекеров и телеметрии Windows">
+              <svg class="ic"><use href="#ic-ban"/></svg><span>Анти-реклама</span>
+            </button>
+            <button type="button" class="r-preset-btn r-preset-btn--ghost" data-bundle="clear" title="Отключить все списки маршрутизации">
+              <svg class="ic"><use href="#ic-close"/></svg><span>Сброс</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Основная рабочая карточка списков и пользовательских правил -->
+        <div class="routing-card">
+          <div class="routing-card__head">
+            <div class="seg seg--compact" id="routingSubtabs">
+              <button type="button" class="is-active" data-rtab="lists">
+                <svg class="ic"><use href="#ic-layers"/></svg><span>Каталог сервисов</span>
+                <em class="chip-count" id="activeListsCountBadge">0</em>
+              </button>
+              <button type="button" data-rtab="custom">
+                <svg class="ic"><use href="#ic-code"/></svg><span>Свои правила</span>
+                <em class="chip-count" id="customRulesCount">0</em>
+              </button>
+            </div>
+
+            <div class="lists-toolbar" id="routingListsToolbar">
+              <label class="search search--sm routing-search">
+                <svg class="ic"><use href="#ic-search"/></svg>
+                <input type="text" id="listsSearchInput" placeholder="Поиск сервиса (YouTube, Discord, AI, Steam, банки РФ…)" autocomplete="off" />
+              </label>
+              <div class="seg seg--compact" id="listsFilterSeg">
+                <button type="button" class="is-active" data-lf="all">Все</button>
+                <button type="button" data-lf="active">Активные</button>
+              </div>
+              <button type="button" class="btn-collapse-all" id="collapseAllListsBtn" title="Свернуть или развернуть все категории">Свернуть</button>
+            </div>
+          </div>
+
+          <!-- Вкладка А: Списки Dushnilin/tachyon-lists -->
+          <div class="rtab-pane" id="rtabLists">
+            <div class="community-lists" id="communityListsContainer"></div>
+          </div>
+
+          <!-- Вкладка Б: Свои правила (Домены / IP / Процессы) -->
+          <div class="rtab-pane" id="rtabCustom" hidden>
+            <div class="custom-rule-bar">
+              <select id="customRuleType" class="c-select">
+                <option value="domain">Домен</option>
+                <option value="ip">IP / CIDR</option>
+                <option value="process">Процесс (.exe)</option>
+              </select>
+              <input type="text" id="customRuleValue" class="c-input" placeholder="например: chatgpt.com, 1.1.1.1/32 или discord.exe" autocomplete="off" />
+              <select id="customRuleAction" class="c-select c-select--act">
+                <option value="vpn">→ VPN</option>
+                <option value="desync">→ Desync</option>
+                <option value="direct">→ Прямой</option>
+                <option value="block">→ Блок</option>
+              </select>
+              <button type="button" class="btn-act btn-act--primary" id="addCustomRuleBtn">
+                <svg class="ic"><use href="#ic-plus"/></svg><span>Добавить</span>
+              </button>
+            </div>
+            <div class="sni-pool-chips" id="quickCustomTemplates">
+              <span class="sni-pool-lbl">Быстрое добавление:</span>
+              <button type="button" class="sni-chip" data-qrule="domain:chatgpt.com:vpn">chatgpt.com → VPN</button>
+              <button type="button" class="sni-chip" data-qrule="domain:claude.ai:vpn">claude.ai → VPN</button>
+              <button type="button" class="sni-chip" data-qrule="domain:rutracker.org:desync">rutracker.org → Desync</button>
+              <button type="button" class="sni-chip" data-qrule="process:Discord.exe:desync">Discord.exe → Desync</button>
+              <button type="button" class="sni-chip" data-qrule="process:Telegram.exe:vpn">Telegram.exe → VPN</button>
+              <button type="button" class="sni-chip" data-qrule="process:steam.exe:direct">steam.exe → Прямой</button>
+            </div>
+            <ul class="custom-rules-list" id="customRulesList"></ul>
+            <p class="conn-empty" id="customRulesEmpty">Добавьте любой домен (например, <b>chatgpt.com</b>), подсеть или имя <b>.exe</b> процесса и выберите, куда направить его трафик.</p>
+          </div>
+        </div>
+
+      </section>
+
+      <!-- ===== 3. УЗЛЫ И ПОДПИСКИ (ИСТОЧНИКИ + КОМПАКТНЫЙ СПИСОК УЗЛОВ) ===== -->
+      <section class="view" data-view="subscriptions">
+        <div class="sec-bar">
+          <div class="sec-bar__txt">
+            <h1>Узлы и подписки</h1>
+          </div>
+          <div class="sec-bar__acts">
+            <button class="btn-act btn-act--primary" id="openAddSubBtn" type="button">
+              <svg class="ic"><use href="#ic-plus"/></svg><span>Подписка</span>
+            </button>
+            <button class="btn-act" id="openAddNodeBtn" type="button">
+              <svg class="ic"><use href="#ic-bolt"/></svg><span>Ключ</span>
+            </button>
+            <button class="btn-act" id="createWarpAwgBtn" type="button" title="Сгенерировать бесплатный профиль Cloudflare WARP (AmneziaWG)">
+              <svg class="ic"><use href="#ic-shield"/></svg><span id="createWarpAwgTxt">WARP AWG</span>
+            </button>
+            <button class="btn-icon" id="refreshAllSubsBtn" type="button" title="Обновить все подписки">
+              <svg class="ic"><use href="#ic-refresh"/></svg>
+            </button>
+          </div>
+        </div>
+
+        <!-- Компактная форма добавления -->
+        <div class="sub-add-card" id="addSubCard" hidden>
+          <div class="sub-add-card__head">
+            <h2 id="addSubTitle">Новая подписка</h2>
+          </div>
+          <div class="sub-fields">
+            <label class="field">
+              <svg class="ic field__ic"><use href="#ic-globe"/></svg>
+              <input type="text" id="subInput" placeholder="https://… или ключ vless://, ss://, awg://, hy2://, trojan://, vmess://" autocomplete="off" />
+            </label>
+            <label class="field">
+              <svg class="ic field__ic"><use href="#ic-edit"/></svg>
+              <input type="text" id="subNameInput" placeholder="Название (необязательно)" autocomplete="off" />
+            </label>
+          </div>
+          <div class="sub-add-card__foot">
+            <button class="btn btn--ghost btn--sm" id="cancelSubBtn" type="button">Отмена</button>
+            <button class="btn btn--primary btn--sm" id="saveSubBtn" type="button">Сохранить</button>
+          </div>
+        </div>
+
+        <!-- Список подписок -->
+        <div id="subsList" class="subs-stack"></div>
+
+        <!-- Отдельные узлы -->
+        <div id="customNodesSection" class="custom-sec" hidden>
+          <div class="sec-subhead">Отдельные ключи</div>
+          <div id="customNodesList" class="subs-stack"></div>
+        </div>
+
+        <!-- Пустое состояние -->
+        <div class="sub-empty" id="subsEmpty" hidden>
+          <div class="sub-empty__icon"><svg class="ic"><use href="#ic-server"/></svg></div>
+          <h3>Нет источников</h3>
+          <p>Добавьте URL подписки, нажмите «WARP AWG» выше или вставьте ключ vless, shadowsocks, wireguard, hysteria2.</p>
+          <button class="btn btn--primary btn--sm" id="emptyAddBtn" type="button" style="width:auto;padding:8px 16px">
+            <svg class="ic"><use href="#ic-plus"/></svg>Добавить источник
+          </button>
+        </div>
+
+        <!-- ===== КОМПАКТНЫЙ СПИСОК УЗЛОВ С ВЫДВИЖНЫМ ФИЛЬТРОМ ПО КНОПКЕ ===== -->
+        <div class="node-filter-card" id="nodesFilterCard">
+          <div class="nodes-compact-bar">
+            <label class="search search--sm" style="flex:1">
+              <svg class="ic"><use href="#ic-search"/></svg>
+              <input type="text" id="nodesSearchInput" placeholder="Поиск узла (страна, город, протокол, IP)…" autocomplete="off" />
+              <button type="button" class="search__clear" id="clearNodesSearchBtn" hidden title="Очистить">&times;</button>
+            </label>
+            <button type="button" class="btn-act btn-act--primary" id="nodesPingFilteredBtn" title="Измерить пинг для узлов">
+              <svg class="ic"><use href="#ic-bolt"/></svg><span id="nodesPingBtnLabel">Пинг</span>
+            </button>
+            <button type="button" class="btn-act" id="toggleNodeFiltersBtn" title="Показать или скрыть фильтры узлов">
+              <svg class="ic"><use href="#ic-filter"/></svg><span>Фильтр</span>
+              <span class="drawer__count" id="nodesFilterCountBadge" style="padding:1px 6px;font-size:11px">0</span>
+            </button>
+          </div>
+
+          <!-- Сворачиваемый блок фильтров (скрыт по умолчанию, не занимает место) -->
+          <div class="nf-collapsible" id="nodeFiltersBody" hidden>
+            <div class="nf-toggles">
+              <label class="mini-chk" title="Схлопывать узлы с одинаковым IP/доменом и портом">
+                <input type="checkbox" id="dedupNodesToggle" checked />
+                <span>Без дубликатов</span>
+              </label>
+              <label class="mini-chk" title="Скрывать рекламные, информационные и невалидные записи в подписках">
+                <input type="checkbox" id="hidePromoToggle" checked />
+                <span>Без рекламы</span>
+              </label>
+              <button type="button" class="f-chip" id="quickExcludeRuByBtn"><svg class="ic"><use href="#ic-ban"/></svg><span>Скрыть РФ/РБ</span></button>
+              <button type="button" class="f-chip" id="purgeFilteredNodesBtn" title="Удалить отсеянные фильтром узлы">Очистить мусор</button>
+              <button type="button" class="f-chip" id="resetFiltersBtn">Сброс</button>
+            </div>
+
+            <div class="adv-filter__inputs">
+              <label class="adv-field" style="flex:1">
+                <span>Исключить слова / страны:</span>
+                <input type="text" id="excludeFilterInput" placeholder="RU, BY, реклама, @bot" autocomplete="off" />
+              </label>
+              <label class="adv-field adv-field--sm">
+                <span>Макс. пинг:</span>
+                <input type="number" id="maxPingInput" placeholder="мс" min="10" max="5000" step="10" />
+              </label>
+            </div>
+
+            <div class="chip-bar" id="protoChips">
+              <button type="button" class="f-chip is-active" data-proto="all">Все</button>
+              <button type="button" class="f-chip f-chip--alive" data-proto="alive"><svg class="ic"><use href="#ic-bolt"/></svg><span>С пингом</span></button>
+              <button type="button" class="f-chip" data-proto="REALITY">REALITY</button>
+              <button type="button" class="f-chip" data-proto="XHTTP">XHTTP</button>
+              <button type="button" class="f-chip" data-proto="TCP">TCP</button>
+              <button type="button" class="f-chip" data-proto="WS_GRPC">WS/gRPC</button>
+              <button type="button" class="f-chip" data-proto="HY2">HY2</button>
+              <button type="button" class="f-chip" data-proto="AWG">AWG</button>
+              <button type="button" class="f-chip" data-proto="SS">SS</button>
+            </div>
+
+            <div class="chip-bar chip-bar--countries" id="countryChips"></div>
+          </div>
+
+          <div class="drawer-toolbar" style="margin-bottom:2px">
+            <div class="sort-seg" id="nodesSortBar" role="tablist" aria-label="Сортировка узлов">
+              <button type="button" class="is-active" data-sort="country_ping">Страна + пинг</button>
+              <button type="button" data-sort="ping">По пингу</button>
+              <button type="button" data-sort="sub_ping">Подписка</button>
+              <button type="button" data-sort="name">А–Я</button>
+            </div>
+            <button type="button" class="btn-collapse-all" id="nodesCollapseGroupsBtn">Свернуть</button>
+          </div>
+
+          <ul class="server-list server-list--embedded" id="nodesServerList"></ul>
+        </div>
+      </section>
+
+      <!-- ===== 4. ТРАФИК, МАТРИЦА ТСПУ, СПИДТЕСТ И ЖУРНАЛ ЯДРА ===== -->
+      <section class="view" data-view="connections">
+        <div class="conn-top-tabs">
+          <div class="seg seg--compact" id="trafficSubtabs">
+            <button type="button" class="is-active" data-ttab="conns">Активные соединения</button>
+            <button type="button" data-ttab="diag">Матрица ТСПУ & Спидтест</button>
+            <button type="button" data-ttab="logs">Журнал ядра</button>
+          </div>
+        </div>
+
+        <!-- Подвкладка 1: Активные соединения с созданием правил в 1 клик -->
+        <div class="ttab-pane" id="ttabConns">
+          <div class="conn-bar">
+            <div class="seg seg--compact" id="connFilter">
+              <button class="is-active" data-cf="all" type="button">Все</button>
+              <button data-cf="vpn" type="button">VPN</button>
+              <button data-cf="desync" type="button">Desync</button>
+              <button data-cf="direct" type="button">Прямые</button>
+            </div>
+            <div class="conn-bar__right">
+              <span class="conn-tot" id="connTotals">0 соед.</span>
+              <button type="button" class="btn-act btn-act--sm" id="closeAllConnsBtn" title="Сбросить все активные соединения в ядре">Сбросить все</button>
+            </div>
+          </div>
+          <div class="search-row" style="margin-bottom:6px">
+            <label class="search search--sm">
+              <svg class="ic"><use href="#ic-search"/></svg>
+              <input type="text" id="connSearchInput" placeholder="Фильтр соединений по процессу (.exe), домену или IP…" autocomplete="off" />
+            </label>
+          </div>
+          <div class="conn-wrap">
+            <ul class="conn-list" id="connList"></ul>
+            <p class="conn-empty" id="connEmpty">Нет активных соединений. Включите туннель, чтобы видеть сетевую активность приложений и создавать правила в 1 клик.</p>
+          </div>
+        </div>
+
+        <!-- Подвкладка 2: Матрица доступности ТСПУ и Встроенный Спидтест 10 МБ -->
+        <div class="ttab-pane" id="ttabDiag" hidden>
+          <div class="hairline-card diag-card">
+            <div class="diag-card__head">
+              <div>
+                <b>Матрица доступности и обхода ТСПУ</b>
+                <small>Одновременная проверка Рунета, Cloudflare, YouTube, Discord и Telegram через текущий канал</small>
+              </div>
+              <button type="button" class="btn-act btn-act--primary" id="runDiagMatrixBtn">
+                <svg class="ic"><use href="#ic-activity"/></svg><span id="runDiagMatrixTxt">Запустить проверку</span>
+              </button>
+            </div>
+            <div class="diag-matrix-grid" id="diagMatrixGrid">
+              <div class="diag-empty-hint">Нажмите «Запустить проверку», чтобы протестировать доступность ресурсов через туннель.</div>
+            </div>
+          </div>
+
+          <div class="hairline-card diag-card">
+            <div class="diag-card__head">
+              <div>
+                <b>Спидтест канала <span id="spServerBadge" class="sp-srv-badge">Зарубежный CDN</span></b>
+                <small>Замер пропускной способности, пиковой скорости и времени первого байта (TTFB)</small>
+              </div>
+              <button type="button" class="btn-act btn-act--primary" id="runSpeedtestBtn">
+                <svg class="ic"><use href="#ic-bolt"/></svg><span id="runSpeedtestTxt">Измерить скорость</span>
+              </button>
+            </div>
+
+            <div class="sp-controls-row">
+              <div class="seg seg--compact" id="speedtestSizeSeg" title="Объём тестового потока">
+                <button type="button" data-sp-mb="25">25 МБ</button>
+                <button type="button" class="is-active" data-sp-mb="100">100 МБ</button>
+                <button type="button" data-sp-mb="250">250 МБ</button>
+                <button type="button" data-sp-mb="500">500 МБ</button>
+              </div>
+              <select class="select-sm sp-prov-select" id="speedtestProviderSelect" title="Тестовый сервер">
+                <option value="auto">Авто (OVH / Cloudflare)</option>
+                <option value="ovh">OVH Europe (Франция)</option>
+                <option value="cloudflare">Cloudflare Edge</option>
+                <option value="selectel">Selectel (РФ · Прямой)</option>
+              </select>
+            </div>
+
+            <div class="sp-progress-wrap" id="speedtestProgressWrap" hidden>
+              <div class="sp-progress-meta">
+                <span id="spProgressText">Скачивание 0 / 100 МБ…</span>
+                <b id="spProgressPct">0%</b>
+              </div>
+              <div class="sp-progress-track">
+                <div class="sp-progress-fill" id="spProgressFill" style="width:0%"></div>
+              </div>
+            </div>
+
+            <div class="speedtest-stats speedtest-stats--4" id="speedtestStatsBox">
+              <div class="sp-metric">
+                <span>СКОРОСТЬ (Мбит/с)</span>
+                <b id="spMbpsVal">—</b>
+              </div>
+              <div class="sp-metric">
+                <span>ПИК (Мбит/с)</span>
+                <b id="spPeakVal">—</b>
+              </div>
+              <div class="sp-metric">
+                <span>ПОТОК (МБ/с)</span>
+                <b id="spMbsVal">—</b>
+              </div>
+              <div class="sp-metric">
+                <span>ОТКЛИК (TTFB)</span>
+                <b id="spTtfbVal">—</b>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Подвкладка 3: Живой журнал ядра tachyon-core -->
+        <div class="ttab-pane" id="ttabLogs" hidden>
+          <div class="conn-bar">
+            <div class="seg seg--compact" id="logLevelFilterSeg">
+              <button type="button" class="is-active" data-llf="all">Все</button>
+              <button type="button" data-llf="warn">WARN</button>
+              <button type="button" data-llf="error">ERROR</button>
+            </div>
+            <div class="conn-bar__right">
+              <button type="button" class="btn-act btn-act--sm" id="refreshLogTailBtn">Обновить</button>
+              <button type="button" class="btn-act btn-act--sm" id="copyLogTailBtn">Копировать</button>
+              <button type="button" class="btn-act btn-act--sm" id="openLogFileBtn"><span>Файл</span><svg class="ic"><use href="#ic-ext"/></svg></button>
+            </div>
+          </div>
+          <pre class="core-log-viewer" id="coreLogViewer">Нажмите «Обновить» для чтения журнала tachyon-core.log…</pre>
+        </div>
+      </section>
+
+      <!-- ===== 5. ОПЦИИ (НАСТРОЙКИ + DNS БЕНЧМАРК + FAKEIP + ЭКСПОРТ) ===== -->
+      <section class="view" data-view="settings">
+        <div class="settings-stack">
+
+          <!-- Левая колонка настроек -->
+          <div class="settings-col">
+
+            <!-- Секция 0: Внешний вид -->
+            <div class="s-group">
+              <div class="s-group__title">Оформление интерфейса</div>
+              <div class="s-card">
+                <div class="s-row">
+                  <div class="s-row__txt">
+                    <b>Цветовая тема</b>
+                    <small>Строгая графитовая (#0B0B0D) или чистая бумажная (#FAFAFA)</small>
+                  </div>
+                  <div class="seg seg--compact" id="themeSelectSeg">
+                    <button type="button" class="is-active" data-theme-val="dark">Тёмная</button>
+                    <button type="button" data-theme-val="light">Светлая</button>
+                  </div>
+                </div>
+                <label class="toggle">
+                  <span><b>Фоновые частицы</b><small>Атмосферный эффект на карточке реактора</small></span>
+                  <input type="checkbox" id="precipToggle"/><span class="track"></span>
+                </label>
+              </div>
+            </div>
+
+            <!-- Секция 2: Протокол и сетевой стек -->
+            <div class="s-group">
+              <div class="s-group__title">Сетевой стек и параметры туннеля</div>
+              <div class="s-card">
+                <div class="s-row" id="modeRow">
+                  <div class="s-row__txt">
+                    <b>Режим работы</b>
+                    <small id="modeRowHint">Виртуальный сетевой адаптер Wintun</small>
+                  </div>
+                  <div class="mini-select" id="modeSelect" data-value="tun">
+                    <button type="button" class="mini-select__btn">
+                      <span class="mini-select__val">TUN (весь ПК)</span>
+                      <svg class="mini-select__chev" viewBox="0 0 12 12" width="11" height="11"><path d="M2.5 4.5 6 8l3.5-3.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    </button>
+                    <ul class="mini-select__menu" hidden>
+                      <li data-value="tun">TUN (весь ПК)</li>
+                      <li data-value="proxy">Системный прокси</li>
+                    </ul>
+                  </div>
+                </div>
+
+                <div class="s-row">
+                  <div class="s-row__txt">
+                    <b>Размер пакета MTU (Wintun)</b>
+                    <small>Рекомендуется 1420 (или 1360 для мобильных модемов и PPPoE)</small>
+                  </div>
+                  <select id="mtuSelect" class="c-select">
+                    <option value="1420">1420 (Оптимально)</option>
+                    <option value="1400">1400</option>
+                    <option value="1360">1360 (Мобильные сети)</option>
+                    <option value="1280">1280 (Минимум IPv6)</option>
+                    <option value="1500">1500 (Ethernet)</option>
+                  </select>
+                </div>
+
+                <label class="toggle">
+                  <span><b>Фрагментация TLS на прокси (record_fragment)</b><small>Дробить TLS ClientHello при подключении к узлам VLESS / Trojan</small></span>
+                  <input type="checkbox" id="proxyTlsFragToggle" checked/><span class="track"></span>
+                </label>
+
+                <label class="toggle">
+                  <span><b>Доступ из локальной сети (Allow LAN)</b><small>Принимать входящие соединения на прокси 0.0.0.0:7897</small></span>
+                  <input type="checkbox" id="allowLanToggle"/><span class="track"></span>
+                </label>
+
+                <div class="s-row">
+                  <div class="s-row__txt">
+                    <b>Уровень подробности логов ядра</b>
+                    <small>Уровень записи событий в tachyon-core.log</small>
+                  </div>
+                  <select id="logLevelSelect" class="c-select">
+                    <option value="warn">WARN (Стандартно)</option>
+                    <option value="info">INFO (Подробно)</option>
+                    <option value="debug">DEBUG (Отладка)</option>
+                    <option value="error">ERROR (Только ошибки)</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+
+            <!-- Секция 4: Движок tachyon-core (обновление с GitHub) -->
+            <div class="s-group">
+              <div class="s-group__title">Движок tachyon-core</div>
+              <div class="s-card s-card--pad core-upd-card">
+                <div class="core-upd__row">
+                  <div class="core-upd__info">
+                    <div class="core-upd__title">
+                      <b>Ядро маршрутизации</b>
+                      <span class="core-ver-pill" id="coreVerBadge">v0.3.0</span>
+                    </div>
+                    <small id="coreUpdStatus">Репозиторий: Dushnilin/tachyon-core</small>
+                  </div>
+                  <div class="core-upd__actions">
+                    <button class="btn-act" id="checkCoreUpdBtn" type="button" title="Проверить релизы на GitHub">
+                      <svg class="ic"><use href="#ic-refresh"/></svg><span>Проверить</span>
+                    </button>
+                    <button class="btn-act btn-act--primary" id="installCoreUpdBtn" type="button" hidden>
+                      <svg class="ic"><use href="#ic-bolt"/></svg><span id="installCoreUpdTxt">Обновить</span>
+                    </button>
+                  </div>
+                </div>
+                <div class="core-upd__prog" id="coreUpdProgressWrap" hidden>
+                  <div class="core-upd__bar" id="coreUpdProgressBar" style="width:0%"></div>
+                </div>
+              </div>
+            </div>
+
+          </div>
+
+          <!-- Правая колонка настроек -->
+          <div class="settings-col">
+
+            <!-- Секция 1: DNS, FakeIP и Бенчмарк -->
+            <div class="s-group">
+              <div class="s-group__title">DNS, FakeIP и анти-спуфинг</div>
+              <div class="s-card">
+                <div class="s-row">
+                  <div class="s-row__txt">
+                    <b>Зашифрованный DNS-резолвер</b>
+                    <small>Защита от перехвата DNS провайдером и утечек</small>
+                  </div>
+                  <div class="mini-select" id="dnsSelect" data-value="auto">
+                    <button type="button" class="mini-select__btn">
+                      <span class="mini-select__val">Авто (Cloudflare DoH)</span>
+                      <svg class="mini-select__chev" viewBox="0 0 12 12" width="11" height="11"><path d="M2.5 4.5 6 8l3.5-3.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    </button>
+                    <ul class="mini-select__menu" hidden>
+                      <li data-value="auto">Авто (Cloudflare DoH)</li>
+                      <li data-value="cloudflare">Cloudflare 1.1.1.1</li>
+                      <li data-value="google">Google 8.8.8.8</li>
+                      <li data-value="quad9">Quad9 9.9.9.9</li>
+                      <li data-value="adguard">AdGuard DNS (без рекламы)</li>
+                      <li data-value="yandex">Яндекс 77.88.8.8</li>
+                    </ul>
+                  </div>
+                </div>
+
+                <div class="s-row">
+                  <div class="s-row__txt">
+                    <b>Маршрутизация DNS-запросов</b>
+                    <small>Сайты .ru/.рф через быстрый российский DNS, остальные — через туннель</small>
+                  </div>
+                  <select id="dnsRouteModeSelect" class="c-select">
+                    <option value="split_ru">Раздельный (РФ + Прокси)</option>
+                    <option value="proxy">Весь DNS через туннель</option>
+                    <option value="direct">Весь DNS напрямую</option>
+                  </select>
+                </div>
+
+                <label class="toggle">
+                  <span><b>Режим FakeIP (198.18.0.0/15)</b><small>Мгновенный синтетический DNS-ответ и 100% защита от утечек</small></span>
+                  <input type="checkbox" id="fakeIpToggle"/><span class="track"></span>
+                </label>
+
+                <div class="s-row s-row--col">
+                  <div class="s-row__top">
+                    <div class="s-row__txt">
+                      <b>Бенчмарк DNS-серверов</b>
+                      <small>Измерить время отклика и выбрать самый быстрый резолвер</small>
+                    </div>
+                    <button type="button" class="btn-act btn-act--primary" id="runDnsBenchBtn">
+                      <svg class="ic"><use href="#ic-bolt"/></svg><span id="runDnsBenchTxt">Тест задержки DNS</span>
+                    </button>
+                  </div>
+                  <div class="dns-bench-list" id="dnsBenchList" hidden></div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Секция 3: Автоматизация и защита -->
+            <div class="s-group">
+              <div class="s-group__title">Автоматизация и защита</div>
+              <div class="s-card">
+                <label class="toggle">
+                  <span><b>Подключаться при старте</b><small>К последнему выбранному узлу</small></span>
+                  <input type="checkbox" id="autoConnectToggle"/><span class="track"></span>
+                </label>
+                <label class="toggle">
+                  <span><b>Автовыбор быстрого узла</b><small>Сортировка по минимальному пингу</small></span>
+                  <input type="checkbox" id="autoServerToggle" checked/><span class="track"></span>
+                </label>
+                <label class="toggle">
+                  <span><b>Авто-переподключение</b><small>Удерживать связь при обрывах</small></span>
+                  <input type="checkbox" id="autoReconnectToggle" checked/><span class="track"></span>
+                </label>
+                <label class="toggle">
+                  <span><b>Kill Switch</b><small>Блокировать трафик вне туннеля через Windows Firewall</small></span>
+                  <input type="checkbox" id="killSwitchToggle"/><span class="track"></span>
+                </label>
+                <label class="toggle" id="hotkeysRow" hidden>
+                  <span><b>Горячие клавиши</b><small>Ctrl+Alt+S (вкл/выкл), Ctrl+Alt+N (след. узел)</small></span>
+                  <input type="checkbox" id="hotkeysToggle"/><span class="track"></span>
+                </label>
+                <label class="toggle" id="safeModeRow" hidden>
+                  <span><b>Безопасный режим GPU</b><small>Программная отрисовка окна</small></span>
+                  <input type="checkbox" id="safeModeToggle"/><span class="track"></span>
+                </label>
+              </div>
+            </div>
+
+            <!-- Секция 5: Диагностика, резервное копирование и обслуживание -->
+            <div class="s-group">
+              <div class="s-group__title">Резервная копия и обслуживание</div>
+              <div class="s-card s-card--pad">
+                <div class="tools-grid">
+                  <button class="tool-btn" id="exportConfigBtn" type="button">
+                    <svg class="ic"><use href="#ic-copy"/></svg><span>Экспорт JSON</span>
+                  </button>
+                  <button class="tool-btn" id="importConfigBtn" type="button">
+                    <svg class="ic"><use href="#ic-plus"/></svg><span>Импорт JSON</span>
+                  </button>
+                  <button class="tool-btn" id="selfCheckBtn" type="button">
+                    <svg class="ic"><use href="#ic-shield"/></svg><span>Проверить сеть</span>
+                  </button>
+                  <button class="tool-btn" id="openLogBtnCore" type="button">
+                    <svg class="ic"><use href="#ic-search"/></svg><span>Лог ядра</span>
+                  </button>
+                  <button class="tool-btn" id="collectLogsBtn" type="button">
+                    <svg class="ic"><use href="#ic-server"/></svg><span>Собрать отчёт</span>
+                  </button>
+                  <button class="tool-btn" id="checkUpdBtn" type="button">
+                    <svg class="ic"><use href="#ic-refresh"/></svg><span>Обновить клиент</span>
+                  </button>
+                </div>
+                <small id="selfCheckHint" hidden></small>
+                <ul class="checklist" id="selfCheckList" hidden></ul>
+                <div class="checksum" id="selfCheckSum" hidden></div>
+                <div class="about-bar">
+                  <span>Tachyon Core <b id="aboutVersion">v0.3.0</b></span>
+                  <button class="link-btn" id="githubBtn" type="button"><span>GitHub</span><svg class="ic"><use href="#ic-ext"/></svg></button>
+                </div>
+              </div>
+            </div>
+
+          </div>
+
+        </div>
+      </section>
+
+    </main>
+
+    <!-- Нижняя информационная строка состояния -->
+    <footer class="statusbar" id="statusBar">
+      <div class="statusbar__left">
+        <span class="statusbar__dot" id="footerDot"></span>
+        <span>Ядро <b id="footerCoreVer">tachyon-core 0.3.0</b></span>
+        <span class="statusbar__sep">·</span>
+        <span id="footerDnsLabel">DNS: Авто</span>
+      </div>
+      <div class="statusbar__right">
+        <span id="footerStatsLabel">Узлов: 0 · Правил: 0</span>
+        <span class="statusbar__sep">·</span>
+        <button type="button" class="statusbar__link" id="footerLogBtn">Лог ядра</button>
+      </div>
+    </footer>
+  </div>
+
+  <!-- ===== ШТОРКА ВЫБОРА СЕРВЕРА ===== -->
+  <div class="drawer" id="serverDrawer" hidden>
+    <div class="drawer__backdrop" id="drawerBackdrop"></div>
+    <aside class="drawer__panel">
+      <div class="drawer__head">
+        <div class="drawer__title-wrap">
+          <h2>Выбор локации</h2>
+          <span class="drawer__count" id="drawerCountBadge">0</span>
+        </div>
+        <div class="drawer__actions">
+          <button class="btn-act" id="pingAllBtn" type="button" title="Измерить пинг только для отфильтрованных узлов">
+            <svg class="ic"><use href="#ic-bolt"/></svg><span id="pingBtnLabel">Пинг</span>
+          </button>
+          <button class="btn-act" id="openNodesFilterFromDrawerBtn" type="button" title="Перейти к фильтрации узлов во вкладке «Узлы»">
+            <svg class="ic"><use href="#ic-filter"/></svg><span>Фильтры</span><em class="chip-count" id="advFilterBadge" hidden>0</em>
+          </button>
+          <button class="btn-icon" id="drawerClose" type="button" title="Закрыть">
+            <svg class="ic"><use href="#ic-close"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- Поиск -->
+      <div class="search-row">
+        <label class="search">
+          <svg class="ic"><use href="#ic-search"/></svg>
+          <input type="text" id="serverSearch" placeholder="Поиск среди отфильтрованных узлов…" autocomplete="off" />
+          <button type="button" class="search__clear" id="clearSearchBtn" hidden title="Очистить">&times;</button>
+        </label>
+      </div>
+
+      <!-- Панель сортировки -->
+      <div class="drawer-toolbar">
+        <div class="sort-seg" id="sortBar" role="tablist" aria-label="Сортировка узлов">
+          <button type="button" class="is-active" data-sort="country_ping" title="Группировать по стране, внутри страны — по возрастанию пинга">Страна + пинг</button>
+          <button type="button" data-sort="ping" title="Самые быстрые серверы сверху">По пингу</button>
+          <button type="button" data-sort="sub_ping" title="Группировать по подписке, внутри — по пингу">Подписка</button>
+          <button type="button" data-sort="name" title="По алфавиту А–Я">А–Я</button>
+        </div>
+        <button type="button" class="btn-collapse-all" id="collapseGroupsBtn" title="Свернуть или развернуть все группы">Свернуть</button>
+      </div>
+
+      <span id="subSyncText" hidden></span>
+      <ul class="server-list" id="serverList"></ul>
+    </aside>
+  </div>
+
+  <!-- Модальное окно QR-кода и ключа профиля -->
+  <div class="cmodal" id="qrModal" hidden>
+    <div class="cmodal__backdrop" id="qrBackdrop"></div>
+    <div class="cmodal__box cmodal__box--qr">
+      <div class="qr-head">
+        <b id="qrNodeTitle">Профиль</b>
+        <button type="button" class="btn-icon" id="qrCloseBtn" style="width:28px;height:28px"><svg class="ic"><use href="#ic-close"/></svg></button>
+      </div>
+      <div class="qr-canvas-wrap">
+        <img id="qrImage" alt="QR-код профиля" width="200" height="200" />
+      </div>
+      <input type="text" class="cmodal__input" id="qrUriInput" readonly />
+      <div class="cmodal__actions">
+        <button class="btn btn--primary btn--sm" id="copyQrUriBtn" type="button">Скопировать ключ</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <!-- Модальные окна подтверждения и ввода -->
+  <div class="cmodal" id="confirmModal" hidden>
+    <div class="cmodal__backdrop" id="confirmBackdrop"></div>
+    <div class="cmodal__box">
+      <p id="confirmText">—</p>
+      <div class="cmodal__actions">
+        <button class="btn btn--ghost btn--sm" id="confirmNo" type="button">Отмена</button>
+        <button class="btn btn--primary btn--sm" id="confirmYes" type="button">Подтвердить</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="cmodal" id="promptModal" hidden>
+    <div class="cmodal__backdrop" id="promptBackdrop"></div>
+    <div class="cmodal__box">
+      <p id="promptText">—</p>
+      <input type="text" class="cmodal__input" id="promptInput" autocomplete="off" spellcheck="false" />
+      <div class="cmodal__actions">
+        <button class="btn btn--ghost btn--sm" id="promptNo" type="button">Отмена</button>
+        <button class="btn btn--primary btn--sm" id="promptYes" type="button">Сохранить</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="config.js"></script>
+  <script src="api.js"></script>
+  <script src="rain.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
