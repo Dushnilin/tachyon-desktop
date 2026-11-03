@@ -410,9 +410,9 @@
   function updateActiveServerDisplay() {
     const s = activeServer();
     if (vpnPrefs?.route === 'desync-only') {
-      $('#currentServerName').textContent = 'Tachyon Desync (DPI Bypass)';
+      $('#currentServerName').textContent = 'Tachyon Desync';
       const subEl = $('#currentServerSub');
-      if (subEl) subEl.textContent = `Прямой обход блокировок без VPN · Пресет: ${DESYNC_PRESET_LABELS[desyncPrefs.preset] || 'Авто'}`;
+      if (subEl) subEl.textContent = `Прямая десинхронизация пакетов без VPN · Пресет: ${DESYNC_PRESET_LABELS[desyncPrefs.preset] || 'Авто'}`;
       const flagEl = $('#pickFlag');
       if (flagEl) flagEl.src = 'flags/globe.svg';
       $('#mPing').textContent = '–';
@@ -1617,8 +1617,9 @@
         const cleanVal = hostVal.replace(/:\d+$/, '');
         const isIp = /^\d{1,3}(\.\d{1,3}){3}$/.test(cleanVal);
         const existing = customRouteRules.find(r => r.value.toLowerCase() === cleanVal.toLowerCase());
+        const isSelective = vpnPrefs.route === 'selective';
         const nextAct = existing
-          ? (existing.action === 'vpn' ? 'desync' : (existing.action === 'desync' ? 'direct' : 'vpn'))
+          ? (existing.action === 'vpn' ? 'desync' : (existing.action === 'desync' && !isSelective ? 'direct' : 'vpn'))
           : 'vpn';
         if (existing) {
           existing.action = nextAct;
@@ -1642,7 +1643,7 @@
     dns: 'auto',
     dnsBootstrap: '77.88.8.8',
     fakeIp: false,
-    dnsRouteMode: 'smart',
+    dnsRouteMode: 'split_ru',
     mtu: 1400,
     allowLan: false,
     proxyTlsFragment: false,
@@ -1736,6 +1737,7 @@
   const DESYNC_PRESET_LABELS = {
     auto: 'Авто (Adaptive)',
     youtube_discord: 'YT + Discord',
+    multi_disorder: 'Multi-Disorder',
     fake_split: 'Fake + Split',
     fake_disorder: 'Fake + Disorder',
     tlsrec: 'TLS Record',
@@ -1755,6 +1757,9 @@
       mode: 'auto',
       fooling: 'md5',
       splitPos: 'midsld',
+      tlsrecFirst: true,
+      seqovl: 0,
+      ipfrag: false,
       fakeTtl: 6,
       fakeSni: 'www.google.com',
       repeats: 2,
@@ -1774,6 +1779,9 @@
       Object.assign(desyncPrefs, savedD);
       if (desyncPrefs.fooling === 'md5sig') desyncPrefs.fooling = 'md5';
       if (desyncPrefs.autoDirect === undefined) desyncPrefs.autoDirect = true;
+      if (desyncPrefs.tlsrecFirst === undefined) desyncPrefs.tlsrecFirst = true;
+      if (desyncPrefs.seqovl === undefined) desyncPrefs.seqovl = 0;
+      if (desyncPrefs.ipfrag === undefined) desyncPrefs.ipfrag = false;
     }
   } catch {}
 
@@ -1787,15 +1795,16 @@
     {
       cat: 'ru_base',
       icon: 'ic-globe',
-      title: 'Базовые РФ и обход блокировок',
+      title: 'Базовые списки РФ и реестры маршрутизации',
       items: [
         { name: 'ru_domains', title: 'Домены РФ (.ru / .рф / .su)', desc: 'Все российские домены и популярные сервисы РФ' },
         { name: 'geoip_ru', title: 'IP-адреса РФ (GeoIP RU)', desc: 'Все подсети российских провайдеров и ЦОД' },
-        { name: 'russia_inside', title: 'Внутренние сервисы РФ', desc: 'Госуслуги, банки, ФНС, маркетплейсы, РЖД (всегда напрямую)' },
-        { name: 'ru_whitelist', title: 'Белый список РФ', desc: 'Критическая инфраструктура РФ, чувствительная к иностранным IP' },
-        { name: 'ru_blocked', title: 'Заблокированные в РФ (ru_blocked)', desc: 'Сводный список ресурсов, заблокированных ТСПУ / РКН' },
-        { name: 'antifilter', title: 'Antifilter Community', desc: 'База заблокированных доменов и IP-адресов Antifilter' },
-        { name: 'reestr', title: 'Реестр запрещённых сайтов', desc: 'Выгрузка доменов из реестра блокировок' }
+        { name: 'ru_only_inside', title: 'Внутренние сервисы РФ (Госуслуги, банки)', desc: 'Госуслуги, банки, ФНС, маркетплейсы, РЖД (чувствительные к зарубежным IP)' },
+        { name: 'ru_whitelist', title: 'Белый список РФ', desc: 'Критическая инфраструктура РФ, кассы, капчи и госсайты' },
+        { name: 'ru_blocked', title: 'Ресурсы с фильтрацией на маршруте (ru_blocked)', desc: 'Сводный очищенный список доменов с сетевыми ограничениями' },
+        { name: 'russia_inside', title: 'Сводный реестр доменов (russia_inside)', desc: 'Re:filter + Antifilter + зарубежные сервисы с геоограничениями (73 тыс. доменов)' },
+        { name: 'antifilter', title: 'Antifilter Community', desc: 'База доменов и IP-адресов сообщества Antifilter' },
+        { name: 'reestr', title: 'Реестр доменов (reestr)', desc: 'Сводная выгрузка доменов с сетевыми ограничениями' }
       ]
     },
     {
@@ -1895,13 +1904,20 @@
      РФ и банки — напрямую, YouTube и Discord — через Desync */
   let communityListsState = {
     ru_domains: 'direct',
-    russia_inside: 'direct',
+    ru_only_inside: 'direct',
     youtube: 'desync',
     discord: 'desync'
   };
   try {
     const savedL = JSON.parse(localStorage.getItem(LISTS_STATE_KEY) || 'null');
-    if (savedL && typeof savedL === 'object') communityListsState = savedL;
+    if (savedL && typeof savedL === 'object') {
+      if (savedL.russia_inside === 'direct') {
+        delete savedL.russia_inside;
+        if (!savedL.ru_only_inside) savedL.ru_only_inside = 'direct';
+        try { localStorage.setItem(LISTS_STATE_KEY, JSON.stringify(savedL)); } catch {}
+      }
+      communityListsState = savedL;
+    }
   } catch {}
 
   function saveCommunityListsState() {
@@ -1921,9 +1937,17 @@
   }
 
   function getActiveCommunityListsArray() {
+    const isSelective = vpnPrefs.route === 'selective';
     return Object.entries(communityListsState)
-      .filter(([, act]) => act && act !== 'off')
+      .filter(([, act]) => act && act !== 'off' && (!isSelective || act !== 'direct'))
       .map(([name, action]) => ({ name, action }));
+  }
+
+  function getActiveCustomRulesArray() {
+    const isSelective = vpnPrefs.route === 'selective';
+    return isSelective
+      ? customRouteRules.filter(r => r.action !== 'direct')
+      : customRouteRules;
   }
 
   let reconnectTimer = null;
@@ -1938,17 +1962,34 @@
   }
 
   function updateRoutingSummaryUI() {
+    const isSelective = vpnPrefs.route === 'selective';
     const activeLists = getActiveCommunityListsArray();
-    const totalRules = activeLists.length + customRouteRules.length;
+    const activeCustom = getActiveCustomRulesArray();
+    const totalRules = activeLists.length + activeCustom.length;
 
     const navBadge = $('#routeRulesBadge');
     if (navBadge) navBadge.textContent = String(totalRules);
 
     const customBadge = $('#customRulesCount');
-    if (customBadge) customBadge.textContent = String(customRouteRules.length);
+    if (customBadge) customBadge.textContent = String(activeCustom.length);
 
     const activeListsBadge = $('#activeListsCountBadge');
     if (activeListsBadge) activeListsBadge.textContent = String(activeLists.length);
+
+    /* В режиме «Точечно» блокируем выбор действия «Прямой» при создании новых правил */
+    const customActSel = $('#customRuleAction');
+    if (customActSel) {
+      const dirOpt = $('option[value="direct"]', customActSel);
+      if (dirOpt) dirOpt.disabled = isSelective;
+      if (isSelective && customActSel.value === 'direct') {
+        customActSel.value = 'vpn';
+      }
+    }
+    $$('#quickCustomTemplates button[data-qrule]').forEach(btn => {
+      const isDirTpl = (btn.dataset.qrule || '').endsWith(':direct');
+      btn.disabled = isSelective && isDirTpl;
+      btn.classList.toggle('is-disabled', isSelective && isDirTpl);
+    });
 
     const dPill = $('#summaryDesyncPill');
     if (dPill) {
@@ -1999,10 +2040,14 @@
     const techSum = $('#desyncTechSummary');
     if (techSum) {
       const m = desyncPrefs.preset === 'custom' ? desyncPrefs.mode : desyncPrefs.preset;
+      const tr = desyncPrefs.tlsrecFirst !== false ? ' · TLSRec' : '';
+      const ipf = desyncPrefs.ipfrag ? ' · IPFrag' : '';
+      const ovl = desyncPrefs.seqovl > 0 ? ` · seqovl:${desyncPrefs.seqovl}` : '';
       const q = desyncPrefs.blockQuic ? ' · Блок QUIC' : '';
       const u = desyncPrefs.udpFake ? ` · UDP Fake (×${desyncPrefs.udpRepeats || 6})` : '';
       const ad = desyncPrefs.autoDirect ? ' · Auto-Direct' : '';
-      techSum.textContent = `Пресет: ${m} · ${desyncPrefs.fooling} · split:${desyncPrefs.splitPos} · TTL ${desyncPrefs.fakeTtl} · SNI ${desyncPrefs.fakeSni || 'www.google.com'}${u}${q}${ad}`;
+      const ttlLbl = (desyncPrefs.preset === 'auto' && Number(desyncPrefs.fakeTtl || 6) === 6) ? 'TTL auto' : `TTL ${desyncPrefs.fakeTtl}`;
+      techSum.textContent = `Пресет: ${m} · ${desyncPrefs.fooling} · split:${desyncPrefs.splitPos}${tr}${ovl}${ipf} · ${ttlLbl} · SNI ${desyncPrefs.fakeSni || 'www.google.com'}${u}${q}${ad}`;
     }
 
     /* Синхронизация быстрых плиток главного экрана и статус-бара */
@@ -2088,7 +2133,18 @@
           desyncPrefs.enabled = true;
           saveDesyncPrefs();
         }
+        if (vpnPrefs.route === 'selective') {
+          const hasAnyVpnRule =
+            Object.values(communityListsState).some(v => v === 'vpn') ||
+            customRouteRules.some(r => r.action === 'vpn');
+          if (!hasAnyVpnRule) {
+            communityListsState.ru_blocked = 'vpn';
+            saveCommunityListsState();
+          }
+        }
         saveVpnPrefs();
+        renderCommunityLists();
+        renderCustomRules();
         updateRoutingSummaryUI();
         applyReconnectIfActive();
       });
@@ -2128,6 +2184,9 @@
         desyncPrefs.mode = 'auto';
         desyncPrefs.fooling = 'md5';
         desyncPrefs.splitPos = 'midsld';
+        desyncPrefs.tlsrecFirst = true;
+        desyncPrefs.seqovl = 0;
+        desyncPrefs.ipfrag = false;
         desyncPrefs.fakeTtl = 6;
         desyncPrefs.repeats = 2;
         desyncPrefs.splitDelayMs = 1;
@@ -2138,58 +2197,78 @@
         desyncPrefs.autoTune = true;
       } else if (p === 'youtube_discord') {
         desyncPrefs.mode = 'fake_split';
-        desyncPrefs.fooling = 'badseq';
+        desyncPrefs.fooling = 'md5';
         desyncPrefs.splitPos = 'midsld';
-        desyncPrefs.fakeTtl = 5;
-        desyncPrefs.repeats = 4;
+        desyncPrefs.tlsrecFirst = true;
+        desyncPrefs.seqovl = 0;
+        desyncPrefs.fakeTtl = 6;
+        desyncPrefs.repeats = 3;
         desyncPrefs.splitDelayMs = 1;
         desyncPrefs.udpFake = true;
         desyncPrefs.udpRepeats = 6;
-        desyncPrefs.udpFakeTtl = 5;
+        desyncPrefs.udpFakeTtl = 6;
         desyncPrefs.blockQuic = true;
         desyncPrefs.autoTune = true;
+      } else if (p === 'multi_disorder') {
+        desyncPrefs.mode = 'multi_disorder';
+        desyncPrefs.fooling = 'badsum';
+        desyncPrefs.splitPos = 'midsld';
+        desyncPrefs.tlsrecFirst = true;
+        desyncPrefs.fakeSni = 'rzd.ru';
+        desyncPrefs.fakeTtl = 6;
+        desyncPrefs.repeats = 2;
+        desyncPrefs.udpFake = true;
+        desyncPrefs.blockQuic = true;
       } else if (p === 'fake_split') {
         desyncPrefs.mode = 'fake_split';
         desyncPrefs.fooling = 'md5';
         desyncPrefs.splitPos = 'midsld';
+        desyncPrefs.tlsrecFirst = true;
         desyncPrefs.fakeTtl = 6;
         desyncPrefs.repeats = 2;
         desyncPrefs.udpFake = true;
       } else if (p === 'fake_disorder') {
         desyncPrefs.mode = 'fake_disorder';
-        desyncPrefs.fooling = 'badseq';
-        desyncPrefs.splitPos = 'midsld';
+        desyncPrefs.fooling = 'md5';
+        desyncPrefs.splitPos = 'sniext+1';
+        desyncPrefs.tlsrecFirst = true;
         desyncPrefs.fakeTtl = 6;
-        desyncPrefs.repeats = 4;
+        desyncPrefs.repeats = 3;
         desyncPrefs.udpFake = true;
         desyncPrefs.blockQuic = true;
       } else if (p === 'tlsrec') {
         desyncPrefs.mode = 'tlsrec';
         desyncPrefs.splitPos = 'sni';
+        desyncPrefs.tlsrecFirst = false;
         desyncPrefs.blockQuic = true;
       } else if (p === 'multi_split') {
         desyncPrefs.mode = 'multi_split';
         desyncPrefs.fooling = 'md5';
         desyncPrefs.splitPos = 'midsld';
+        desyncPrefs.tlsrecFirst = true;
         desyncPrefs.fakeTtl = 6;
-        desyncPrefs.repeats = 3;
+        desyncPrefs.repeats = 2;
         desyncPrefs.udpFake = true;
       } else if (p === 'split') {
         desyncPrefs.mode = 'split';
         desyncPrefs.splitPos = 'midsld';
+        desyncPrefs.tlsrecFirst = false;
         desyncPrefs.udpFake = false;
       } else if (p === 'disorder') {
         desyncPrefs.mode = 'disorder';
-        desyncPrefs.splitPos = '1';
+        desyncPrefs.splitPos = 'sniext+1';
+        desyncPrefs.tlsrecFirst = true;
         desyncPrefs.udpFake = false;
       } else if (p === 'fake') {
         desyncPrefs.mode = 'fake';
-        desyncPrefs.fooling = 'md5';
+        desyncPrefs.fooling = 'autottl';
+        desyncPrefs.splitPos = 'sni';
         desyncPrefs.fakeTtl = 6;
         desyncPrefs.udpFake = true;
       } else if (p === 'oob') {
         desyncPrefs.mode = 'oob';
-        desyncPrefs.splitPos = '1';
+        desyncPrefs.splitPos = 'midsld';
+        desyncPrefs.tlsrecFirst = true;
         desyncPrefs.udpFake = false;
       }
       syncDesyncAdvInputs();
@@ -2212,6 +2291,8 @@
 
   function syncDesyncAdvInputs() {
     const ad = $('#desyncAutoDirectToggle'); if (ad) ad.checked = desyncPrefs.autoDirect !== false;
+    const tr = $('#desyncTlsrecFirstToggle'); if (tr) tr.checked = desyncPrefs.tlsrecFirst !== false;
+    const ipf = $('#desyncIpfragToggle'); if (ipf) ipf.checked = !!desyncPrefs.ipfrag;
     const m = $('#desyncModeSelect'); if (m) m.value = desyncPrefs.mode || 'auto';
     const f = $('#desyncFoolingSelect'); if (f) f.value = (desyncPrefs.fooling === 'md5sig' ? 'md5' : (desyncPrefs.fooling || 'md5'));
 
@@ -2228,6 +2309,7 @@
     const sni = $('#desyncFakeSniInput'); if (sni) sni.value = desyncPrefs.fakeSni || 'www.google.com';
     const rep = $('#desyncRepeatsInput'); if (rep) rep.value = String(desyncPrefs.repeats || 2);
     const dly = $('#desyncSplitDelayInput'); if (dly) dly.value = String(desyncPrefs.splitDelayMs ?? 1);
+    const ovl = $('#desyncSeqovlInput'); if (ovl) ovl.value = String(desyncPrefs.seqovl || 0);
     const uf = $('#desyncUdpFakeToggle'); if (uf) uf.checked = !!desyncPrefs.udpFake;
     const urep = $('#desyncUdpRepeatsInput'); if (urep) urep.value = String(desyncPrefs.udpRepeats || 6);
     const uttl = $('#desyncUdpFakeTtlInput'); if (uttl) uttl.value = String(desyncPrefs.udpFakeTtl || 6);
@@ -2242,12 +2324,14 @@
     const offField = $('#desyncCustomOffsetField');
     if (offField) offField.hidden = spSelectVal !== 'custom_offset';
 
-    if (targetId === 'desyncModeSelect' || targetId === 'desyncFoolingSelect' || targetId === 'desyncSplitPosSelect' || targetId === 'desyncSplitOffsetInput') {
+    if (targetId === 'desyncModeSelect' || targetId === 'desyncFoolingSelect' || targetId === 'desyncSplitPosSelect' || targetId === 'desyncSplitOffsetInput' || targetId === 'desyncSeqovlInput') {
       desyncPrefs.preset = 'custom';
     }
 
     desyncPrefs.mode = $('#desyncModeSelect')?.value || 'auto';
     desyncPrefs.fooling = $('#desyncFoolingSelect')?.value || 'md5';
+    desyncPrefs.tlsrecFirst = !!$('#desyncTlsrecFirstToggle')?.checked;
+    desyncPrefs.ipfrag = !!$('#desyncIpfragToggle')?.checked;
 
     if (spSelectVal === 'custom_offset') {
       const n = Math.max(1, Math.min(1400, parseInt($('#desyncSplitOffsetInput')?.value, 10) || 3));
@@ -2260,6 +2344,7 @@
     desyncPrefs.fakeSni = ($('#desyncFakeSniInput')?.value || 'www.google.com').trim() || 'www.google.com';
     desyncPrefs.repeats = Math.max(1, Math.min(100, parseInt($('#desyncRepeatsInput')?.value, 10) || 2));
     desyncPrefs.splitDelayMs = Math.max(0, Math.min(1000, parseInt($('#desyncSplitDelayInput')?.value, 10) || 0));
+    desyncPrefs.seqovl = Math.max(0, Math.min(256, parseInt($('#desyncSeqovlInput')?.value, 10) || 0));
     desyncPrefs.udpFake = !!$('#desyncUdpFakeToggle')?.checked;
     desyncPrefs.udpRepeats = Math.max(1, Math.min(50, parseInt($('#desyncUdpRepeatsInput')?.value, 10) || 6));
     desyncPrefs.udpFakeTtl = Math.max(1, Math.min(128, parseInt($('#desyncUdpFakeTtlInput')?.value, 10) || 6));
@@ -2271,6 +2356,7 @@
 
   ['#desyncModeSelect', '#desyncFoolingSelect', '#desyncSplitPosSelect', '#desyncSplitOffsetInput',
    '#desyncFakeTtlInput', '#desyncFakeSniInput', '#desyncRepeatsInput', '#desyncSplitDelayInput',
+   '#desyncSeqovlInput', '#desyncTlsrecFirstToggle', '#desyncIpfragToggle',
    '#desyncUdpFakeToggle', '#desyncUdpRepeatsInput', '#desyncUdpFakeTtlInput',
    '#desyncBlockQuicToggle', '#desyncAutoTuneToggle'].forEach(sel => {
     $(sel)?.addEventListener('change', onCustomDesyncFieldChange);
@@ -2331,6 +2417,7 @@
     const box = $('#communityListsContainer');
     if (!box) return;
     const q = ($('#listsSearchInput')?.value || '').trim().toLowerCase();
+    const isSelective = vpnPrefs.route === 'selective';
 
     const collapseBtn = $('#collapseAllListsBtn');
     if (collapseBtn) {
@@ -2341,8 +2428,9 @@
     let html = '';
     for (const group of TACHYON_LISTS_CATALOG) {
       const items = group.items.filter(it => {
-        const act = communityListsState[it.name] || 'off';
-        if (listsFilterMode === 'active' && act === 'off') return false;
+        const rawAct = communityListsState[it.name] || 'off';
+        const effAct = isSelective && rawAct === 'direct' ? 'off' : rawAct;
+        if (listsFilterMode === 'active' && effAct === 'off') return false;
         if (q) {
           const hay = `${it.name} ${it.title} ${it.desc}`.toLowerCase();
           if (!hay.includes(q)) return false;
@@ -2352,7 +2440,10 @@
 
       if (!items.length) continue;
 
-      const activeInGroup = group.items.filter(it => (communityListsState[it.name] || 'off') !== 'off').length;
+      const activeInGroup = group.items.filter(it => {
+        const a = communityListsState[it.name] || 'off';
+        return a !== 'off' && (!isSelective || a !== 'direct');
+      }).length;
       const isCollapsed = !q && listsFilterMode !== 'active' && collapsedListCats.has(group.cat);
 
       html += `
@@ -2369,7 +2460,11 @@
           </div>
           <div class="list-cat-body">
             ${items.map(it => {
-              const cur = communityListsState[it.name] || 'off';
+              const rawCur = communityListsState[it.name] || 'off';
+              const cur = isSelective && rawCur === 'direct' ? 'off' : rawCur;
+              const dirTitle = isSelective
+                ? 'Недоступно в режиме «Точечно»: весь трафик вне правил уже идёт напрямую'
+                : 'Направлять напрямую в обход VPN';
               return `
                 <div class="list-row" data-list-name="${it.name}" data-state="${cur}">
                   <div class="list-row__info">
@@ -2383,7 +2478,7 @@
                     <button type="button" class="${cur === 'off' ? 'is-active' : ''}" data-act="off" title="Не использовать список">Выкл</button>
                     <button type="button" class="${cur === 'vpn' ? 'is-active' : ''}" data-act="vpn" title="Направлять через VPN-сервер">VPN</button>
                     <button type="button" class="${cur === 'desync' ? 'is-active' : ''}" data-act="desync" title="Направлять напрямую с обходом DPI (Tachyon Desync)">Desync</button>
-                    <button type="button" class="${cur === 'direct' ? 'is-active' : ''}" data-act="direct" title="Направлять напрямую в обход VPN">Прямой</button>
+                    <button type="button" class="${cur === 'direct' ? 'is-active' : ''} ${isSelective ? 'is-disabled' : ''}" data-act="direct" ${isSelective ? 'disabled' : ''} title="${dirTitle}">Прямой</button>
                     <button type="button" class="${cur === 'block' ? 'is-active' : ''}" data-act="block" title="Блокировать соединения">Блок</button>
                   </div>
                 </div>
@@ -2411,9 +2506,14 @@
 
     $$('.act-seg[data-list] button[data-act]', box).forEach(btn => {
       btn.addEventListener('click', () => {
+        if (btn.disabled) return;
         const parent = btn.closest('.act-seg');
         const listName = parent.dataset.list;
         const act = btn.dataset.act;
+        if (vpnPrefs.route === 'selective' && act === 'direct') {
+          toast('В точечном режиме весь трафик уже идёт напрямую по умолчанию', true);
+          return;
+        }
         if (act === 'off') delete communityListsState[listName];
         else communityListsState[listName] = act;
 
@@ -2438,7 +2538,7 @@
       communityListsState = {
         ru_domains: 'direct',
         geoip_ru: 'direct',
-        russia_inside: 'direct',
+        ru_only_inside: 'direct',
         ru_whitelist: 'direct',
         youtube: 'desync',
         discord: 'desync',
@@ -2458,7 +2558,7 @@
         ru_blocked: 'desync',
         torrents: 'desync'
       };
-      toast('Режим «Только Desync»: обход DPI без VPN-сервера');
+      toast('Режим «Только Desync»: адаптивная доставка без VPN-сервера');
     } else if (b === 'selective_vpn') {
       vpnPrefs.route = 'selective';
       desyncPrefs.enabled = true;
@@ -2548,9 +2648,12 @@
     }
     if (empty) empty.hidden = true;
 
+    const isSelective = vpnPrefs.route === 'selective';
     const typeLabels = { domain: 'ДОМЕН', ip: 'IP/CIDR', process: 'EXE' };
-    list.innerHTML = customRouteRules.map((r, idx) => `
-      <li class="custom-rule-item" data-idx="${idx}">
+    list.innerHTML = customRouteRules.map((r, idx) => {
+      const isBlockedDirect = isSelective && r.action === 'direct';
+      return `
+      <li class="custom-rule-item ${isBlockedDirect ? 'is-disabled-rule' : ''}" data-idx="${idx}">
         <div class="custom-rule-item__left">
           <span class="custom-rule-item__type">${typeLabels[r.type] || 'ДОМЕН'}</span>
           <span class="custom-rule-item__val" title="${escapeHtml(r.value)}">${escapeHtml(r.value)}</span>
@@ -2559,7 +2662,7 @@
           <div class="act-seg" data-cidx="${idx}">
             <button type="button" class="${r.action === 'vpn' ? 'is-active' : ''}" data-act="vpn">VPN</button>
             <button type="button" class="${r.action === 'desync' ? 'is-active' : ''}" data-act="desync">Desync</button>
-            <button type="button" class="${r.action === 'direct' ? 'is-active' : ''}" data-act="direct">Прямой</button>
+            <button type="button" class="${!isSelective && r.action === 'direct' ? 'is-active' : ''} ${isSelective ? 'is-disabled' : ''}" data-act="direct" ${isSelective ? 'disabled' : ''} title="${isSelective ? 'Недоступно в режиме «Точечно»: весь трафик вне правил уже идёт напрямую' : 'Направлять напрямую в обход VPN'}">Прямой</button>
             <button type="button" class="${r.action === 'block' ? 'is-active' : ''}" data-act="block">Блок</button>
           </div>
           <button type="button" class="icon-btn custom-rule-del" data-idx="${idx}" style="width:24px;height:24px;color:var(--red)" title="Удалить">
@@ -2567,12 +2670,18 @@
           </button>
         </div>
       </li>
-    `).join('');
+    `;
+    }).join('');
 
     $$('.act-seg[data-cidx] button[data-act]', list).forEach(btn => {
       btn.addEventListener('click', () => {
+        if (btn.disabled) return;
         const idx = parseInt(btn.closest('.act-seg').dataset.cidx, 10);
         if (!customRouteRules[idx]) return;
+        if (vpnPrefs.route === 'selective' && btn.dataset.act === 'direct') {
+          toast('В точечном режиме весь трафик уже идёт напрямую по умолчанию', true);
+          return;
+        }
         customRouteRules[idx].action = btn.dataset.act;
         if (btn.dataset.act === 'desync' && !desyncPrefs.enabled) {
           desyncPrefs.enabled = true;
@@ -2604,7 +2713,10 @@
     }
     const selType = $('#customRuleType')?.value || 'domain';
     const type = detectCustomRuleType(raw, selType);
-    const action = $('#customRuleAction')?.value || 'vpn';
+    let action = $('#customRuleAction')?.value || 'vpn';
+    if (vpnPrefs.route === 'selective' && action === 'direct') {
+      action = 'vpn';
+    }
 
     const existingIdx = customRouteRules.findIndex(r => r.value.toLowerCase() === raw.toLowerCase());
     if (existingIdx >= 0) {
@@ -2633,9 +2745,11 @@
 
   $$('#quickCustomTemplates button[data-qrule]').forEach(btn => {
     btn.addEventListener('click', () => {
+      if (btn.disabled) return;
       const parts = (btn.dataset.qrule || '').split(':');
       if (parts.length < 3) return;
-      const [type, val, action] = parts;
+      const [type, val, rawAction] = parts;
+      const action = (vpnPrefs.route === 'selective' && rawAction === 'direct') ? 'vpn' : rawAction;
       const existingIdx = customRouteRules.findIndex(r => r.value.toLowerCase() === val.toLowerCase());
       if (existingIdx >= 0) {
         customRouteRules[existingIdx].action = action;
@@ -2711,6 +2825,7 @@
     }
     const rules = appRules.map(a => `PROCESS-NAME,${a.binary}`);
     const communityLists = getActiveCommunityListsArray();
+    const activeCustomRules = getActiveCustomRulesArray();
 
     /* Собираем extraNodes, если в правилах есть привязка вида node:<id> */
     const extraNodes = {};
@@ -2721,7 +2836,7 @@
         if (srv?.vless) extraNodes[`NODE_${nid}`] = srv.vless;
       }
     }
-    for (const r of customRouteRules) {
+    for (const r of activeCustomRules) {
       if (r.action && r.action.startsWith('node:')) {
         const nid = r.action.slice(5);
         const srv = servers.find(x => x.id === nid);
@@ -2740,7 +2855,7 @@
       dns: vpnPrefs.dns || 'auto',
       dnsBootstrap: vpnPrefs.dnsBootstrap || '77.88.8.8',
       fakeIp: !!vpnPrefs.fakeIp,
-      dnsRouteMode: vpnPrefs.dnsRouteMode || 'smart',
+      dnsRouteMode: vpnPrefs.dnsRouteMode || 'split_ru',
       mtu: Number(vpnPrefs.mtu) || 1400,
       allowLan: !!vpnPrefs.allowLan,
       proxyTlsFragment: !!vpnPrefs.proxyTlsFragment,
@@ -2752,7 +2867,7 @@
         enabled: route === 'desync-only' ? true : !!desyncPrefs.enabled
       },
       communityLists,
-      customRules: customRouteRules,
+      customRules: activeCustomRules,
       extraNodes
     };
   }
@@ -3538,7 +3653,7 @@
   });
 
   /* ============================================================
-     ПОДВКЛАДКИ «ТРАФИК И ДИАГНОСТИКА»: СОЕДИНЕНИЯ, МАТРИЦА ТСПУ, СПИДТЕСТ, ЛОГ ЯДРА
+     ПОДВКЛАДКИ «ТРАФИК И ДИАГНОСТИКА»: СОЕДИНЕНИЯ, МАТРИЦА ДОСТУПНОСТИ, СПИДТЕСТ, ЛОГ ЯДРА
      ============================================================ */
   let coreLogTimer = null;
   let lastRawLogText = '';
@@ -3620,7 +3735,7 @@
     const grid = $('#diagMatrixGrid');
     if (!grid) return;
     if (btn) btn.disabled = true;
-    if (txt) txt.textContent = 'Проверка ТСПУ…';
+    if (txt) txt.textContent = 'Проверка маршрута…';
     grid.innerHTML = `<div class="diag-empty-hint">Выполняется параллельное зондирование целей через текущий маршрут…</div>`;
     try {
       const res = await window.API.runDiagMatrix();

@@ -34,8 +34,13 @@ jobs:
           path: tachyon-core
 
       - name: Apply desktop runtime patch to tachyon-core
+        shell: bash
         run: |
-          git -C tachyon-core apply --ignore-whitespace ../tachyon-desktop/desktop-rs/patches/tachyon-core-desktop.patch
+          if git -C tachyon-core apply --check --ignore-whitespace ../tachyon-desktop/desktop-rs/patches/tachyon-core-desktop.patch 2>/dev/null; then
+            git -C tachyon-core apply --ignore-whitespace ../tachyon-desktop/desktop-rs/patches/tachyon-core-desktop.patch
+          else
+            echo "Desktop runtime patch already upstreamed in tachyon-core, skipping."
+          fi
 
       - name: Install WebKitGTK & GTK3 dependencies
         run: |
@@ -56,7 +61,7 @@ jobs:
         run: |
           RAW_TAG="${{ inputs.release_tag != '' && inputs.release_tag || github.ref_name }}"
           VER="${RAW_TAG#v}"
-          if [[ ! "${VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then VER="0.3.2"; fi
+          if [[ ! "${VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then VER="0.3.3"; fi
           chmod +x desktop-rs/scripts/package-linux.sh
           ./desktop-rs/scripts/package-linux.sh "${VER}"
 
@@ -86,8 +91,13 @@ jobs:
           path: tachyon-core
 
       - name: Apply desktop runtime patch to tachyon-core
+        shell: bash
         run: |
-          git -C tachyon-core apply --ignore-whitespace ../tachyon-desktop/desktop-rs/patches/tachyon-core-desktop.patch
+          if git -C tachyon-core apply --check --ignore-whitespace ../tachyon-desktop/desktop-rs/patches/tachyon-core-desktop.patch 2>/dev/null; then
+            git -C tachyon-core apply --ignore-whitespace ../tachyon-desktop/desktop-rs/patches/tachyon-core-desktop.patch
+          else
+            echo "Desktop runtime patch already upstreamed in tachyon-core, skipping."
+          fi
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -99,7 +109,7 @@ jobs:
         run: |
           RAW_TAG="${{ inputs.release_tag != '' && inputs.release_tag || github.ref_name }}"
           VER="${RAW_TAG#v}"
-          if [[ ! "${VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then VER="0.3.2"; fi
+          if [[ ! "${VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then VER="0.3.3"; fi
           chmod +x desktop-rs/scripts/package-macos.sh
           ./desktop-rs/scripts/package-macos.sh --universal "${VER}"
 
@@ -128,8 +138,13 @@ jobs:
           path: tachyon-core
 
       - name: Apply desktop runtime patch to tachyon-core
+        shell: bash
         run: |
-          git -C tachyon-core apply --ignore-whitespace ../tachyon-desktop/desktop-rs/patches/tachyon-core-desktop.patch
+          if git -C tachyon-core apply --check --ignore-whitespace ../tachyon-desktop/desktop-rs/patches/tachyon-core-desktop.patch 2>/dev/null; then
+            git -C tachyon-core apply --ignore-whitespace ../tachyon-desktop/desktop-rs/patches/tachyon-core-desktop.patch
+          else
+            echo "Desktop runtime patch already upstreamed in tachyon-core, skipping."
+          fi
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

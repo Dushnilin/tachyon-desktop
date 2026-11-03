@@ -3350,6 +3350,21 @@ body {
   border-color: var(--red);
   color: var(--red);
 }
+.act-seg button:disabled,
+.act-seg button.is-disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+  text-decoration: line-through;
+}
+.act-seg button:disabled:hover,
+.act-seg button.is-disabled:hover {
+  color: var(--muted);
+}
+.sni-chip:disabled,
+.sni-chip.is-disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
 
 /* Свои правила */
 .custom-rule-bar {
@@ -3404,6 +3419,9 @@ body {
   border-radius: var(--r-md);
   background: var(--surface-2);
   border: 1px solid var(--border);
+}
+.custom-rule-item.is-disabled-rule .custom-rule-item__left {
+  opacity: 0.45;
 }
 .custom-rule-item__left {
   display: flex;
@@ -3634,7 +3652,7 @@ body {
   gap: 12px;
 }
 
-/* Карточки Диагностики (Матрица ТСПУ и Спидтест) */
+/* Карточки Диагностики (Матрица доступности и Спидтест) */
 .diag-card {
   padding: 16px;
   display: flex;

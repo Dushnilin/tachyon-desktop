@@ -71,7 +71,7 @@
             <span class="topbar__title">Tachyon</span>
             <span class="topbar__ver">—</span>
           </div>
-          <span class="wordmark-sub">Маршрутизация и обход DPI</span>
+          <span class="wordmark-sub">Маршрутизация и туннелирование</span>
         </div>
       </div>
 
@@ -233,7 +233,7 @@
             <div class="seg seg--compact seg--routes" id="routeSwitch">
               <button class="is-active" data-route="all" type="button" title="Весь трафик через VPN + активные списки и Desync">Весь ПК</button>
               <button data-route="selective" type="button" title="В VPN и Desync идут только выбранные списки и правила, остальное — напрямую">Точечно</button>
-              <button data-route="desync-only" type="button" title="Обход DPI без VPN-сервера (напрямую через Desync)">Только Desync</button>
+              <button data-route="desync-only" type="button" title="Адаптивная доставка трафика без VPN-сервера (напрямую через Desync)">Только Desync</button>
               <button data-route="apps" type="button" title="Раздельное туннелирование по процессам (.exe)">Приложения</button>
             </div>
           </div>
@@ -312,12 +312,12 @@
               <span class="desync-badge-icon"><svg class="ic"><use href="#ic-bolt"/></svg></span>
               <div>
                 <h2>Tachyon Desync <span class="core-ver-pill">AdaptiveBrain L1/L2/L3</span></h2>
-                <small id="desyncSubtitle">Встроенный самообучающийся движок обхода ТСПУ в ядре tachyon-core</small>
+                <small id="desyncSubtitle">Встроенный самообучающийся движок десинхронизации пакетов в ядре tachyon-core</small>
               </div>
             </div>
             <div style="display:flex;align-items:center;gap:10px">
               <button type="button" class="btn-act btn-act--sm" id="resetDesyncBtn" title="Сбросить параметры Desync к оптимальным значениям ядра">Сброс</button>
-              <label class="toggle toggle--inline" title="Включить встроенный в ядро движок обхода DPI Tachyon Desync">
+              <label class="toggle toggle--inline" title="Включить встроенный в ядро движок десинхронизации пакетов Tachyon Desync">
                 <input type="checkbox" id="desyncEnableToggle" checked />
                 <span class="track"></span>
               </label>
@@ -327,7 +327,7 @@
           <div class="desync-body" id="desyncBody">
             <!-- Живая сводка текущей конфигурации -->
             <div class="desync-status-strip">
-              <span class="desync-foot__summary" id="desyncTechSummary">Пресет: auto · md5 · split:midsld · TTL 6 · UDP Fake · Блок QUIC</span>
+              <span class="desync-foot__summary" id="desyncTechSummary">Пресет: auto · md5 · split:midsld · TLSRec · TTL auto · UDP Fake · Блок QUIC</span>
             </div>
 
             <!-- 1. Автоматика и самообучение ядра -->
@@ -347,11 +347,33 @@
 
                 <label class="desync-switch-row">
                   <div class="desync-switch-row__txt">
-                    <b>3-уровневое самообучение L1/L2/L3 + Анти-ТСПУ 32 КБ (auto_tune)</b>
-                    <small>Автоподбор из 8 рецептов ядра, пробитие 16 КБ блока ТСПУ (окно 32 КБ) и сохранение стратегий в cache.db</small>
+                    <b>3-уровневое самообучение L1/L2/L3 + контроль окна 32 КБ (auto_tune)</b>
+                    <small>Автоподбор из 12 рецептов ядра, детектор порога 16/32 КБ и шейпера потока, сохранение стратегий в cache.db</small>
                   </div>
                   <label class="toggle toggle--inline">
                     <input type="checkbox" id="desyncAutoTuneToggle" checked />
+                    <span class="track"></span>
+                  </label>
+                </label>
+
+                <label class="desync-switch-row">
+                  <div class="desync-switch-row__txt">
+                    <b>Двухуровневое дробление TLS Record + TCP (tlsrec_first)</b>
+                    <small>Предварительное разбиение TLS ClientHello на две записи по границе SNI перед TCP-десинхронизацией</small>
+                  </div>
+                  <label class="toggle toggle--inline">
+                    <input type="checkbox" id="desyncTlsrecFirstToggle" checked />
+                    <span class="track"></span>
+                  </label>
+                </label>
+
+                <label class="desync-switch-row">
+                  <div class="desync-switch-row__txt">
+                    <b>L3 IP-фрагментация тестовых сегментов в обратном порядке (ipfrag)</b>
+                    <small>Разбиение IPv4/IPv6-пакета на два фрагмента с отправкой хвоста перед L4-заголовком</small>
+                  </div>
+                  <label class="toggle toggle--inline">
+                    <input type="checkbox" id="desyncIpfragToggle" />
                     <span class="track"></span>
                   </label>
                 </label>
@@ -360,14 +382,15 @@
 
             <!-- 2. Профиль / Пресет обхода -->
             <div class="desync-section">
-              <div class="desync-sec-title">Профиль обхода</div>
+              <div class="desync-sec-title">Профиль десинхронизации</div>
               <div class="preset-chips" id="desyncPresetsBar">
-                <button type="button" class="p-chip is-active" data-dpreset="auto" title="Автоматический выбор из 8 рецептов AdaptiveBrain под провайдера"><svg class="ic"><use href="#ic-bolt"/></svg><span>Авто (Adaptive)</span></button>
+                <button type="button" class="p-chip is-active" data-dpreset="auto" title="Автоматический выбор из 12 рецептов AdaptiveBrain под маршрут"><svg class="ic"><use href="#ic-bolt"/></svg><span>Авто (Adaptive)</span></button>
                 <button type="button" class="p-chip" data-dpreset="youtube_discord" title="Fake + Split по SLD + UDP Fake для голоса Discord и YouTube GGC"><svg class="ic"><use href="#ic-play"/></svg><span>YouTube + Discord</span></button>
+                <button type="button" class="p-chip" data-dpreset="multi_disorder" title="TLSRec + каскадный разрез на 4 сегмента в обратном порядке + BadSum"><svg class="ic"><use href="#ic-shuffle"/></svg><span>Multi-Disorder</span></button>
                 <button type="button" class="p-chip" data-dpreset="fake_split" title="Отправка фейкового ClientHello + разрез реального пакета"><svg class="ic"><use href="#ic-split"/></svg><span>Fake + Split</span></button>
                 <button type="button" class="p-chip" data-dpreset="fake_disorder" title="Fake-пакет + отправка сегментов с обратным порядком/TTL"><svg class="ic"><use href="#ic-shuffle"/></svg><span>Fake + Disorder</span></button>
                 <button type="button" class="p-chip" data-dpreset="tlsrec" title="Фрагментация на уровне TLS Record Layer до заголовка SNI"><svg class="ic"><use href="#ic-lock"/></svg><span>TLS Record</span></button>
-                <button type="button" class="p-chip" data-dpreset="multi_split" title="Каскадное разрезание ClientHello на 3 сегмента (2-й байт + SLD)"><svg class="ic"><use href="#ic-layers"/></svg><span>Multi-Split</span></button>
+                <button type="button" class="p-chip" data-dpreset="multi_split" title="Каскадное разрезание ClientHello на 4 сегмента"><svg class="ic"><use href="#ic-layers"/></svg><span>Multi-Split</span></button>
                 <button type="button" class="p-chip" data-dpreset="split" title="Чистый TCP Split без отправки фейковых пакетов"><svg class="ic"><use href="#ic-split"/></svg><span>Split</span></button>
                 <button type="button" class="p-chip" data-dpreset="disorder" title="Разрез + занижение TTL первого сегмента без фейка"><svg class="ic"><use href="#ic-shuffle"/></svg><span>Disorder</span></button>
                 <button type="button" class="p-chip" data-dpreset="fake" title="Инъекция фейкового пакета без разрезания полезной нагрузки"><svg class="ic"><use href="#ic-mask"/></svg><span>Только Fake</span></button>
@@ -384,10 +407,11 @@
                   <span>Базовый метод TCP (mode)</span>
                   <select id="desyncModeSelect">
                     <option value="auto">Авто (AdaptiveBrain)</option>
+                    <option value="multi_disorder">Multi-Disorder (4 сегмента + Fake)</option>
                     <option value="fake_split">Fake + Split</option>
                     <option value="fake_disorder">Fake + Disorder</option>
                     <option value="tlsrec">TLS Record Split</option>
-                    <option value="multi_split">Multi-Split (3 сегмента)</option>
+                    <option value="multi_split">Multi-Split (4 сегмента)</option>
                     <option value="split">Split (без фейка)</option>
                     <option value="disorder">Disorder (без фейка)</option>
                     <option value="fake">Только Fake</option>
@@ -396,13 +420,18 @@
                 </label>
 
                 <label class="d-field">
-                  <span>Метод обмана ТСПУ (fooling)</span>
+                  <span>Инвалидация фейка (fooling)</span>
                   <select id="desyncFoolingSelect">
                     <option value="md5">TCP MD5 Option 19 (дефолт ядра)</option>
+                    <option value="md5_badack">MD5 + BadAck + TS (валидный checksum)</option>
+                    <option value="badack">BadAck (-66000) + Timestamp</option>
                     <option value="badseq">BadSeq (сдвиг Sequence)</option>
                     <option value="timestamp">Timestamp (PAWS RFC 7323)</option>
-                    <option value="badsum">BadSum (битая контрольная сумма)</option>
-                    <option value="autottl">AutoTTL (отсечка по хопам)</option>
+                    <option value="badsum">BadSum (инверсия L4 checksum)</option>
+                    <option value="badseq_badack_badsum">Combo (BadSeq + BadAck + BadSum)</option>
+                    <option value="datanoack">DataNoAck (снятие флага ACK + MD5)</option>
+                    <option value="hopbyhop2">IPv6 Hop-by-Hop ×2 (RFC 8200)</option>
+                    <option value="autottl">AutoTTL (динамический расчёт по хопам)</option>
                   </select>
                 </label>
 
@@ -410,7 +439,13 @@
                   <span>Точка разреза (split_pos)</span>
                   <select id="desyncSplitPosSelect">
                     <option value="midsld">Середина домена (midsld)</option>
+                    <option value="midsld-2">До середины домена (midsld-2)</option>
+                    <option value="midsld+2">После середины домена (midsld+2)</option>
                     <option value="sni">Начало поля SNI (sni)</option>
+                    <option value="sniext+1">Смещение SNI +1 (sniext+1)</option>
+                    <option value="host+1">2-й символ домена (host+1)</option>
+                    <option value="endhost-1">Предпоследний символ (endhost-1)</option>
+                    <option value="extlen">Длина расширений TLS (extlen)</option>
                     <option value="1">1-й байт (byte 1)</option>
                     <option value="2">2-й байт (byte 2)</option>
                     <option value="custom_offset">Своё смещение (байт)…</option>
@@ -436,6 +471,11 @@
                   <span>Пауза между сегментами (0–1000 мс)</span>
                   <input type="number" id="desyncSplitDelayInput" min="0" max="1000" value="1" />
                 </label>
+
+                <label class="d-field">
+                  <span>Перекрытие Sequence (seqovl: 0–256 Б)</span>
+                  <input type="number" id="desyncSeqovlInput" min="0" max="256" value="0" />
+                </label>
               </div>
 
               <!-- Подменный SNI + пул белых доменов ядра -->
@@ -448,6 +488,7 @@
                   <span class="sni-pool-lbl">Белый пул ядра:</span>
                   <button type="button" class="sni-chip" data-sni="www.google.com">www.google.com</button>
                   <button type="button" class="sni-chip" data-sni="vk.com">vk.com</button>
+                  <button type="button" class="sni-chip" data-sni="rzd.ru">rzd.ru</button>
                   <button type="button" class="sni-chip" data-sni="max.ru">max.ru</button>
                   <button type="button" class="sni-chip" data-sni="gosuslugi.ru">gosuslugi.ru</button>
                   <button type="button" class="sni-chip" data-sni="ya.ru">ya.ru</button>
@@ -510,7 +551,7 @@
               <span class="routing-top__icon"><svg class="ic"><use href="#ic-route"/></svg></span>
               <div>
                 <h2>Маршрутизация трафика <span class="core-ver-pill">tachyon-lists .trs</span></h2>
-                <small>Направляйте сервисы, домены и процессы в VPN, через обход ТСПУ (Desync), напрямую или в блок</small>
+                <small>Направляйте сервисы, домены и процессы в VPN, через адаптивную доставку (Desync), напрямую или в блок</small>
               </div>
             </div>
             <div class="routing-top__controls">
@@ -529,10 +570,10 @@
 
           <div class="routing-presets-bar" id="quickBundlesBar">
             <span class="routing-presets__lbl">Сценарии:</span>
-            <button type="button" class="r-preset-btn" data-bundle="ru_smart" title="Сайты РФ напрямую, YouTube и Discord через Desync, заблокированные сервисы и ИИ через VPN">
-              <svg class="ic"><use href="#ic-shield"/></svg><span>РФ мимо + РКН в VPN</span>
+            <button type="button" class="r-preset-btn" data-bundle="ru_smart" title="Сайты РФ напрямую, YouTube и Discord через Desync, зарубежные сервисы и ИИ через VPN">
+              <svg class="ic"><use href="#ic-shield"/></svg><span>РФ мимо + Реестр в VPN</span>
             </button>
-            <button type="button" class="r-preset-btn" data-bundle="desync_media" title="Работа без VPN-сервера: обход ТСПУ для YouTube, Discord и заблокированных сайтов">
+            <button type="button" class="r-preset-btn" data-bundle="desync_media" title="Работа без VPN-сервера: адаптивная доставка (Desync) для YouTube, Discord и реестра доменов">
               <svg class="ic"><use href="#ic-bolt"/></svg><span>YT + Discord (Desync)</span>
             </button>
             <button type="button" class="r-preset-btn" data-bundle="selective_vpn" title="Точечный режим: весь трафик напрямую, кроме выбранных списков">
@@ -749,12 +790,12 @@
         </div>
       </section>
 
-      <!-- ===== 4. ТРАФИК, МАТРИЦА ТСПУ, СПИДТЕСТ И ЖУРНАЛ ЯДРА ===== -->
+      <!-- ===== 4. ТРАФИК, МАТРИЦА ДОСТУПНОСТИ, СПИДТЕСТ И ЖУРНАЛ ЯДРА ===== -->
       <section class="view" data-view="connections">
         <div class="conn-top-tabs">
           <div class="seg seg--compact" id="trafficSubtabs">
             <button type="button" class="is-active" data-ttab="conns">Активные соединения</button>
-            <button type="button" data-ttab="diag">Матрица ТСПУ & Спидтест</button>
+            <button type="button" data-ttab="diag">Матрица маршрутов & Спидтест</button>
             <button type="button" data-ttab="logs">Журнал ядра</button>
           </div>
         </div>
@@ -785,12 +826,12 @@
           </div>
         </div>
 
-        <!-- Подвкладка 2: Матрица доступности ТСПУ и Встроенный Спидтест 10 МБ -->
+        <!-- Подвкладка 2: Матрица доступности маршрутов и Встроенный Спидтест 10 МБ -->
         <div class="ttab-pane" id="ttabDiag" hidden>
           <div class="hairline-card diag-card">
             <div class="diag-card__head">
               <div>
-                <b>Матрица доступности и обхода ТСПУ</b>
+                <b>Матрица доступности маршрутов</b>
                 <small>Одновременная проверка Рунета, Cloudflare, YouTube, Discord и Telegram через текущий канал</small>
               </div>
               <button type="button" class="btn-act btn-act--primary" id="runDiagMatrixBtn">

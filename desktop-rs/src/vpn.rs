@@ -44,6 +44,12 @@ pub struct DesyncOptions {
     pub mode: String,
     pub fooling: String,
     pub split_pos: String,
+    pub tlsrec_first: bool,
+    pub seqovl: u32,
+    pub syndata: bool,
+    pub wsize: u32,
+    pub ipfrag: bool,
+    pub udplen: u32,
     pub fake_ttl: u32,
     pub fake_sni: String,
     pub repeats: u32,
@@ -64,6 +70,12 @@ impl Default for DesyncOptions {
             mode: "auto".to_string(),
             fooling: "md5".to_string(),
             split_pos: "midsld".to_string(),
+            tlsrec_first: true,
+            seqovl: 0,
+            syndata: false,
+            wsize: 0,
+            ipfrag: false,
+            udplen: 0,
             fake_ttl: 6,
             fake_sni: "www.google.com".to_string(),
             repeats: 2,
@@ -304,6 +316,24 @@ impl ConnectOptions {
             } else if let Some(v) = d.get("splitPos").and_then(Value::as_u64) {
                 desync.split_pos = v.clamp(1, 1400).to_string();
             }
+            if let Some(v) = d.get("tlsrecFirst").and_then(Value::as_bool) {
+                desync.tlsrec_first = v;
+            }
+            if let Some(v) = d.get("seqovl").and_then(Value::as_u64) {
+                desync.seqovl = (v as u32).min(256);
+            }
+            if let Some(v) = d.get("syndata").and_then(Value::as_bool) {
+                desync.syndata = v;
+            }
+            if let Some(v) = d.get("wsize").and_then(Value::as_u64) {
+                desync.wsize = (v as u32).min(65535);
+            }
+            if let Some(v) = d.get("ipfrag").and_then(Value::as_bool) {
+                desync.ipfrag = v;
+            }
+            if let Some(v) = d.get("udplen").and_then(Value::as_u64) {
+                desync.udplen = (v as u32).min(256);
+            }
             if let Some(v) = d.get("fakeTtl").and_then(Value::as_u64) {
                 desync.fake_ttl = (v as u32).clamp(1, 128);
             }
@@ -508,7 +538,7 @@ pub fn canonical_ruleset_name(raw: &str) -> String {
 }
 
 fn is_priority_direct_ru_list(can: &str) -> bool {
-    matches!(can, "russia_inside" | "ru_whitelist" | "ru_only_inside")
+    matches!(can, "ru_whitelist" | "ru_only_inside" | "russia_outside")
 }
 
 #[cfg(target_os = "windows")]
@@ -680,6 +710,11 @@ impl VpnManager {
     pub async fn ensure_community_rulesets(&self, opts: &ConnectOptions, force_refresh: bool) {
         let mut needed = HashSet::new();
         for item in &opts.community_lists {
+            if opts.route == RouteMode::Selective
+                && item.action.trim().eq_ignore_ascii_case("direct")
+            {
+                continue;
+            }
             let can = canonical_ruleset_name(&item.name);
             if !can.is_empty() {
                 needed.insert(can);
@@ -771,6 +806,7 @@ impl VpnManager {
         let mapped_preset = match preset.as_str() {
             "youtube_discord" | "fake_split" | "fakesplit" => "fake_split",
             "fake_disorder" | "fakedisorder" | "aggressive" => "fake_disorder",
+            "multi_disorder" | "multidisorder" | "multidisorder2" => "multi_disorder",
             "multi_split" | "multisplit" => "multi_split",
             "tlsrec" | "tls_rec" => "tlsrec",
             "split" => "split",
@@ -784,14 +820,15 @@ impl VpnManager {
         let raw_mode = d.mode.trim().to_ascii_lowercase();
         let valid_mode = match raw_mode.as_str() {
             "auto" | "adaptive" | "smart" => "auto",
-            "fake_split" | "fakesplit" => "fake_split",
-            "fake_disorder" | "fakedisorder" => "fake_disorder",
-            "multi_split" | "multisplit" => "multi_split",
+            "fake_split" | "fakesplit" | "fakedsplit" | "hostfakesplit" => "fake_split",
+            "fake_disorder" | "fakedisorder" | "fakeddisorder" => "fake_disorder",
+            "multi_disorder" | "multidisorder" | "multidisorder2" => "multi_disorder",
+            "multi_split" | "multisplit" | "multisplit2" => "multi_split",
             "tlsrec" | "tls_rec" => "tlsrec",
-            "split" => "split",
-            "disorder" => "disorder",
-            "fake" => "fake",
-            "oob" => "oob",
+            "split" | "split2" => "split",
+            "disorder" | "disorder2" => "disorder",
+            "fake" | "syndata" => "fake",
+            "oob" | "disoob" => "oob",
             _ => {
                 if mapped_preset.is_empty() {
                     "fake_split"
@@ -802,23 +839,61 @@ impl VpnManager {
         };
 
         let valid_fooling = match d.fooling.trim().to_ascii_lowercase().as_str() {
-            "md5" | "md5sig" | "tcp_md5" | "wrong-md5" => "md5",
-            "badseq" | "seq" | "wrong-sequence" => "badseq",
-            "timestamp" | "ts" | "tcp_ts" | "wrong-timestamp" => "timestamp",
-            "badsum" | "sum" | "wrong-checksum" => "badsum",
-            "autottl" | "auto_ttl" | "ttl" | "low-ttl" => "autottl",
+            "md5" | "md5sig" | "tcp_md5" | "tcp_md5sig" | "wrong-md5" | "wrong_md5" => "md5",
+            "badseq" | "seq" | "wrong-sequence" | "wrong_sequence" => "badseq",
+            "badack" | "ack" | "tcp_ack" | "wrong-ack" | "wrong_ack" => "badack",
+            "timestamp" | "ts" | "tcp_ts" | "wrong-timestamp" | "wrong_timestamp" => "timestamp",
+            "badsum" | "sum" | "wrong-checksum" | "wrong_checksum" => "badsum",
+            "autottl" | "auto_ttl" | "ttl" | "low-ttl" | "low_ttl" => "autottl",
+            "hopbyhop" | "hopbyhop2" | "ip6_hopbyhop" | "ip6_hopbyhop2" | "destopt"
+            | "ip6_destopt" => "hopbyhop2",
+            "badseq_badack_badsum" | "combo" | "badsum_combo" | "badseq,badsum" => {
+                "badseq_badack_badsum"
+            }
+            "md5_badack" | "tcp_md5_badack" | "md5+badack" | "md5sig_badack"
+            | "md5sig+badack" | "md5sig,badack" => "md5_badack",
+            "datanoack" | "data_no_ack" | "noack" => "datanoack",
             _ => "md5",
         };
 
-        let sp = d.split_pos.trim().to_ascii_lowercase();
-        let split_pos_val: Value = if let Ok(n) = sp.parse::<u32>() {
-            json!(n.clamp(1, 1400))
-        } else if sp == "sni" || sp == "sniext" {
-            json!("sni")
-        } else {
-            json!("midsld")
+        let parse_single_split_pos = |token: &str| -> Value {
+            let t = token.trim().to_ascii_lowercase();
+            if let Ok(n) = t.parse::<u32>() {
+                json!(n.clamp(1, 1400))
+            } else {
+                match t.as_str() {
+                    "sni" | "sniext" => json!("sni"),
+                    "sniext+1" | "sni+1" => json!("sniext+1"),
+                    "host+1" => json!("host+1"),
+                    "midsld-2" | "sld-2" => json!("midsld-2"),
+                    "midsld" | "sld" | "host" => json!("midsld"),
+                    "midsld+2" | "sld+2" => json!("midsld+2"),
+                    "endhost-1" | "endsld-1" | "endhost" => json!("endhost-1"),
+                    "extlen" => json!("extlen"),
+                    _ => json!("midsld"),
+                }
+            }
         };
 
+        let sp_raw = d.split_pos.trim();
+        let split_pos_val: Value = if sp_raw.contains(',') {
+            let arr: Vec<Value> = sp_raw
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .take(8)
+                .map(parse_single_split_pos)
+                .collect();
+            if arr.is_empty() {
+                json!("midsld")
+            } else {
+                Value::Array(arr)
+            }
+        } else {
+            parse_single_split_pos(sp_raw)
+        };
+
+        let is_auto_preset = mapped_preset == "auto";
         let mut obj = json!({
             "type": "desync",
             "tag": tag,
@@ -826,15 +901,35 @@ impl VpnManager {
             "mode": valid_mode,
             "fooling": valid_fooling,
             "split_pos": split_pos_val,
-            "fake_ttl": d.fake_ttl.clamp(1, 128),
+            "tlsrec_first": if mapped_preset == "multi_disorder" || is_auto_preset { true } else { d.tlsrec_first },
             "fake_sni": if d.fake_sni.trim().is_empty() { "www.google.com" } else { d.fake_sni.trim() },
             "repeats": d.repeats.clamp(1, 100),
             "split_delay_ms": d.split_delay_ms.clamp(0, 1000),
-            "auto_tune": if preset == "auto" { true } else { d.auto_tune },
+            "auto_tune": if is_auto_preset { true } else { d.auto_tune },
             "udp_fake": d.udp_fake,
             "udp_repeats": d.udp_repeats.clamp(1, 50),
             "udp_fake_ttl": d.udp_fake_ttl.clamp(1, 128),
         });
+        // Omit `fake_ttl` when running in `auto` mode with the default TTL=6 so `tachyon-core`
+        // keeps `explicit_fake_ttl = false` and uses dynamic SYN+ACK hop-distance estimation.
+        if !is_auto_preset || d.fake_ttl != 6 || valid_fooling == "autottl" {
+            obj["fake_ttl"] = json!(d.fake_ttl.clamp(1, 128));
+        }
+        if d.seqovl > 0 {
+            obj["seqovl"] = json!(d.seqovl.min(256));
+        }
+        if d.syndata {
+            obj["syndata"] = json!(true);
+        }
+        if d.wsize > 0 {
+            obj["wsize"] = json!(d.wsize.min(65535));
+        }
+        if d.ipfrag {
+            obj["ipfrag"] = json!(true);
+        }
+        if d.udplen > 0 {
+            obj["udplen"] = json!(d.udplen.min(256));
+        }
         if !mapped_preset.is_empty() {
             obj["preset"] = json!(mapped_preset);
         }
@@ -1012,7 +1107,7 @@ impl VpnManager {
             "server": "dns_direct"
         })];
 
-        if opts.dns_route_mode == "split_ru" {
+        if opts.dns_route_mode == "split_ru" || opts.dns_route_mode == "smart" {
             dns_rules.push(json!({
                 "domain_suffix": [".ru", ".su", ".рф", "xn--p1ai"],
                 "server": "dns_direct"
@@ -1306,11 +1401,12 @@ impl VpnManager {
         rule_sets_list: &mut Vec<Value>,
         registered_rs: &mut HashSet<String>,
     ) {
-        let mut custom_groups = vec![
-            "block".to_string(),
-            "direct".to_string(),
-            "desync".to_string(),
-        ];
+        let is_selective = opts.route == RouteMode::Selective;
+        let mut custom_groups = vec!["block".to_string()];
+        if !is_selective {
+            custom_groups.push("direct".to_string());
+        }
+        custom_groups.push("desync".to_string());
         for t in valid_extra_tags {
             custom_groups.push(t.clone());
         }
@@ -1426,6 +1522,11 @@ impl VpnManager {
         let mut rest_direct_rs = Vec::new();
 
         for item in &opts.community_lists {
+            let act = item.action.trim();
+            let act_low = act.to_ascii_lowercase();
+            if is_selective && act_low == "direct" {
+                continue;
+            }
             let can = canonical_ruleset_name(&item.name);
             if can.is_empty() {
                 continue;
@@ -1442,8 +1543,6 @@ impl VpnManager {
                 }));
             }
 
-            let act = item.action.trim();
-            let act_low = act.to_ascii_lowercase();
             if act_low == "block" {
                 block_rs.push(tag);
             } else if act_low == "desync" {

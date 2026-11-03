@@ -456,7 +456,7 @@ dependencies = [
 
 [[package]]
 name = "core-config"
-version = "0.3.1"
+version = "0.3.3"
 dependencies = [
  "aes",
  "base64",
@@ -470,7 +470,7 @@ dependencies = [
 
 [[package]]
 name = "core-crypto"
-version = "0.3.1"
+version = "0.3.3"
 dependencies = [
  "aead",
  "aes-gcm",
@@ -501,7 +501,7 @@ dependencies = [
 
 [[package]]
 name = "core-experimental"
-version = "0.3.1"
+version = "0.3.3"
 
 [[package]]
 name = "core-foundation"
@@ -545,7 +545,7 @@ dependencies = [
 
 [[package]]
 name = "core-runtime"
-version = "0.3.1"
+version = "0.3.3"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -610,7 +610,7 @@ dependencies = [
 
 [[package]]
 name = "core-tls"
-version = "0.3.1"
+version = "0.3.3"
 dependencies = [
  "aes-gcm",
  "brotli",
