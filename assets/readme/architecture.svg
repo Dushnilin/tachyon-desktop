@@ -2,7 +2,7 @@
      width="1200" height="320" viewBox="0 0 1200 320"
      role="img" aria-labelledby="title desc">
   <title id="title">Архитектура конвейера трафика tachyon-desktop</title>
-  <desc id="desc">Схема прохождения пакетов в tachyon-desktop: от нативного окна Wry/Tao через VpnManager и системный интерфейс TUN (Wintun / Linux TUN / macOS utun) во встроенное Rust-ядро tachyon-core с разделением на прокси-протоколы, самообучающийся DPI Desync (AdaptiveBrain), прямое соединение для РФ и блокировщик.</desc>
+  <desc id="desc">Схема прохождения пакетов в tachyon-desktop: от нативного окна Wry/Tao через VpnManager и системный интерфейс TUN (Wintun / Linux TUN / macOS utun) во встроенное Rust-ядро tachyon-core с разделением на прокси-протоколы, адаптивный шейпер пакетов (AdaptiveBrain), прямое соединение для РФ и фильтр трафика.</desc>
 
   <rect width="1200" height="320" rx="22" fill="#0B0B0D"/>
   <rect x="1" y="1" width="1198" height="318" rx="21" fill="none" stroke="#26262B" stroke-width="2"/>
@@ -25,7 +25,7 @@
           font-size="16" fill="#A8A8AD">• Каталог .trs (Sing-Box v2/v3)</text>
     <text x="22" y="156"
           font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
-          font-size="16" fill="#A8A8AD">• Матрица ТСПУ и Спидтест</text>
+          font-size="16" fill="#A8A8AD">• Матрица узлов и Спидтест</text>
     <text x="22" y="184"
           font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
           font-size="16" fill="#A8A8AD">• Split-Tunnel по процессам</text>

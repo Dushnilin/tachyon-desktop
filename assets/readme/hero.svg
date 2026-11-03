@@ -1,8 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg"
      width="1200" height="390" viewBox="0 0 1200 390"
      role="img" aria-labelledby="title desc">
-  <title id="title">tachyon-desktop — Нативный кроссплатформенный клиент VPN и обхода DPI (Windows, Linux, macOS)</title>
-  <desc id="desc">Шапка репозитория tachyon-desktop: десктопный клиент на чистом Rust (Wry/Tao + встроенное ядро tachyon-core) с поддержкой VLESS REALITY, XHTTP, Hysteria2, TUIC, AmneziaWG и самообучающегося пакетного десинка ТСПУ AdaptiveBrain.</desc>
+  <title id="title">tachyon-desktop — Нативный кроссплатформенный клиент маршрутизации и туннелирования (Windows, Linux, macOS)</title>
+  <desc id="desc">Шапка репозитория tachyon-desktop: десктопный клиент на чистом Rust (Wry/Tao + встроенное ядро tachyon-core) с поддержкой VLESS REALITY, XHTTP, Hysteria2, TUIC, AmneziaWG и самообучающегося шейпера пакетов AdaptiveBrain.</desc>
 
   <defs>
     <pattern id="dotGrid" width="28" height="28" patternUnits="userSpaceOnUse">
@@ -41,7 +41,7 @@
     <!-- Subtitle -->
     <text x="0" y="128"
           font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Roboto, Helvetica, Arial, sans-serif"
-          font-size="18.5" font-weight="400" fill="#A8A8AD">Нативный десктопный клиент проксирования и обхода DPI</text>
+          font-size="18.5" font-weight="400" fill="#A8A8AD">Нативный десктопный клиент маршрутизации и туннелирования</text>
     <text x="0" y="154"
           font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Roboto, Helvetica, Arial, sans-serif"
           font-size="18.5" font-weight="400" fill="#A8A8AD">со встроенным ядром <tspan fill="#F2F2F3" font-weight="600">tachyon-core</tspan> и самообучением <tspan fill="#E5C07B" font-weight="600">AdaptiveBrain</tspan></text>
@@ -66,7 +66,7 @@
       <rect x="520" y="0" width="144" height="32" rx="8" fill="#292218" stroke="#E5C07B" stroke-opacity="0.45"/>
       <text x="592" y="21" text-anchor="middle"
             font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
-            font-size="13" font-weight="600" fill="#E5C07B">DPI Desync L1-L3</text>
+            font-size="13" font-weight="600" fill="#E5C07B">Adaptive L1-L3</text>
     </g>
 
     <!-- Technical Metadata -->
