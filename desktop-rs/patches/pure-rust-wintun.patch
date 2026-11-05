@@ -1,0 +1,1694 @@
+﻿diff --git a/crates/core-runtime/src/inbound/tun.rs b/crates/core-runtime/src/inbound/tun.rs
+index 3d7c170..b0d0ad1 100644
+--- a/crates/core-runtime/src/inbound/tun.rs
++++ b/crates/core-runtime/src/inbound/tun.rs
+@@ -2680,16 +2680,71 @@ mod linux {
+ 
+ #[cfg(target_os = "windows")]
+ mod windows_tun {
+-    use std::ffi::{CStr, c_void};
++    use std::ffi::c_void;
+     use std::io;
+     use std::net::{Ipv4Addr, Ipv6Addr};
+-    use std::sync::atomic::Ordering;
++    use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+     use tokio::sync::{Mutex, mpsc};
+ 
+     use super::{WIN_OUTBOUND_IF_INDEX, prefix_to_ipv4_netmask};
+ 
++    const WINTUN_INF: &[u8] = include_bytes!("wintun_driver/wintun.inf");
++    const WINTUN_CAT: &[u8] = include_bytes!("wintun_driver/wintun.cat");
++    const WINTUN_SYS: &[u8] = include_bytes!("wintun_driver/wintun.sys");
++
++    type Handle = *mut c_void;
++    type HKey = *mut c_void;
++    type HDevInfo = *mut c_void;
++    type HSwDevice = *mut c_void;
++
++    const INVALID_HANDLE_VALUE: Handle = (-1isize) as Handle;
++    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
++    const RING_CAPACITY: u32 = 0x0040_0000; // 4 MiB (power of two)
++    const WINTUN_MAX_IP_PACKET_SIZE: u32 = 0xFFFF;
++    const TUN_ALIGNMENT: u32 = 4;
++    const TUN_PACKET_RELEASE: u32 = 0x8000_0000;
++    // CTL_CODE(51820U, 0x970U, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
++    const TUN_IOCTL_REGISTER_RINGS: u32 = (51820u32 << 16) | (3u32 << 14) | (0x970u32 << 2);
++
++    const MEM_COMMIT: u32 = 0x0000_1000;
++    const MEM_RESERVE: u32 = 0x0000_2000;
++    const MEM_RELEASE: u32 = 0x0000_8000;
++    const PAGE_READWRITE: u32 = 0x04;
++
++    const GENERIC_READ: u32 = 0x8000_0000;
++    const GENERIC_WRITE: u32 = 0x4000_0000;
++    const FILE_SHARE_READ: u32 = 0x0000_0001;
++    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
++    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
++    const OPEN_EXISTING: u32 = 3;
++
++    const DIGCF_PRESENT: u32 = 0x0000_0002;
++    const DIOD_INHERIT_CLASSDRVS: u32 = 0x0000_0002;
++    const DICS_FLAG_GLOBAL: u32 = 0x0000_0001;
++    const DIREG_DRV: u32 = 0x0000_0002;
++    const DIF_REMOVE: u32 = 0x0000_0005;
++    const DI_REMOVEDEVICE_GLOBAL: u32 = 0x0000_0001;
++    const SPOST_NONE: u32 = 0;
++
++    const KEY_QUERY_VALUE: u32 = 0x0001;
++    const KEY_SET_VALUE: u32 = 0x0002;
++    const REG_BINARY: u32 = 3;
++
++    const CM_LOCATE_DEVNODE_NORMAL: u32 = 0x0000_0000;
++    const CM_LOCATE_DEVNODE_PHANTOM: u32 = 0x0000_0001;
++    const CM_REGISTRY_SOFTWARE: u32 = 0x0000_0001;
++    const CM_GET_DEVICE_INTERFACE_LIST_PRESENT: u32 = 0x0000_0000;
++    const CR_SUCCESS: u32 = 0x0000_0000;
++
++    const DEVPROP_STORE_SYSTEM: u32 = 0;
++    const DEVPROP_TYPE_STRING: u32 = 0x0000_0012;
++    const DEVPROP_TYPE_GUID: u32 = 0x0000_000D;
++
++    // SWDeviceCapabilitiesSilentInstall (2) | SWDeviceCapabilitiesDriverRequired (8)
++    const SW_DEVICE_CAPABILITIES: u32 = 0x0000_000A;
++
+     #[repr(C)]
+-    #[derive(Clone, Copy)]
++    #[derive(Clone, Copy, PartialEq, Eq)]
+     struct Guid {
+         data1: u32,
+         data2: u16,
+@@ -2697,29 +2752,144 @@ mod windows_tun {
+         data4: [u8; 8],
+     }
+ 
+-    type WintunAdapterHandle = *mut c_void;
+-    type WintunSessionHandle = *mut c_void;
+-    type Handle = *mut c_void;
+-    type HModule = *mut c_void;
+-
+-    type FnCreateAdapter =
+-        unsafe extern "system" fn(*const u16, *const u16, *const Guid) -> WintunAdapterHandle;
+-    type FnOpenAdapter = unsafe extern "system" fn(*const u16) -> WintunAdapterHandle;
+-    type FnCloseAdapter = unsafe extern "system" fn(WintunAdapterHandle);
+-    type FnStartSession =
+-        unsafe extern "system" fn(WintunAdapterHandle, u32) -> WintunSessionHandle;
+-    type FnEndSession = unsafe extern "system" fn(WintunSessionHandle);
+-    type FnGetReadWaitEvent = unsafe extern "system" fn(WintunSessionHandle) -> Handle;
+-    type FnReceivePacket = unsafe extern "system" fn(WintunSessionHandle, *mut u32) -> *mut u8;
+-    type FnReleaseReceivePacket = unsafe extern "system" fn(WintunSessionHandle, *const u8);
+-    type FnAllocateSendPacket = unsafe extern "system" fn(WintunSessionHandle, u32) -> *mut u8;
+-    type FnSendPacket = unsafe extern "system" fn(WintunSessionHandle, *const u8);
++    const GUID_DEVCLASS_NET: Guid = Guid {
++        data1: 0x4d36_e972,
++        data2: 0xe325,
++        data3: 0x11ce,
++        data4: [0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18],
++    };
++
++    const GUID_DEVINTERFACE_NET: Guid = Guid {
++        data1: 0xcac8_8484,
++        data2: 0x7515,
++        data3: 0x4c03,
++        data4: [0x82, 0xe6, 0x71, 0xa8, 0x7a, 0xba, 0xc3, 0x61],
++    };
++
++    #[repr(C)]
++    #[derive(Clone, Copy)]
++    struct DevPropKey {
++        fmtid: Guid,
++        pid: u32,
++    }
++
++    const DEVPKEY_WINTUN_NAME: DevPropKey = DevPropKey {
++        fmtid: Guid {
++            data1: 0x3361_c968,
++            data2: 0x2f2e,
++            data3: 0x4660,
++            data4: [0xb4, 0x7e, 0x69, 0x9c, 0xdc, 0x4c, 0x32, 0xb9],
++        },
++        pid: 3, // DEVPROPID_FIRST_USABLE (2) + 1
++    };
++
++    const DEVPKEY_DEVICE_CLASS_GUID: DevPropKey = DevPropKey {
++        fmtid: Guid {
++            data1: 0xa45c_254e,
++            data2: 0xdf1c,
++            data3: 0x4efd,
++            data4: [0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0],
++        },
++        pid: 10,
++    };
++
++    const DEVPKEY_DEVICE_FRIENDLY_NAME: DevPropKey = DevPropKey {
++        fmtid: Guid {
++            data1: 0xa45c_254e,
++            data2: 0xdf1c,
++            data3: 0x4efd,
++            data4: [0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0],
++        },
++        pid: 14,
++    };
++
++    const DEVPKEY_DEVICE_DESC: DevPropKey = DevPropKey {
++        fmtid: Guid {
++            data1: 0xa45c_254e,
++            data2: 0xdf1c,
++            data3: 0x4efd,
++            data4: [0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0],
++        },
++        pid: 2,
++    };
++
++    #[repr(C)]
++    #[derive(Clone, Copy)]
++    struct DevPropCompKey {
++        key: DevPropKey,
++        store: u32,
++        locale_name: *const u16,
++    }
++
++    #[repr(C)]
++    #[derive(Clone, Copy)]
++    struct DevProperty {
++        comp_key: DevPropCompKey,
++        prop_type: u32,
++        buffer_size: u32,
++        buffer: *const c_void,
++    }
++
++    #[repr(C)]
++    struct SwDeviceCreateInfo {
++        cb_size: u32,
++        psz_instance_id: *const u16,
++        pszz_hardware_ids: *const u16,
++        pszz_compatible_ids: *const u16,
++        p_container_id: *const Guid,
++        capability_flags: u32,
++        psz_device_description: *const u16,
++        psz_device_location: *const u16,
++        p_security_descriptor: *const c_void,
++    }
++
++    #[repr(C)]
++    #[derive(Clone, Copy)]
++    struct SpDevInfoData {
++        cb_size: u32,
++        class_guid: Guid,
++        dev_inst: u32,
++        reserved: usize,
++    }
++
++    #[repr(C)]
++    struct SpClassInstallHeader {
++        cb_size: u32,
++        install_function: u32,
++    }
++
++    #[repr(C)]
++    struct SpRemoveDeviceParams {
++        class_install_header: SpClassInstallHeader,
++        scope: u32,
++        hw_profile: u32,
++    }
++
++    #[repr(C)]
++    pub(crate) struct TunRing {
++        pub(crate) head: AtomicU32,
++        pub(crate) tail: AtomicU32,
++        pub(crate) alertable: AtomicI32,
++    }
++
++    #[repr(C)]
++    struct TunRingDescriptor {
++        ring_size: u32,
++        ring: *mut TunRing,
++        tail_moved: Handle,
++    }
++
++    #[repr(C)]
++    struct TunRegisterRings {
++        send: TunRingDescriptor,
++        receive: TunRingDescriptor,
++    }
++
++    type SwDeviceCreateCallback =
++        unsafe extern "system" fn(HSwDevice, i32, *mut c_void, *const u16);
+ 
+     #[link(name = "kernel32")]
+     unsafe extern "system" {
+-        fn LoadLibraryW(lpLibFileName: *const u16) -> HModule;
+-        fn GetProcAddress(hModule: HModule, lpProcName: *const u8) -> *mut c_void;
+-        fn FreeLibrary(hLibModule: HModule) -> i32;
+         fn CreateEventW(
+             lpEventAttributes: *mut c_void,
+             bManualReset: i32,
+@@ -2728,60 +2898,237 @@ mod windows_tun {
+         ) -> Handle;
+         fn SetEvent(hEvent: Handle) -> i32;
+         fn CloseHandle(hObject: Handle) -> i32;
++        fn WaitForSingleObject(hHandle: Handle, dwMilliseconds: u32) -> u32;
+         fn WaitForMultipleObjects(
+             nCount: u32,
+             lpHandles: *const Handle,
+             bWaitAll: i32,
+             dwMilliseconds: u32,
+         ) -> u32;
++        fn VirtualAlloc(
++            lpAddress: *mut c_void,
++            dwSize: usize,
++            flAllocationType: u32,
++            flProtect: u32,
++        ) -> *mut u8;
++        fn VirtualFree(lpAddress: *mut c_void, dwSize: usize, dwFreeType: u32) -> i32;
++        fn CreateFileW(
++            lpFileName: *const u16,
++            dwDesiredAccess: u32,
++            dwShareMode: u32,
++            lpSecurityAttributes: *mut c_void,
++            dwCreationDisposition: u32,
++            dwFlagsAndAttributes: u32,
++            hTemplateFile: Handle,
++        ) -> Handle;
++        fn DeviceIoControl(
++            hDevice: Handle,
++            dwIoControlCode: u32,
++            lpInBuffer: *const c_void,
++            nInBufferSize: u32,
++            lpOutBuffer: *mut c_void,
++            nOutBufferSize: u32,
++            lpBytesReturned: *mut u32,
++            lpOverlapped: *mut c_void,
++        ) -> i32;
++    }
++
++    #[link(name = "advapi32")]
++    unsafe extern "system" {
++        fn RegQueryValueExW(
++            hKey: HKey,
++            lpValueName: *const u16,
++            lpReserved: *mut u32,
++            lpType: *mut u32,
++            lpData: *mut u8,
++            lpcbData: *mut u32,
++        ) -> i32;
++        fn RegSetValueExW(
++            hKey: HKey,
++            lpValueName: *const u16,
++            Reserved: u32,
++            dwType: u32,
++            lpData: *const u8,
++            cbData: u32,
++        ) -> i32;
++        fn RegCloseKey(hKey: HKey) -> i32;
++    }
++
++    #[link(name = "ole32")]
++    unsafe extern "system" {
++        fn CLSIDFromString(lpsz: *const u16, pclsid: *mut Guid) -> i32;
++    }
++
++    #[link(name = "setupapi")]
++    unsafe extern "system" {
++        fn SetupCopyOEMInfW(
++            SourceInfFileName: *const u16,
++            OEMSourceMediaLocation: *const u16,
++            OEMSourceMediaType: u32,
++            CopyStyle: u32,
++            DestinationInfFileName: *mut u16,
++            DestinationInfFileNameSize: u32,
++            RequiredSize: *mut u32,
++            DestinationInfFileNameComponent: *mut *mut u16,
++        ) -> i32;
++        fn SetupDiCreateDeviceInfoListExW(
++            ClassGuid: *const Guid,
++            hwndParent: Handle,
++            MachineName: *const u16,
++            Reserved: *mut c_void,
++        ) -> HDevInfo;
++        fn SetupDiGetClassDevsExW(
++            ClassGuid: *const Guid,
++            Enumerator: *const u16,
++            hwndParent: Handle,
++            Flags: u32,
++            DeviceInfoSet: HDevInfo,
++            MachineName: *const u16,
++            Reserved: *mut c_void,
++        ) -> HDevInfo;
++        fn SetupDiEnumDeviceInfo(
++            DeviceInfoSet: HDevInfo,
++            MemberIndex: u32,
++            DeviceInfoData: *mut SpDevInfoData,
++        ) -> i32;
++        fn SetupDiOpenDeviceInfoW(
++            DeviceInfoSet: HDevInfo,
++            DeviceInstanceId: *const u16,
++            hwndParent: Handle,
++            OpenFlags: u32,
++            DeviceInfoData: *mut SpDevInfoData,
++        ) -> i32;
++        fn SetupDiDestroyDeviceInfoList(DeviceInfoSet: HDevInfo) -> i32;
++        fn SetupDiOpenDevRegKey(
++            DeviceInfoSet: HDevInfo,
++            DeviceInfoData: *mut SpDevInfoData,
++            Scope: u32,
++            HwProfile: u32,
++            KeyType: u32,
++            samDesired: u32,
++        ) -> HKey;
++        fn SetupDiGetDevicePropertyW(
++            DeviceInfoSet: HDevInfo,
++            DeviceInfoData: *mut SpDevInfoData,
++            PropertyKey: *const DevPropKey,
++            PropertyType: *mut u32,
++            PropertyBuffer: *mut u8,
++            PropertyBufferSize: u32,
++            RequiredSize: *mut u32,
++            Flags: u32,
++        ) -> i32;
++        fn SetupDiGetDeviceInstanceIdW(
++            DeviceInfoSet: HDevInfo,
++            DeviceInfoData: *mut SpDevInfoData,
++            DeviceInstanceId: *mut u16,
++            DeviceInstanceIdSize: u32,
++            RequiredSize: *mut u32,
++        ) -> i32;
++        fn SetupDiSetClassInstallParamsW(
++            DeviceInfoSet: HDevInfo,
++            DeviceInfoData: *mut SpDevInfoData,
++            ClassInstallParams: *const SpClassInstallHeader,
++            ClassInstallParamsSize: u32,
++        ) -> i32;
++        fn SetupDiCallClassInstaller(
++            InstallFunction: u32,
++            DeviceInfoSet: HDevInfo,
++            DeviceInfoData: *mut SpDevInfoData,
++        ) -> i32;
++    }
++
++    #[link(name = "cfgmgr32")]
++    unsafe extern "system" {
++        fn CM_Locate_DevNodeW(
++            pdnDevInst: *mut u32,
++            pDeviceID: *const u16,
++            ulFlags: u32,
++        ) -> u32;
++        fn CM_Get_Device_IDW(
++            dnDevInst: u32,
++            Buffer: *mut u16,
++            BufferLen: u32,
++            ulFlags: u32,
++        ) -> u32;
++        fn CM_Open_DevNode_Key(
++            dnDevInst: u32,
++            samDesired: u32,
++            ulHardwareProfile: u32,
++            Disposition: u32,
++            phkDevice: *mut HKey,
++            ulFlags: u32,
++        ) -> u32;
++        fn CM_Get_Device_Interface_List_SizeW(
++            pulLen: *mut u32,
++            InterfaceClassGuid: *const Guid,
++            pDeviceID: *const u16,
++            ulFlags: u32,
++        ) -> u32;
++        fn CM_Get_Device_Interface_ListW(
++            InterfaceClassGuid: *const Guid,
++            pDeviceID: *const u16,
++            Buffer: *mut u16,
++            BufferLen: u32,
++            ulFlags: u32,
++        ) -> u32;
++    }
++
++    #[link(name = "swdevice")]
++    unsafe extern "system" {
++        fn SwDeviceCreate(
++            pszEnumeratorName: *const u16,
++            pszParentDeviceInstance: *const u16,
++            pCreateInfo: *const SwDeviceCreateInfo,
++            cPropertyCount: u32,
++            pProperties: *const DevProperty,
++            pCallback: SwDeviceCreateCallback,
++            pContext: *mut c_void,
++            phSwDevice: *mut HSwDevice,
++        ) -> i32;
++        fn SwDeviceClose(hSwDevice: HSwDevice);
+     }
+ 
+     #[link(name = "iphlpapi")]
+     unsafe extern "system" {
+         fn GetBestInterface(dwDestAddr: u32, pdwBestIfIndex: *mut u32) -> u32;
++        fn ConvertInterfaceGuidToLuid(InterfaceGuid: *const Guid, InterfaceLuid: *mut u64) -> u32;
++        fn ConvertInterfaceLuidToAlias(
++            InterfaceLuid: *const u64,
++            InterfaceAlias: *mut u16,
++            Length: usize,
++        ) -> u32;
+     }
+ 
+-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+-    const RING_CAPACITY: u32 = 0x0040_0000; // 4 MiB
++    pub(crate) const fn tun_align(size: u32) -> u32 {
++        (size + (TUN_ALIGNMENT - 1)) & !(TUN_ALIGNMENT - 1)
++    }
++
++    pub(crate) const fn tun_max_packet_size() -> u32 {
++        tun_align(4 + WINTUN_MAX_IP_PACKET_SIZE)
++    }
++
++    pub(crate) const fn tun_ring_size(capacity: u32) -> u32 {
++        std::mem::size_of::<TunRing>() as u32 + capacity + (tun_max_packet_size() - TUN_ALIGNMENT)
++    }
++
++    pub(crate) const fn tun_ring_wrap(value: u32, capacity: u32) -> u32 {
++        value & (capacity - 1)
++    }
+ 
+     fn to_wide(s: &str) -> Vec<u16> {
+         s.encode_utf16().chain(std::iter::once(0)).collect()
+     }
+ 
+-    unsafe fn resolve_fn<T>(hmod: HModule, name: &CStr) -> io::Result<T> {
+-        let ptr = unsafe { GetProcAddress(hmod, name.as_ptr() as *const u8) };
+-        if ptr.is_null() {
+-            return Err(io::Error::new(
+-                io::ErrorKind::NotFound,
+-                format!("wintun.dll missing symbol {:?}", name),
+-            ));
+-        }
+-        Ok(unsafe { std::mem::transmute_copy(&ptr) })
++    fn to_wide_multi(s: &str) -> Vec<u16> {
++        let mut v: Vec<u16> = s.encode_utf16().collect();
++        v.push(0);
++        v.push(0);
++        v
+     }
+ 
+-    fn load_wintun_dll() -> io::Result<HModule> {
+-        let mut candidates = Vec::new();
+-        if let Ok(exe) = std::env::current_exe()
+-            && let Some(dir) = exe.parent()
+-        {
+-            candidates.push(dir.join("wintun.dll").to_string_lossy().into_owned());
+-            if let Some(parent) = dir.parent() {
+-                candidates.push(parent.join("wintun.dll").to_string_lossy().into_owned());
+-            }
+-        }
+-        candidates.push("wintun.dll".to_string());
+-
+-        for path in &candidates {
+-            let wide = to_wide(path);
+-            let hmod = unsafe { LoadLibraryW(wide.as_ptr()) };
+-            if !hmod.is_null() {
+-                return Ok(hmod);
+-            }
+-        }
+-        Err(io::Error::new(
+-            io::ErrorKind::NotFound,
+-            "wintun.dll not found in executable directory or PATH",
+-        ))
++    fn from_wide_nul(buf: &[u16]) -> String {
++        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
++        String::from_utf16_lossy(&buf[..len])
+     }
+ 
+     fn run_netsh(args: &[&str]) {
+@@ -2792,17 +3139,917 @@ mod windows_tun {
+             .output();
+     }
+ 
++    /// Ensure the signed Wintun kernel driver (`wintun.sys` + `wintun.cat` + `wintun.inf`)
++    /// is installed in the Windows Driver Store directly from embedded Rust bytes.
++    fn ensure_wintun_kernel_driver_installed() -> io::Result<()> {
++        let sys_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
++        let driver_sys = std::path::Path::new(&sys_root)
++            .join("System32")
++            .join("drivers")
++            .join("wintun.sys");
++
++        let temp_dir = std::env::temp_dir().join(format!(
++            "tachyon-wintun-drv-{}",
++            std::process::id()
++        ));
++        std::fs::create_dir_all(&temp_dir)?;
++
++        let inf_path = temp_dir.join("wintun.inf");
++        let cat_path = temp_dir.join("wintun.cat");
++        let sys_path = temp_dir.join("wintun.sys");
++
++        let res = (|| -> io::Result<()> {
++            std::fs::write(&inf_path, WINTUN_INF)?;
++            std::fs::write(&cat_path, WINTUN_CAT)?;
++            std::fs::write(&sys_path, WINTUN_SYS)?;
++
++            let inf_wide = to_wide(&inf_path.to_string_lossy());
++            let ok = unsafe {
++                SetupCopyOEMInfW(
++                    inf_wide.as_ptr(),
++                    std::ptr::null(),
++                    SPOST_NONE,
++                    0,
++                    std::ptr::null_mut(),
++                    0,
++                    std::ptr::null_mut(),
++                    std::ptr::null_mut(),
++                )
++            };
++            if ok == 0 && !driver_sys.exists() {
++                return Err(io::Error::last_os_error());
++            }
++            Ok(())
++        })();
++
++        let _ = std::fs::remove_file(&inf_path);
++        let _ = std::fs::remove_file(&cat_path);
++        let _ = std::fs::remove_file(&sys_path);
++        let _ = std::fs::remove_dir(&temp_dir);
++        res
++    }
++
++    struct SwCreateCtx {
++        hresult: i32,
++        instance_id: [u16; 256],
++        event: Handle,
++    }
++
++    unsafe extern "system" fn sw_device_create_cb(
++        _h_sw_device: HSwDevice,
++        create_result: i32,
++        context: *mut c_void,
++        device_instance_id: *const u16,
++    ) {
++        if context.is_null() {
++            return;
++        }
++        let ctx = unsafe { &mut *(context as *mut SwCreateCtx) };
++        ctx.hresult = create_result;
++        if !device_instance_id.is_null() {
++            let mut i = 0usize;
++            while i + 1 < ctx.instance_id.len() {
++                let ch = unsafe { *device_instance_id.add(i) };
++                ctx.instance_id[i] = ch;
++                if ch == 0 {
++                    break;
++                }
++                i += 1;
++            }
++            ctx.instance_id[ctx.instance_id.len() - 1] = 0;
++        }
++        unsafe {
++            SetEvent(ctx.event);
++        }
++    }
++
++    fn query_device_object_filename(instance_id: &[u16]) -> Option<Vec<u16>> {
++        let mut list_len: u32 = 0;
++        let cr = unsafe {
++            CM_Get_Device_Interface_List_SizeW(
++                &mut list_len,
++                &GUID_DEVINTERFACE_NET,
++                instance_id.as_ptr(),
++                CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
++            )
++        };
++        if cr != CR_SUCCESS || list_len <= 1 {
++            return None;
++        }
++        let mut buf = vec![0u16; list_len as usize];
++        let cr = unsafe {
++            CM_Get_Device_Interface_ListW(
++                &GUID_DEVINTERFACE_NET,
++                instance_id.as_ptr(),
++                buf.as_mut_ptr(),
++                list_len,
++                CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
++            )
++        };
++        if cr != CR_SUCCESS || buf[0] == 0 {
++            return None;
++        }
++        let first_nul = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
++        let mut path = buf[..first_nul].to_vec();
++        path.push(0);
++        Some(path)
++    }
++
++    fn query_adapter_guid_and_alias(dev_info: HDevInfo, dev_info_data: &mut SpDevInfoData) -> Option<(Guid, String)> {
++        let hkey = unsafe {
++            SetupDiOpenDevRegKey(
++                dev_info,
++                dev_info_data,
++                DICS_FLAG_GLOBAL,
++                0,
++                DIREG_DRV,
++                KEY_QUERY_VALUE,
++            )
++        };
++        if hkey.is_null() || hkey == INVALID_HANDLE_VALUE {
++            return None;
++        }
++        let val_name = to_wide("NetCfgInstanceId");
++        let mut reg_type: u32 = 0;
++        let mut buf = [0u16; 128];
++        let mut byte_len = (buf.len() * 2) as u32;
++        let rc = unsafe {
++            RegQueryValueExW(
++                hkey,
++                val_name.as_ptr(),
++                std::ptr::null_mut(),
++                &mut reg_type,
++                buf.as_mut_ptr() as *mut u8,
++                &mut byte_len,
++            )
++        };
++        unsafe {
++            RegCloseKey(hkey);
++        }
++        if rc != 0 {
++            return None;
++        }
++        buf[buf.len() - 1] = 0;
++        let mut guid = Guid {
++            data1: 0,
++            data2: 0,
++            data3: 0,
++            data4: [0; 8],
++        };
++        let hr = unsafe { CLSIDFromString(buf.as_ptr(), &mut guid) };
++        if hr < 0 {
++            return None;
++        }
++        let mut luid: u64 = 0;
++        if unsafe { ConvertInterfaceGuidToLuid(&guid, &mut luid) } != 0 {
++            return None;
++        }
++        let mut alias_buf = [0u16; 256];
++        if unsafe { ConvertInterfaceLuidToAlias(&luid, alias_buf.as_mut_ptr(), alias_buf.len()) } != 0 {
++            return None;
++        }
++        let alias = from_wide_nul(&alias_buf);
++        if alias.is_empty() {
++            return None;
++        }
++        Some((guid, alias))
++    }
++
++    fn try_rename_interface_alias(current_alias: &str, desired_name: &str) -> String {
++        if current_alias.eq_ignore_ascii_case(desired_name) {
++            return desired_name.to_string();
++        }
++        run_netsh(&[
++            "interface",
++            "set",
++            "interface",
++            &format!("name={current_alias}"),
++            &format!("newname={desired_name}"),
++        ]);
++        // Verify whether rename succeeded; otherwise use actual OS alias so IP/route setup always works
++        let enumerator = to_wide("SWD\\Wintun");
++        let dev_info = unsafe {
++            SetupDiGetClassDevsExW(
++                &GUID_DEVCLASS_NET,
++                enumerator.as_ptr(),
++                std::ptr::null_mut(),
++                DIGCF_PRESENT,
++                std::ptr::null_mut(),
++                std::ptr::null(),
++                std::ptr::null_mut(),
++            )
++        };
++        if !dev_info.is_null() && dev_info != INVALID_HANDLE_VALUE {
++            let mut data = SpDevInfoData {
++                cb_size: std::mem::size_of::<SpDevInfoData>() as u32,
++                class_guid: GUID_DEVCLASS_NET,
++                dev_inst: 0,
++                reserved: 0,
++            };
++            let mut idx = 0u32;
++            while unsafe { SetupDiEnumDeviceInfo(dev_info, idx, &mut data) } != 0 {
++                idx += 1;
++                if let Some((_, alias)) = query_adapter_guid_and_alias(dev_info, &mut data)
++                    && alias.eq_ignore_ascii_case(desired_name)
++                {
++                    unsafe {
++                        SetupDiDestroyDeviceInfoList(dev_info);
++                    }
++                    return desired_name.to_string();
++                }
++            }
++            unsafe {
++                SetupDiDestroyDeviceInfoList(dev_info);
++            }
++        }
++        current_alias.to_string()
++    }
++
++    struct NativeAdapter {
++        sw_device: HSwDevice,
++        dev_info: HDevInfo,
++        dev_info_data: SpDevInfoData,
++        interface_filename: Vec<u16>,
++        effective_name: String,
++    }
++
++    impl NativeAdapter {
++        fn open_existing(name: &str) -> Option<Self> {
++            let enumerator = to_wide("SWD\\Wintun");
++            let dev_info = unsafe {
++                SetupDiGetClassDevsExW(
++                    &GUID_DEVCLASS_NET,
++                    enumerator.as_ptr(),
++                    std::ptr::null_mut(),
++                    DIGCF_PRESENT,
++                    std::ptr::null_mut(),
++                    std::ptr::null(),
++                    std::ptr::null_mut(),
++                )
++            };
++            if dev_info.is_null() || dev_info == INVALID_HANDLE_VALUE {
++                return None;
++            }
++
++            let mut data = SpDevInfoData {
++                cb_size: std::mem::size_of::<SpDevInfoData>() as u32,
++                class_guid: GUID_DEVCLASS_NET,
++                dev_inst: 0,
++                reserved: 0,
++            };
++            let mut idx = 0u32;
++            while unsafe { SetupDiEnumDeviceInfo(dev_info, idx, &mut data) } != 0 {
++                idx += 1;
++                let mut prop_type = 0u32;
++                let mut prop_buf = [0u16; 256];
++                let ok = unsafe {
++                    SetupDiGetDevicePropertyW(
++                        dev_info,
++                        &mut data,
++                        &DEVPKEY_WINTUN_NAME,
++                        &mut prop_type,
++                        prop_buf.as_mut_ptr() as *mut u8,
++                        (prop_buf.len() * 2) as u32,
++                        std::ptr::null_mut(),
++                        0,
++                    )
++                };
++                let prop_name = if ok != 0 && prop_type == DEVPROP_TYPE_STRING {
++                    from_wide_nul(&prop_buf)
++                } else {
++                    String::new()
++                };
++
++                let alias_opt = query_adapter_guid_and_alias(dev_info, &mut data);
++                let matches = prop_name.eq_ignore_ascii_case(name)
++                    || alias_opt
++                        .as_ref()
++                        .is_some_and(|(_, alias)| alias.eq_ignore_ascii_case(name));
++                if !matches {
++                    continue;
++                }
++
++                let mut inst_id = [0u16; 256];
++                let mut req = 0u32;
++                if unsafe {
++                    SetupDiGetDeviceInstanceIdW(
++                        dev_info,
++                        &mut data,
++                        inst_id.as_mut_ptr(),
++                        inst_id.len() as u32,
++                        &mut req,
++                    )
++                } == 0
++                {
++                    continue;
++                }
++                if let Some(filename) = query_device_object_filename(&inst_id) {
++                    let effective_name = alias_opt
++                        .map(|(_, a)| try_rename_interface_alias(&a, name))
++                        .unwrap_or_else(|| name.to_string());
++                    return Some(Self {
++                        sw_device: std::ptr::null_mut(),
++                        dev_info,
++                        dev_info_data: data,
++                        interface_filename: filename,
++                        effective_name,
++                    });
++                }
++            }
++
++            unsafe {
++                SetupDiDestroyDeviceInfoList(dev_info);
++            }
++            None
++        }
++
++        fn create_or_open(name: &str) -> io::Result<Self> {
++            ensure_wintun_kernel_driver_installed()?;
++
++            if let Some(existing) = Self::open_existing(name) {
++                return Ok(existing);
++            }
++
++            let mut root_node: u32 = 0;
++            let cr = unsafe {
++                CM_Locate_DevNodeW(&mut root_node, std::ptr::null(), CM_LOCATE_DEVNODE_NORMAL)
++            };
++            if cr != CR_SUCCESS {
++                return Err(io::Error::other(format!(
++                    "CM_Locate_DevNodeW root failed: 0x{cr:x}"
++                )));
++            }
++            let mut root_name = [0u16; 200];
++            let cr = unsafe {
++                CM_Get_Device_IDW(root_node, root_name.as_mut_ptr(), root_name.len() as u32, 0)
++            };
++            if cr != CR_SUCCESS {
++                return Err(io::Error::other(format!(
++                    "CM_Get_Device_IDW root failed: 0x{cr:x}"
++                )));
++            }
++
++            let instance_guid = Guid {
++                data1: 0x7461_6368,
++                data2: 0x796f,
++                data3: 0x6e00,
++                data4: *b"wintun01",
++            };
++            let instance_guid_str = to_wide("{74616368-796F-6E00-7769-6E74756E3031}");
++            let enumerator_wintun = to_wide("Wintun");
++            let empty_hwids = to_wide_multi("");
++            let wintun_hwids = to_wide_multi("Wintun");
++            let tunnel_desc = to_wide("Tachyon Tunnel");
++            let wide_name = to_wide(name);
++
++            let event = unsafe { CreateEventW(std::ptr::null_mut(), 0, 0, std::ptr::null()) };
++            if event.is_null() {
++                return Err(io::Error::last_os_error());
++            }
++
++            let mut ctx = SwCreateCtx {
++                hresult: 0,
++                instance_id: [0u16; 256],
++                event,
++            };
++
++            // Step 1: Create stub software device to pre-seed SuggestedInstanceId
++            let stub_info = SwDeviceCreateInfo {
++                cb_size: std::mem::size_of::<SwDeviceCreateInfo>() as u32,
++                psz_instance_id: instance_guid_str.as_ptr(),
++                pszz_hardware_ids: empty_hwids.as_ptr(),
++                pszz_compatible_ids: std::ptr::null(),
++                p_container_id: std::ptr::null(),
++                capability_flags: SW_DEVICE_CAPABILITIES,
++                psz_device_description: tunnel_desc.as_ptr(),
++                psz_device_location: std::ptr::null(),
++                p_security_descriptor: std::ptr::null(),
++            };
++            let stub_props = [DevProperty {
++                comp_key: DevPropCompKey {
++                    key: DEVPKEY_DEVICE_CLASS_GUID,
++                    store: DEVPROP_STORE_SYSTEM,
++                    locale_name: std::ptr::null(),
++                },
++                prop_type: DEVPROP_TYPE_GUID,
++                buffer_size: std::mem::size_of::<Guid>() as u32,
++                buffer: &GUID_DEVCLASS_NET as *const Guid as *const c_void,
++            }];
++
++            let mut stub_sw: HSwDevice = std::ptr::null_mut();
++            let hr = unsafe {
++                SwDeviceCreate(
++                    enumerator_wintun.as_ptr(),
++                    root_name.as_ptr(),
++                    &stub_info,
++                    stub_props.len() as u32,
++                    stub_props.as_ptr(),
++                    sw_device_create_cb,
++                    &mut ctx as *mut SwCreateCtx as *mut c_void,
++                    &mut stub_sw,
++                )
++            };
++            if hr >= 0 {
++                unsafe {
++                    WaitForSingleObject(ctx.event, 10_000);
++                }
++                if ctx.hresult >= 0 {
++                    let mut dev_inst: u32 = 0;
++                    if unsafe {
++                        CM_Locate_DevNodeW(
++                            &mut dev_inst,
++                            ctx.instance_id.as_ptr(),
++                            CM_LOCATE_DEVNODE_PHANTOM,
++                        )
++                    } == CR_SUCCESS
++                    {
++                        let mut drv_key: HKey = std::ptr::null_mut();
++                        if unsafe {
++                            CM_Open_DevNode_Key(
++                                dev_inst,
++                                KEY_SET_VALUE,
++                                0,
++                                0, // RegDisposition_OpenAlways
++                                &mut drv_key,
++                                CM_REGISTRY_SOFTWARE,
++                            )
++                        } == CR_SUCCESS
++                        {
++                            let val_name = to_wide("SuggestedInstanceId");
++                            unsafe {
++                                RegSetValueExW(
++                                    drv_key,
++                                    val_name.as_ptr(),
++                                    0,
++                                    REG_BINARY,
++                                    &instance_guid as *const Guid as *const u8,
++                                    std::mem::size_of::<Guid>() as u32,
++                                );
++                                RegCloseKey(drv_key);
++                            }
++                        }
++                    }
++                }
++                if !stub_sw.is_null() {
++                    unsafe {
++                        SwDeviceClose(stub_sw);
++                    }
++                }
++            }
++
++            // Step 2: Create real Wintun software device attached to wintun.sys
++            let create_info = SwDeviceCreateInfo {
++                cb_size: std::mem::size_of::<SwDeviceCreateInfo>() as u32,
++                psz_instance_id: instance_guid_str.as_ptr(),
++                pszz_hardware_ids: wintun_hwids.as_ptr(),
++                pszz_compatible_ids: std::ptr::null(),
++                p_container_id: std::ptr::null(),
++                capability_flags: SW_DEVICE_CAPABILITIES,
++                psz_device_description: tunnel_desc.as_ptr(),
++                psz_device_location: std::ptr::null(),
++                p_security_descriptor: std::ptr::null(),
++            };
++            let props = [
++                DevProperty {
++                    comp_key: DevPropCompKey {
++                        key: DEVPKEY_WINTUN_NAME,
++                        store: DEVPROP_STORE_SYSTEM,
++                        locale_name: std::ptr::null(),
++                    },
++                    prop_type: DEVPROP_TYPE_STRING,
++                    buffer_size: (wide_name.len() * 2) as u32,
++                    buffer: wide_name.as_ptr() as *const c_void,
++                },
++                DevProperty {
++                    comp_key: DevPropCompKey {
++                        key: DEVPKEY_DEVICE_FRIENDLY_NAME,
++                        store: DEVPROP_STORE_SYSTEM,
++                        locale_name: std::ptr::null(),
++                    },
++                    prop_type: DEVPROP_TYPE_STRING,
++                    buffer_size: (tunnel_desc.len() * 2) as u32,
++                    buffer: tunnel_desc.as_ptr() as *const c_void,
++                },
++                DevProperty {
++                    comp_key: DevPropCompKey {
++                        key: DEVPKEY_DEVICE_DESC,
++                        store: DEVPROP_STORE_SYSTEM,
++                        locale_name: std::ptr::null(),
++                    },
++                    prop_type: DEVPROP_TYPE_STRING,
++                    buffer_size: (tunnel_desc.len() * 2) as u32,
++                    buffer: tunnel_desc.as_ptr() as *const c_void,
++                },
++            ];
++
++            let mut sw_device: HSwDevice = std::ptr::null_mut();
++            let hr = unsafe {
++                SwDeviceCreate(
++                    enumerator_wintun.as_ptr(),
++                    root_name.as_ptr(),
++                    &create_info,
++                    props.len() as u32,
++                    props.as_ptr(),
++                    sw_device_create_cb,
++                    &mut ctx as *mut SwCreateCtx as *mut c_void,
++                    &mut sw_device,
++                )
++            };
++            if hr < 0 {
++                unsafe {
++                    CloseHandle(ctx.event);
++                }
++                return Err(io::Error::other(format!(
++                    "SwDeviceCreate failed: 0x{hr:x}"
++                )));
++            }
++
++            let wait_rc = unsafe { WaitForSingleObject(ctx.event, 15_000) };
++            unsafe {
++                CloseHandle(ctx.event);
++            }
++            if wait_rc != 0 || ctx.hresult < 0 {
++                unsafe {
++                    SwDeviceClose(sw_device);
++                }
++                return Err(io::Error::other(format!(
++                    "SwDeviceCreate callback failed: wait={wait_rc}, hr=0x{:x}",
++                    ctx.hresult
++                )));
++            }
++
++            // Wait up to 15s for the NDIS device interface & registry NetCfgInstanceId to appear
++            let dev_info = unsafe {
++                SetupDiCreateDeviceInfoListExW(
++                    &GUID_DEVCLASS_NET,
++                    std::ptr::null_mut(),
++                    std::ptr::null(),
++                    std::ptr::null_mut(),
++                )
++            };
++            if dev_info.is_null() || dev_info == INVALID_HANDLE_VALUE {
++                unsafe {
++                    SwDeviceClose(sw_device);
++                }
++                return Err(io::Error::last_os_error());
++            }
++
++            let mut dev_info_data = SpDevInfoData {
++                cb_size: std::mem::size_of::<SpDevInfoData>() as u32,
++                class_guid: GUID_DEVCLASS_NET,
++                dev_inst: 0,
++                reserved: 0,
++            };
++
++            let mut interface_filename = None;
++            let mut alias_info = None;
++            for _ in 0..300 {
++                if interface_filename.is_none() {
++                    interface_filename = query_device_object_filename(&ctx.instance_id);
++                }
++                if alias_info.is_none() {
++                    let opened = unsafe {
++                        SetupDiOpenDeviceInfoW(
++                            dev_info,
++                            ctx.instance_id.as_ptr(),
++                            std::ptr::null_mut(),
++                            DIOD_INHERIT_CLASSDRVS,
++                            &mut dev_info_data,
++                        )
++                    };
++                    if opened != 0 {
++                        alias_info = query_adapter_guid_and_alias(dev_info, &mut dev_info_data);
++                    }
++                }
++                if interface_filename.is_some() && alias_info.is_some() {
++                    break;
++                }
++                std::thread::sleep(std::time::Duration::from_millis(50));
++            }
++
++            let Some(interface_filename) = interface_filename else {
++                unsafe {
++                    SetupDiDestroyDeviceInfoList(dev_info);
++                    SwDeviceClose(sw_device);
++                }
++                return Err(io::Error::new(
++                    io::ErrorKind::TimedOut,
++                    "timed out waiting for Wintun NDIS device interface",
++                ));
++            };
++
++            let effective_name = alias_info
++                .map(|(_, alias)| try_rename_interface_alias(&alias, name))
++                .unwrap_or_else(|| name.to_string());
++
++            Ok(Self {
++                sw_device,
++                dev_info,
++                dev_info_data,
++                interface_filename,
++                effective_name,
++            })
++        }
++    }
++
++    impl Drop for NativeAdapter {
++        fn drop(&mut self) {
++            if !self.sw_device.is_null() {
++                unsafe {
++                    SwDeviceClose(self.sw_device);
++                }
++            }
++            if !self.dev_info.is_null() && self.dev_info != INVALID_HANDLE_VALUE {
++                let remove_params = SpRemoveDeviceParams {
++                    class_install_header: SpClassInstallHeader {
++                        cb_size: std::mem::size_of::<SpClassInstallHeader>() as u32,
++                        install_function: DIF_REMOVE,
++                    },
++                    scope: DI_REMOVEDEVICE_GLOBAL,
++                    hw_profile: 0,
++                };
++                unsafe {
++                    if SetupDiSetClassInstallParamsW(
++                        self.dev_info,
++                        &mut self.dev_info_data,
++                        &remove_params.class_install_header,
++                        std::mem::size_of::<SpRemoveDeviceParams>() as u32,
++                    ) != 0
++                    {
++                        SetupDiCallClassInstaller(
++                            DIF_REMOVE,
++                            self.dev_info,
++                            &mut self.dev_info_data,
++                        );
++                    }
++                    SetupDiDestroyDeviceInfoList(self.dev_info);
++                }
++            }
++        }
++    }
++
++    /// Pure-Rust shared-memory ring session directly registered via `TUN_IOCTL_REGISTER_RINGS`
++    /// with `wintun.sys` (no `wintun.dll` in user space).
++    struct NativeRingSession {
++        dev_handle: Handle,
++        region_ptr: *mut u8,
++        send_ring: *mut TunRing,    // Kernel -> Userspace (we read incoming IP packets here)
++        receive_ring: *mut TunRing, // Userspace -> Kernel (we write outgoing IP packets here)
++        send_tail_moved: Handle,
++        receive_tail_moved: Handle,
++        capacity: u32,
++        send_head: std::sync::Mutex<u32>,
++        receive_tail: std::sync::Mutex<u32>,
++    }
++
++    unsafe impl Send for NativeRingSession {}
++    unsafe impl Sync for NativeRingSession {}
++
++    impl NativeRingSession {
++        fn start(interface_filename: &[u16], capacity: u32) -> io::Result<Self> {
++            let ring_size = tun_ring_size(capacity) as usize;
++            let region_ptr = unsafe {
++                VirtualAlloc(
++                    std::ptr::null_mut(),
++                    ring_size * 2,
++                    MEM_COMMIT | MEM_RESERVE,
++                    PAGE_READWRITE,
++                )
++            };
++            if region_ptr.is_null() {
++                return Err(io::Error::last_os_error());
++            }
++
++            let send_ring = region_ptr as *mut TunRing;
++            let receive_ring = unsafe { region_ptr.add(ring_size) as *mut TunRing };
++
++            let send_tail_moved =
++                unsafe { CreateEventW(std::ptr::null_mut(), 0, 0, std::ptr::null()) };
++            if send_tail_moved.is_null() {
++                let err = io::Error::last_os_error();
++                unsafe {
++                    VirtualFree(region_ptr as *mut c_void, 0, MEM_RELEASE);
++                }
++                return Err(err);
++            }
++
++            let receive_tail_moved =
++                unsafe { CreateEventW(std::ptr::null_mut(), 0, 0, std::ptr::null()) };
++            if receive_tail_moved.is_null() {
++                let err = io::Error::last_os_error();
++                unsafe {
++                    CloseHandle(send_tail_moved);
++                    VirtualFree(region_ptr as *mut c_void, 0, MEM_RELEASE);
++                }
++                return Err(err);
++            }
++
++            let dev_handle = unsafe {
++                CreateFileW(
++                    interface_filename.as_ptr(),
++                    GENERIC_READ | GENERIC_WRITE,
++                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++                    std::ptr::null_mut(),
++                    OPEN_EXISTING,
++                    0,
++                    std::ptr::null_mut(),
++                )
++            };
++            if dev_handle.is_null() || dev_handle == INVALID_HANDLE_VALUE {
++                let err = io::Error::last_os_error();
++                unsafe {
++                    CloseHandle(receive_tail_moved);
++                    CloseHandle(send_tail_moved);
++                    VirtualFree(region_ptr as *mut c_void, 0, MEM_RELEASE);
++                }
++                return Err(err);
++            }
++
++            let reg = TunRegisterRings {
++                send: TunRingDescriptor {
++                    ring_size: ring_size as u32,
++                    ring: send_ring,
++                    tail_moved: send_tail_moved,
++                },
++                receive: TunRingDescriptor {
++                    ring_size: ring_size as u32,
++                    ring: receive_ring,
++                    tail_moved: receive_tail_moved,
++                },
++            };
++
++            let mut bytes_returned: u32 = 0;
++            let ok = unsafe {
++                DeviceIoControl(
++                    dev_handle,
++                    TUN_IOCTL_REGISTER_RINGS,
++                    &reg as *const TunRegisterRings as *const c_void,
++                    std::mem::size_of::<TunRegisterRings>() as u32,
++                    std::ptr::null_mut(),
++                    0,
++                    &mut bytes_returned,
++                    std::ptr::null_mut(),
++                )
++            };
++            if ok == 0 {
++                let err = io::Error::last_os_error();
++                unsafe {
++                    CloseHandle(dev_handle);
++                    CloseHandle(receive_tail_moved);
++                    CloseHandle(send_tail_moved);
++                    VirtualFree(region_ptr as *mut c_void, 0, MEM_RELEASE);
++                }
++                return Err(err);
++            }
++
++            Ok(Self {
++                dev_handle,
++                region_ptr,
++                send_ring,
++                receive_ring,
++                send_tail_moved,
++                receive_tail_moved,
++                capacity,
++                send_head: std::sync::Mutex::new(0),
++                receive_tail: std::sync::Mutex::new(0),
++            })
++        }
++
++        fn try_receive_packet(&self) -> io::Result<Option<Vec<u8>>> {
++            let mut head_guard = self.send_head.lock().unwrap();
++            let head = *head_guard;
++            if head >= self.capacity {
++                return Err(io::Error::new(
++                    io::ErrorKind::UnexpectedEof,
++                    "Wintun send ring head out of bounds",
++                ));
++            }
++            let ring = unsafe { &*self.send_ring };
++            let buff_tail = ring.tail.load(Ordering::Acquire);
++            if buff_tail >= self.capacity {
++                return Err(io::Error::new(
++                    io::ErrorKind::UnexpectedEof,
++                    "Wintun send ring tail out of bounds",
++                ));
++            }
++            if head == buff_tail {
++                return Ok(None);
++            }
++
++            let buff_content = tun_ring_wrap(buff_tail.wrapping_sub(head), self.capacity);
++            if buff_content < 4 {
++                return Err(io::Error::new(
++                    io::ErrorKind::InvalidData,
++                    "Wintun send ring frame shorter than header",
++                ));
++            }
++
++            let data_base =
++                unsafe { (self.send_ring as *const u8).add(std::mem::size_of::<TunRing>()) };
++            let pkt_ptr = unsafe { data_base.add(head as usize) };
++            let pkt_size =
++                unsafe { std::ptr::read_unaligned(pkt_ptr as *const u32) } & !TUN_PACKET_RELEASE;
++            if pkt_size > WINTUN_MAX_IP_PACKET_SIZE {
++                return Err(io::Error::new(
++                    io::ErrorKind::InvalidData,
++                    "Wintun packet exceeds max IP packet size",
++                ));
++            }
++
++            let aligned_pkt_size = tun_align(4 + pkt_size);
++            if aligned_pkt_size > buff_content {
++                return Err(io::Error::new(
++                    io::ErrorKind::InvalidData,
++                    "Wintun incomplete packet in send ring",
++                ));
++            }
++
++            let payload_slice =
++                unsafe { std::slice::from_raw_parts(pkt_ptr.add(4), pkt_size as usize) };
++            let owned = payload_slice.to_vec();
++
++            let next_head = tun_ring_wrap(head.wrapping_add(aligned_pkt_size), self.capacity);
++            *head_guard = next_head;
++            ring.head.store(next_head, Ordering::Release);
++            Ok(Some(owned))
++        }
++
++        fn send_packet(&self, pkt: &[u8]) -> io::Result<usize> {
++            if pkt.is_empty() || pkt.len() > WINTUN_MAX_IP_PACKET_SIZE as usize {
++                return Ok(0);
++            }
++            let pkt_size = pkt.len() as u32;
++            let aligned_pkt_size = tun_align(4 + pkt_size);
++
++            let mut tail_guard = self.receive_tail.lock().unwrap();
++            let tail = *tail_guard;
++            if tail >= self.capacity {
++                return Err(io::Error::new(
++                    io::ErrorKind::UnexpectedEof,
++                    "Wintun receive ring tail out of bounds",
++                ));
++            }
++
++            let ring = unsafe { &*self.receive_ring };
++            let buff_head = ring.head.load(Ordering::Acquire);
++            if buff_head >= self.capacity {
++                return Err(io::Error::new(
++                    io::ErrorKind::UnexpectedEof,
++                    "Wintun receive ring head out of bounds",
++                ));
++            }
++
++            let buff_space = tun_ring_wrap(
++                buff_head
++                    .wrapping_sub(tail)
++                    .wrapping_sub(TUN_ALIGNMENT),
++                self.capacity,
++            );
++            if aligned_pkt_size > buff_space {
++                return Err(io::Error::new(
++                    io::ErrorKind::WouldBlock,
++                    "Wintun receive ring full",
++                ));
++            }
++
++            let data_base =
++                unsafe { (self.receive_ring as *mut u8).add(std::mem::size_of::<TunRing>()) };
++            let pkt_ptr = unsafe { data_base.add(tail as usize) };
++            unsafe {
++                std::ptr::write_unaligned(pkt_ptr as *mut u32, pkt_size);
++                std::ptr::copy_nonoverlapping(pkt.as_ptr(), pkt_ptr.add(4), pkt.len());
++            }
++
++            let next_tail = tun_ring_wrap(tail.wrapping_add(aligned_pkt_size), self.capacity);
++            *tail_guard = next_tail;
++            ring.tail.store(next_tail, Ordering::Release);
++            std::sync::atomic::fence(Ordering::SeqCst);
++            if ring.alertable.load(Ordering::Acquire) != 0 {
++                unsafe {
++                    SetEvent(self.receive_tail_moved);
++                }
++            }
++            Ok(pkt.len())
++        }
++    }
++
++    impl Drop for NativeRingSession {
++        fn drop(&mut self) {
++            unsafe {
++                CloseHandle(self.dev_handle);
++                CloseHandle(self.send_tail_moved);
++                CloseHandle(self.receive_tail_moved);
++                VirtualFree(self.region_ptr as *mut c_void, 0, MEM_RELEASE);
++            }
++        }
++    }
++
+     pub struct WinTunDevice {
+-        hmod: usize,
+-        adapter: usize,
+-        session: usize,
++        session: std::sync::Arc<NativeRingSession>,
++        _adapter: NativeAdapter,
+         stop_event: usize,
+         reader_thread: Option<std::thread::JoinHandle<()>>,
+         rx_rx: Mutex<mpsc::Receiver<Vec<u8>>>,
+-        fn_end_session: FnEndSession,
+-        fn_close_adapter: FnCloseAdapter,
+-        fn_allocate_send: FnAllocateSendPacket,
+-        fn_send_packet: FnSendPacket,
+         name: String,
+         auto_route: bool,
+         ipv4_gw: Option<Ipv4Addr>,
+@@ -2830,63 +4077,18 @@ mod windows_tun {
+                 }
+             }
+ 
+-            let hmod = load_wintun_dll()?;
+             let res = (|| -> io::Result<Self> {
+-                let fn_create: FnCreateAdapter =
+-                    unsafe { resolve_fn(hmod, c"WintunCreateAdapter")? };
+-                let fn_open: FnOpenAdapter = unsafe { resolve_fn(hmod, c"WintunOpenAdapter")? };
+-                let fn_close_adapter: FnCloseAdapter =
+-                    unsafe { resolve_fn(hmod, c"WintunCloseAdapter")? };
+-                let fn_start_session: FnStartSession =
+-                    unsafe { resolve_fn(hmod, c"WintunStartSession")? };
+-                let fn_end_session: FnEndSession =
+-                    unsafe { resolve_fn(hmod, c"WintunEndSession")? };
+-                let fn_get_read_event: FnGetReadWaitEvent =
+-                    unsafe { resolve_fn(hmod, c"WintunGetReadWaitEvent")? };
+-                let fn_receive_packet: FnReceivePacket =
+-                    unsafe { resolve_fn(hmod, c"WintunReceivePacket")? };
+-                let fn_release_receive: FnReleaseReceivePacket =
+-                    unsafe { resolve_fn(hmod, c"WintunReleaseReceivePacket")? };
+-                let fn_allocate_send: FnAllocateSendPacket =
+-                    unsafe { resolve_fn(hmod, c"WintunAllocateSendPacket")? };
+-                let fn_send_packet: FnSendPacket =
+-                    unsafe { resolve_fn(hmod, c"WintunSendPacket")? };
+-
+-                let wide_name = to_wide(name);
+-                let wide_type = to_wide("Tachyon");
+-                let guid = Guid {
+-                    data1: 0x7461_6368,
+-                    data2: 0x796f,
+-                    data3: 0x6e00,
+-                    data4: *b"wintun01",
+-                };
+-
+-                let mut adapter =
+-                    unsafe { fn_create(wide_name.as_ptr(), wide_type.as_ptr(), &guid) };
+-                if adapter.is_null() {
+-                    adapter = unsafe { fn_open(wide_name.as_ptr()) };
+-                }
+-                if adapter.is_null() {
+-                    return Err(io::Error::last_os_error());
+-                }
+-
+-                let session = unsafe { fn_start_session(adapter, RING_CAPACITY) };
+-                if session.is_null() {
+-                    let err = io::Error::last_os_error();
+-                    unsafe { fn_close_adapter(adapter) };
+-                    return Err(err);
+-                }
++                let adapter = NativeAdapter::create_or_open(name)?;
++                let effective_name = adapter.effective_name.clone();
++                let session = std::sync::Arc::new(NativeRingSession::start(
++                    &adapter.interface_filename,
++                    RING_CAPACITY,
++                )?);
+ 
+-                let read_event = unsafe { fn_get_read_event(session) };
+                 let stop_event =
+                     unsafe { CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null()) };
+                 if stop_event.is_null() {
+-                    let err = io::Error::last_os_error();
+-                    unsafe {
+-                        fn_end_session(session);
+-                        fn_close_adapter(adapter);
+-                    }
+-                    return Err(err);
++                    return Err(io::Error::last_os_error());
+                 }
+ 
+                 // Configure IPv4, IPv6, MTU, and split routes via netsh
+@@ -2900,7 +4102,7 @@ mod windows_tun {
+                         "ipv4",
+                         "set",
+                         "address",
+-                        &format!("name={name}"),
++                        &format!("name={effective_name}"),
+                         "source=static",
+                         &format!("addr={ip_str}"),
+                         &format!("mask={mask_str}"),
+@@ -2908,13 +4110,13 @@ mod windows_tun {
+                     ipv4_gw = Some(ip);
+                 }
+                 let mtu_str = format!("mtu={mtu}");
+-                let name_arg = format!("interface={name}");
++                let name_arg = format!("interface={effective_name}");
+                 run_netsh(&[
+                     "interface",
+                     "ipv4",
+                     "set",
+                     "subinterface",
+-                    name,
++                    &effective_name,
+                     &mtu_str,
+                     "store=active",
+                 ]);
+@@ -2932,7 +4134,7 @@ mod windows_tun {
+                             "add",
+                             "route",
+                             "0.0.0.0/1",
+-                            name,
++                            &effective_name,
+                             &gw_str,
+                             "metric=1",
+                         ]);
+@@ -2942,40 +4144,43 @@ mod windows_tun {
+                             "add",
+                             "route",
+                             "128.0.0.0/1",
+-                            name,
++                            &effective_name,
+                             &gw_str,
+                             "metric=1",
+                         ]);
+                     }
+                     if !v6_addrs.is_empty() {
+-                        run_netsh(&["interface", "ipv6", "add", "route", "::/1", name]);
+-                        run_netsh(&["interface", "ipv6", "add", "route", "8000::/1", name]);
++                        run_netsh(&["interface", "ipv6", "add", "route", "::/1", &effective_name]);
++                        run_netsh(&[
++                            "interface",
++                            "ipv6",
++                            "add",
++                            "route",
++                            "8000::/1",
++                            &effective_name,
++                        ]);
+                     }
+                 }
+ 
+                 let (rx_tx, rx_rx) = mpsc::channel::<Vec<u8>>(1024);
+-                let session_addr = session as usize;
+-                let read_event_addr = read_event as usize;
++                let session_reader = std::sync::Arc::clone(&session);
++                let read_event_addr = session.send_tail_moved as usize;
+                 let stop_event_addr = stop_event as usize;
+ 
+                 let reader_thread = std::thread::Builder::new()
+-                    .name(format!("wintun-rx-{name}"))
++                    .name(format!("wintun-rx-{effective_name}"))
+                     .spawn(move || {
+-                        let session_ptr = session_addr as WintunSessionHandle;
+                         let handles = [read_event_addr as Handle, stop_event_addr as Handle];
+                         loop {
+-                            let mut pkt_size: u32 = 0;
+-                            let pkt_ptr = unsafe { fn_receive_packet(session_ptr, &mut pkt_size) };
+-                            if !pkt_ptr.is_null() {
+-                                let slice = unsafe {
+-                                    std::slice::from_raw_parts(pkt_ptr, pkt_size as usize)
+-                                };
+-                                let owned = slice.to_vec();
+-                                unsafe { fn_release_receive(session_ptr, pkt_ptr) };
+-                                if rx_tx.blocking_send(owned).is_err() {
+-                                    break;
++                            match session_reader.try_receive_packet() {
++                                Ok(Some(pkt)) => {
++                                    if rx_tx.blocking_send(pkt).is_err() {
++                                        break;
++                                    }
++                                    continue;
+                                 }
+-                                continue;
++                                Ok(None) => {}
++                                Err(_) => break,
+                             }
+                             let wait_rc =
+                                 unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, 100) };
+@@ -2987,28 +4192,20 @@ mod windows_tun {
+                     })?;
+ 
+                 Ok(Self {
+-                    hmod: hmod as usize,
+-                    adapter: adapter as usize,
+-                    session: session as usize,
++                    session,
++                    _adapter: adapter,
+                     stop_event: stop_event as usize,
+                     reader_thread: Some(reader_thread),
+                     rx_rx: Mutex::new(rx_rx),
+-                    fn_end_session,
+-                    fn_close_adapter,
+-                    fn_allocate_send,
+-                    fn_send_packet,
+-                    name: name.to_string(),
++                    name: effective_name,
+                     auto_route,
+                     ipv4_gw,
+                     has_v6: !v6_addrs.is_empty(),
+                 })
+             })();
+ 
+-            if res.is_err() {
+-                if auto_route {
+-                    WIN_OUTBOUND_IF_INDEX.store(0, Ordering::Release);
+-                }
+-                unsafe { FreeLibrary(hmod) };
++            if res.is_err() && auto_route {
++                WIN_OUTBOUND_IF_INDEX.store(0, Ordering::Release);
+             }
+             res
+         }
+@@ -3026,22 +4223,7 @@ mod windows_tun {
+         }
+ 
+         pub fn write_packet(&self, pkt: &[u8]) -> io::Result<usize> {
+-            if pkt.is_empty() || pkt.len() > u32::MAX as usize {
+-                return Ok(0);
+-            }
+-            let session_ptr = self.session as WintunSessionHandle;
+-            let out_ptr = unsafe { (self.fn_allocate_send)(session_ptr, pkt.len() as u32) };
+-            if out_ptr.is_null() {
+-                return Err(io::Error::new(
+-                    io::ErrorKind::WouldBlock,
+-                    "Wintun send ring full",
+-                ));
+-            }
+-            unsafe {
+-                std::ptr::copy_nonoverlapping(pkt.as_ptr(), out_ptr, pkt.len());
+-                (self.fn_send_packet)(session_ptr, out_ptr);
+-            }
+-            Ok(pkt.len())
++            self.session.send_packet(pkt)
+         }
+     }
+ 
+@@ -3089,10 +4271,7 @@ mod windows_tun {
+                 }
+             }
+             unsafe {
+-                (self.fn_end_session)(self.session as WintunSessionHandle);
+-                (self.fn_close_adapter)(self.adapter as WintunAdapterHandle);
+                 CloseHandle(self.stop_event as Handle);
+-                FreeLibrary(self.hmod as HModule);
+             }
+         }
+     }
+@@ -3740,4 +4919,16 @@ mod tests {
+         assert_eq!(reply[40], 129); // Echo Reply
+         assert_eq!(ipv6_icmp_checksum(dst, src, &reply[40..]), 0xffff);
+     }
++
++    #[cfg(target_os = "windows")]
++    #[test]
++    fn windows_wintun_pure_rust_ring_math_and_embedded_driver() {
++        assert_eq!(windows_tun::tun_align(1), 4);
++        assert_eq!(windows_tun::tun_align(4), 4);
++        assert_eq!(windows_tun::tun_align(5), 8);
++        assert_eq!(windows_tun::tun_max_packet_size(), 65540);
++        // 12 (TunRing header) + 4_194_304 (4 MiB) + (65540 - 4) = 4_259_852
++        assert_eq!(windows_tun::tun_ring_size(0x0040_0000), 4_259_852);
++        assert_eq!(windows_tun::tun_ring_wrap(0x0040_0004, 0x0040_0000), 4);
++    }
+ }

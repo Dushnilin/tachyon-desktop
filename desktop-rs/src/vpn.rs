@@ -108,6 +108,139 @@ pub struct ExtraNodeRef {
     pub vless: String,
 }
 
+pub const BALANCER_URI_PREFIX: &str = "tachyon-balancer://";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BalancerMember {
+    pub name: String,
+    pub vless: String,
+    #[serde(default)]
+    pub country: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BalancerPayload {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default = "default_balancer_mode")]
+    pub mode: String,
+    #[serde(default = "default_balancer_url")]
+    pub url: String,
+    #[serde(default = "default_balancer_interval")]
+    pub interval: String,
+    #[serde(default = "default_balancer_tolerance")]
+    pub tolerance: u32,
+    #[serde(default = "default_balancer_pool")]
+    pub pool: u32,
+    #[serde(default = "default_balancer_pool_tolerance")]
+    pub pool_tolerance: u32,
+    #[serde(default = "default_balancer_sticky_hash")]
+    pub sticky_hash: Vec<String>,
+    #[serde(default = "default_balancer_quota_mib")]
+    pub quota_mib: u32,
+    #[serde(default)]
+    pub members: Vec<BalancerMember>,
+}
+
+fn default_balancer_mode() -> String {
+    "stability".to_string()
+}
+fn default_balancer_url() -> String {
+    "https://www.gstatic.com/generate_204".to_string()
+}
+fn default_balancer_interval() -> String {
+    "3m".to_string()
+}
+fn default_balancer_tolerance() -> u32 {
+    50
+}
+fn default_balancer_pool() -> u32 {
+    4
+}
+fn default_balancer_pool_tolerance() -> u32 {
+    80
+}
+fn default_balancer_sticky_hash() -> Vec<String> {
+    vec![
+        "domain".to_string(),
+        "dest_ip".to_string(),
+        "process".to_string(),
+    ]
+}
+fn default_balancer_quota_mib() -> u32 {
+    256
+}
+
+pub fn normalize_balancer_mode(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "least_test" | "fastest" | "urltest" => "least_test",
+        "failover" => "failover",
+        "sticky" => "sticky",
+        "least_load" => "least_load",
+        "weighted" => "weighted",
+        "passive" => "passive",
+        "priority" => "priority",
+        "hedged" => "hedged",
+        "throughput" => "throughput",
+        "quota" => "quota",
+        "round_robin" => "round_robin",
+        _ => "stability",
+    }
+}
+
+pub fn encode_balancer_uri(payload: &BalancerPayload) -> String {
+    let json_bytes = serde_json::to_vec(payload).unwrap_or_default();
+    let b64 = B64.encode(&json_bytes);
+    let frag = core_config::subscription::percent_encode_component(&payload.name);
+    format!("{BALANCER_URI_PREFIX}{b64}#{frag}")
+}
+
+pub fn decode_balancer_uri(raw: &str) -> Option<BalancerPayload> {
+    let rest = raw.trim().strip_prefix(BALANCER_URI_PREFIX)?;
+    let (b64_part, frag_part) = match rest.split_once('#') {
+        Some((b, f)) => (b.trim(), Some(f.trim())),
+        None => (rest.trim(), None),
+    };
+    let bytes = B64.decode(b64_part).ok()?;
+    let mut payload: BalancerPayload = serde_json::from_slice(&bytes).ok()?;
+    if payload.name.is_empty() {
+        if let Some(f) = frag_part {
+            if !f.is_empty() {
+                payload.name = f.replace("%20", " ");
+            }
+        }
+    }
+    payload.mode = normalize_balancer_mode(&payload.mode).to_string();
+    Some(payload)
+}
+
+#[derive(Debug, Clone)]
+pub struct BalancerOptions {
+    pub mode_override: Option<String>,
+    pub url: String,
+    pub interval: String,
+    pub tolerance: u32,
+    pub pool: u32,
+    pub pool_tolerance: u32,
+    pub sticky_hash: Vec<String>,
+    pub quota_mib: u32,
+}
+
+impl Default for BalancerOptions {
+    fn default() -> Self {
+        Self {
+            mode_override: None,
+            url: default_balancer_url(),
+            interval: default_balancer_interval(),
+            tolerance: default_balancer_tolerance(),
+            pool: default_balancer_pool(),
+            pool_tolerance: default_balancer_pool_tolerance(),
+            sticky_hash: default_balancer_sticky_hash(),
+            quota_mib: default_balancer_quota_mib(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteMode {
     All,
@@ -135,6 +268,7 @@ pub struct ConnectOptions {
     pub detour_vless: String,
     pub extra_nodes: Vec<ExtraNodeRef>,
     pub desync: DesyncOptions,
+    pub balancer: BalancerOptions,
     pub community_lists: Vec<CommunityListRule>,
     pub custom_rules: Vec<CustomRouteRule>,
 }
@@ -150,6 +284,7 @@ impl ConnectOptions {
             || raw.starts_with("hysteria2://")
             || raw.starts_with("amneziawg://")
             || raw.starts_with("awg://")
+            || raw.starts_with(BALANCER_URI_PREFIX)
         {
             return Ok(Self {
                 vless: raw.to_string(),
@@ -168,6 +303,7 @@ impl ConnectOptions {
                 detour_vless: String::new(),
                 extra_nodes: Vec::new(),
                 desync: DesyncOptions::default(),
+                balancer: BalancerOptions::default(),
                 community_lists: Vec::new(),
                 custom_rules: Vec::new(),
             });
@@ -365,6 +501,65 @@ impl ConnectOptions {
             }
         }
 
+        let mut balancer = BalancerOptions::default();
+        if let Some(m) = root
+            .get("balancerMode")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto"))
+        {
+            balancer.mode_override = Some(normalize_balancer_mode(m).to_string());
+        }
+        if let Some(b) = root.get("balancer").and_then(Value::as_object) {
+            if let Some(m) = b
+                .get("mode")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto"))
+            {
+                balancer.mode_override = Some(normalize_balancer_mode(m).to_string());
+            }
+            if let Some(u) = b
+                .get("url")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                balancer.url = u.to_string();
+            }
+            if let Some(iv) = b
+                .get("interval")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                balancer.interval = iv.to_string();
+            }
+            if let Some(t) = b.get("tolerance").and_then(Value::as_u64) {
+                balancer.tolerance = (t as u32).clamp(5, 2000);
+            }
+            if let Some(p) = b.get("pool").and_then(Value::as_u64) {
+                balancer.pool = (p as u32).clamp(1, 32);
+            }
+            if let Some(pt) = b.get("poolTolerance").or_else(|| b.get("pool_tolerance")).and_then(Value::as_u64) {
+                balancer.pool_tolerance = (pt as u32).clamp(10, 2000);
+            }
+            if let Some(q) = b.get("quotaMib").or_else(|| b.get("quota_mib")).and_then(Value::as_u64) {
+                balancer.quota_mib = (q as u32).clamp(1, 1_048_576);
+            }
+            if let Some(arr) = b.get("stickyHash").or_else(|| b.get("sticky_hash")).and_then(Value::as_array) {
+                let parsed: Vec<String> = arr
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| matches!(s.as_str(), "source_ip" | "domain" | "dest_ip" | "dest_port" | "process"))
+                    .collect();
+                if !parsed.is_empty() {
+                    balancer.sticky_hash = parsed;
+                }
+            }
+        }
+
         let mut community_lists = Vec::new();
         if let Some(arr) = root.get("communityLists").and_then(Value::as_array) {
             for item in arr {
@@ -448,6 +643,7 @@ impl ConnectOptions {
             detour_vless,
             extra_nodes,
             desync,
+            balancer,
             community_lists,
             custom_rules,
         })
@@ -542,27 +738,7 @@ fn is_priority_direct_ru_list(can: &str) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-const WINTUN_DLL_BYTES: &[u8] = include_bytes!("../../src/core/wintun.dll");
-#[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-pub fn ensure_wintun_dll() {
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                let dll_path = dir.join("wintun.dll");
-                let needs_write = match fs::metadata(&dll_path) {
-                    Ok(m) => m.len() != WINTUN_DLL_BYTES.len() as u64,
-                    Err(_) => true,
-                };
-                if needs_write {
-                    let _ = fs::write(&dll_path, WINTUN_DLL_BYTES);
-                }
-            }
-        }
-    }
-}
 
 struct RunningEngine {
     in_proc: Option<BoxInstance>,
@@ -608,7 +784,6 @@ pub struct VpnManager {
 
 impl VpnManager {
     pub fn new(send_js: Arc<dyn Fn(String) + Send + Sync>) -> Self {
-        ensure_wintun_dll();
         #[cfg(target_os = "windows")]
         refresh_cached_windows_phys_ifindex();
         let data_dir = app_data_dir();
@@ -982,17 +1157,190 @@ impl VpnManager {
         Ok((false, node, server_host))
     }
 
+    fn alloc_unique_member_tag(
+        base_name: &str,
+        group_tag: &str,
+        idx: usize,
+        used_tags: &mut HashSet<String>,
+    ) -> String {
+        let trimmed = base_name.trim();
+        let candidate_base = if trimmed.is_empty() {
+            format!("{group_tag}-{}", idx + 1)
+        } else {
+            trimmed.to_string()
+        };
+        if !used_tags.contains(&candidate_base) {
+            used_tags.insert(candidate_base.clone());
+            return candidate_base;
+        }
+        let mut n = 2usize;
+        loop {
+            let next = format!("{candidate_base} #{n}");
+            if !used_tags.contains(&next) {
+                used_tags.insert(next.clone());
+                return next;
+            }
+            n += 1;
+        }
+    }
+
+    fn expand_parsed_target(
+        raw_uri: &str,
+        tag: &str,
+        tls_fragment: bool,
+        detour_tag: Option<&str>,
+        balancer_opts: &BalancerOptions,
+        used_tags: &mut HashSet<String>,
+    ) -> Result<(Vec<Value>, Vec<Value>, Vec<String>), String> {
+        let trimmed = raw_uri.trim();
+        if let Some(bal) = decode_balancer_uri(trimmed) {
+            let mut ep_list = Vec::new();
+            let mut ob_list = Vec::new();
+            let mut hosts = Vec::new();
+            let mut member_tags = Vec::new();
+
+            for (idx, m) in bal.members.iter().enumerate() {
+                if m.vless.trim().is_empty() || m.vless.trim().starts_with(BALANCER_URI_PREFIX) {
+                    continue;
+                }
+                let m_tag = Self::alloc_unique_member_tag(&m.name, tag, idx, used_tags);
+                if let Ok((is_ep, val, host)) =
+                    Self::prepare_parsed_node(&m.vless, &m_tag, tls_fragment, detour_tag)
+                {
+                    if let Some(h) = host {
+                        hosts.push(h);
+                    }
+                    if is_ep {
+                        ep_list.push(val);
+                    } else {
+                        ob_list.push(val);
+                    }
+                    member_tags.push(m_tag);
+                }
+            }
+
+            if member_tags.is_empty() {
+                return Err("В балансировщике нет рабочих узлов".to_string());
+            }
+
+            let effective_mode = balancer_opts
+                .mode_override
+                .as_deref()
+                .map(normalize_balancer_mode)
+                .unwrap_or_else(|| normalize_balancer_mode(&bal.mode));
+            let probe_url = if !bal.url.trim().is_empty() {
+                bal.url.trim().to_string()
+            } else {
+                balancer_opts.url.clone()
+            };
+            let probe_interval = if !bal.interval.trim().is_empty() {
+                bal.interval.trim().to_string()
+            } else {
+                balancer_opts.interval.clone()
+            };
+            let tolerance = if bal.tolerance > 0 {
+                bal.tolerance.max(balancer_opts.tolerance)
+            } else {
+                balancer_opts.tolerance
+            };
+            let pool = if bal.pool > 0 {
+                bal.pool
+            } else {
+                balancer_opts.pool
+            };
+            let pool_tol = if bal.pool_tolerance > 0 {
+                bal.pool_tolerance
+            } else {
+                balancer_opts.pool_tolerance
+            };
+            let quota_mib = if bal.quota_mib > 0 {
+                bal.quota_mib
+            } else {
+                balancer_opts.quota_mib
+            };
+            let sticky_hash = if !bal.sticky_hash.is_empty() {
+                bal.sticky_hash.clone()
+            } else {
+                balancer_opts.sticky_hash.clone()
+            };
+
+            let mut urltest_ob = json!({
+                "type": "urltest",
+                "tag": tag,
+                "outbounds": member_tags,
+                "url": probe_url,
+                "interval": probe_interval,
+                "tolerance": tolerance,
+                "mode": effective_mode
+            });
+            if !matches!(effective_mode, "least_test" | "failover") {
+                if let Some(obj) = urltest_ob.as_object_mut() {
+                    obj.insert(
+                        "balancer".to_string(),
+                        json!({
+                            "pool": pool,
+                            "pool_tolerance": pool_tol,
+                            "sticky_hash": sticky_hash,
+                            "quota_mib": quota_mib
+                        }),
+                    );
+                }
+            }
+            // Put urltest group first, followed by its member outbounds
+            let mut final_obs = vec![urltest_ob];
+            final_obs.extend(ob_list);
+            return Ok((ep_list, final_obs, hosts));
+        }
+
+        let (is_ep, val, host) =
+            Self::prepare_parsed_node(trimmed, tag, tls_fragment, detour_tag)?;
+        let mut ep_list = Vec::new();
+        let mut ob_list = Vec::new();
+        let mut hosts = Vec::new();
+        if let Some(h) = host {
+            hosts.push(h);
+        }
+        if is_ep {
+            ep_list.push(val);
+        } else {
+            ob_list.push(val);
+        }
+        Ok((ep_list, ob_list, hosts))
+    }
+
     pub fn build_config(&self, opts: &ConnectOptions) -> Result<(Value, bool), String> {
         let has_main_node = !opts.block_only
             && opts.route != RouteMode::DesyncOnly
             && !opts.vless.trim().is_empty();
 
+        let mut used_tags: HashSet<String> = [
+            "GLOBAL",
+            "PROXY",
+            "DESYNC",
+            "direct",
+            "block",
+            "detour-proxy",
+            "dns_direct",
+            "dns_remote",
+            "dns-fakeip",
+            "tun-in",
+            "mixed-in",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        for ex in &opts.extra_nodes {
+            used_tags.insert(ex.tag.clone());
+        }
+
         let detour_parsed = if has_main_node && !opts.detour_vless.trim().is_empty() {
-            Self::prepare_parsed_node(
+            Self::expand_parsed_target(
                 &opts.detour_vless,
                 "detour-proxy",
                 opts.proxy_tls_fragment,
                 None,
+                &opts.balancer,
+                &mut used_tags,
             )
             .ok()
         } else {
@@ -1001,11 +1349,13 @@ impl VpnManager {
 
         let main_detour_tag = detour_parsed.as_ref().map(|_| "detour-proxy");
         let main_parsed = if has_main_node {
-            Some(Self::prepare_parsed_node(
+            Some(Self::expand_parsed_target(
                 &opts.vless,
                 "PROXY",
                 opts.proxy_tls_fragment,
                 main_detour_tag,
+                &opts.balancer,
+                &mut used_tags,
             )?)
         } else {
             None
@@ -1014,9 +1364,14 @@ impl VpnManager {
         let mut extra_parsed = Vec::new();
         if !opts.block_only && opts.route != RouteMode::DesyncOnly {
             for ex in &opts.extra_nodes {
-                if let Ok(p) =
-                    Self::prepare_parsed_node(&ex.vless, &ex.tag, opts.proxy_tls_fragment, None)
-                {
+                if let Ok(p) = Self::expand_parsed_target(
+                    &ex.vless,
+                    &ex.tag,
+                    opts.proxy_tls_fragment,
+                    None,
+                    &opts.balancer,
+                    &mut used_tags,
+                ) {
                     extra_parsed.push((ex.tag.clone(), p));
                 }
             }
@@ -1208,35 +1563,26 @@ impl VpnManager {
             "outbounds": selector_outbounds
         }));
 
-        if let Some((is_ep, val, host)) = main_parsed.clone() {
-            if let Some(h) = host {
+        if let Some((eps, obs, hosts)) = main_parsed.clone() {
+            for h in hosts {
                 server_hosts.insert(h);
             }
-            if is_ep {
-                endpoints.push(val);
-            } else {
-                outbounds.push(val);
-            }
+            endpoints.extend(eps);
+            outbounds.extend(obs);
         }
-        if let Some((is_ep, val, host)) = detour_parsed {
-            if let Some(h) = host {
+        if let Some((eps, obs, hosts)) = detour_parsed {
+            for h in hosts {
                 server_hosts.insert(h);
             }
-            if is_ep {
-                endpoints.push(val);
-            } else {
-                outbounds.push(val);
-            }
+            endpoints.extend(eps);
+            outbounds.extend(obs);
         }
-        for (_, (is_ep, val, host)) in &extra_parsed {
-            if let Some(h) = host {
+        for (_, (eps, obs, hosts)) in &extra_parsed {
+            for h in hosts {
                 server_hosts.insert(h.clone());
             }
-            if *is_ep {
-                endpoints.push(val.clone());
-            } else {
-                outbounds.push(val.clone());
-            }
+            endpoints.extend(eps.clone());
+            outbounds.extend(obs.clone());
         }
 
         if need_desync {
@@ -1822,13 +2168,52 @@ impl VpnManager {
                         last_up = up_total;
                         last_sample = Instant::now();
 
-                        let msg = json!({
+                        let mut msg = json!({
                             "state": "connected",
                             "down": down_rate,
                             "up": up_rate,
                             "totalDown": down_total,
                             "totalUp": up_total
                         });
+                        if let Ok((200, pbody)) =
+                            clash_api_request(API_PORT, &secret, "GET", "/proxies/PROXY", None).await
+                        {
+                            if let Ok(pdoc) = serde_json::from_str::<Value>(&pbody) {
+                                if pdoc.get("type").and_then(Value::as_str) == Some("URLTest")
+                                    || pdoc.get("telemetry").is_some()
+                                {
+                                    let now_tag = pdoc
+                                        .get("now")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let mode_str = pdoc
+                                        .get("mode")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("stability")
+                                        .to_string();
+                                    let telemetry =
+                                        pdoc.get("telemetry").cloned().unwrap_or_else(|| json!({}));
+                                    let all =
+                                        pdoc.get("all").cloned().unwrap_or_else(|| json!([]));
+                                    if let Some(active_rtt) = telemetry
+                                        .get(&now_tag)
+                                        .and_then(|t| t.get("rtt_ms"))
+                                        .and_then(Value::as_u64)
+                                        .filter(|&ms| ms > 0)
+                                    {
+                                        msg["ping"] = json!(active_rtt);
+                                    }
+                                    msg["balancer"] = json!({
+                                        "tag": "PROXY",
+                                        "now": now_tag,
+                                        "mode": mode_str,
+                                        "all": all,
+                                        "telemetry": telemetry
+                                    });
+                                }
+                            }
+                        }
                         (send_js)(format!("vpn:{msg}"));
                     }
                 }
@@ -1864,6 +2249,27 @@ impl VpnManager {
 
     pub async fn probe_delay(&self) -> Option<u64> {
         probe_proxy_delay(&self.secret).await
+    }
+
+    pub async fn select_balancer_member(&self, member: &str) -> bool {
+        let member = member.trim();
+        if member.is_empty() {
+            return false;
+        }
+        let guard = self.engine.lock().await;
+        if let Some(eng) = guard.as_ref() {
+            if let Some(bx) = eng.in_proc.as_ref() {
+                let inner = bx.router().inner();
+                for (_, tag, outbound) in inner.outbound_table() {
+                    if tag == "PROXY" {
+                        if let core_runtime::route::Outbound::Urltest(u) = outbound {
+                            return u.select(member);
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 
     pub async fn get_connections_json(&self) -> String {
@@ -1975,8 +2381,29 @@ impl VpnManager {
             return;
         }
 
-        // Single share link
+        // Single share link or balancer URI
         if !input.starts_with("http://") && !input.starts_with("https://") {
+            if let Some(bal) = decode_balancer_uri(input) {
+                let name = if bal.name.trim().is_empty() {
+                    "Балансировщик".to_string()
+                } else {
+                    bal.name.clone()
+                };
+                let payload = json!({
+                    "user": { "handle": name },
+                    "servers": [{
+                        "id": "custom-bal-1",
+                        "name": name,
+                        "vless": input,
+                        "country": detect_country_code(&name),
+                        "isBalancer": true,
+                        "balancerMode": bal.mode,
+                        "memberCount": bal.members.len()
+                    }]
+                });
+                self.emit(format!("sub:{payload}"));
+                return;
+            }
             match parse_share_uri(input) {
                 Ok(val) => {
                     let tag = val
@@ -2042,25 +2469,12 @@ impl VpnManager {
             }
         };
 
-        let mut servers = Vec::new();
-        for (idx, node) in nodes.iter().enumerate() {
-            let Some(share_link) = outbound_to_share_link(node) else {
-                continue;
-            };
-            let name = node
-                .get("tag")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("Узел #{}", idx + 1));
-            let country = detect_country_code(&name);
-            servers.push(json!({
-                "id": format!("sub-{}", idx + 1),
-                "name": name,
-                "vless": share_link,
-                "country": country
-            }));
-        }
+        let handle = meta
+            .profile_title
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Подписка".to_string());
+
+        let servers = build_subscription_servers_list(&nodes, &handle);
 
         if servers.is_empty() {
             self.emit(format!(
@@ -2069,11 +2483,6 @@ impl VpnManager {
             ));
             return;
         }
-
-        let handle = meta
-            .profile_title
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "Подписка".to_string());
         let mut traffic_used = 0u64;
         let mut traffic_total = 0u64;
         if let Some(ref ui) = meta.user_info_raw {
@@ -2453,8 +2862,12 @@ impl VpnManager {
         self.emit("diag:done");
     }
 
-    pub async fn check_github_update(&self) {
+    pub async fn check_github_update(&self, silent: bool) {
         let current = env!("CARGO_PKG_VERSION").trim_start_matches('v').to_string();
+        let core_ver = option_env!("TACHYON_CORE_VERSION")
+            .unwrap_or(env!("CARGO_PKG_VERSION"))
+            .trim_start_matches('v')
+            .to_string();
         let pport = if self.is_running().await {
             Some(PROXY_PORT)
         } else {
@@ -2466,26 +2879,34 @@ impl VpnManager {
                 let has_update = is_newer_semver(&rel.version, &current);
                 let payload = json!({
                     "current": current,
+                    "coreVersion": core_ver,
                     "latest": rel.version,
                     "size": rel.asset_size,
                     "asset": rel.asset_name,
                     "url": rel.html_url,
-                    "hasUpdate": has_update
+                    "hasUpdate": has_update,
+                    "silent": silent
                 });
                 if has_update {
                     self.emit(format!("core-update:available:{payload}"));
-                } else {
+                } else if !silent {
                     self.emit(format!("core-update:up-to-date:{payload}"));
                 }
             }
             Err(e) => {
-                self.emit(format!("core-update:error:{e}"));
+                if !silent {
+                    self.emit(format!("core-update:error:{e}"));
+                }
             }
         }
     }
 
     pub async fn install_github_update(&self) {
         let current = env!("CARGO_PKG_VERSION").trim_start_matches('v').to_string();
+        let core_ver = option_env!("TACHYON_CORE_VERSION")
+            .unwrap_or(env!("CARGO_PKG_VERSION"))
+            .trim_start_matches('v')
+            .to_string();
         let pport = if self.is_running().await {
             Some(PROXY_PORT)
         } else {
@@ -2502,7 +2923,7 @@ impl VpnManager {
         };
 
         if !is_newer_semver(&rel.version, &current) && rel.download_url.is_empty() {
-            let payload = json!({ "version": current });
+            let payload = json!({ "version": current, "coreVersion": core_ver });
             self.emit(format!("core-update:done:{payload}"));
             return;
         }
@@ -2538,7 +2959,7 @@ impl VpnManager {
         let report_dl = move |got: usize, total_opt: Option<usize>| {
             let total = total_opt.unwrap_or(expected_size);
             if total > 0 {
-                let pct = 15 + ((got.saturating_mul(75)) / total).min(75);
+                let pct = 15 + ((got.saturating_mul(70)) / total).min(70);
                 (send_prog)(format!("core-update:progress:{pct}"));
             }
         };
@@ -2589,18 +3010,45 @@ impl VpnManager {
             return;
         }
 
+        if let Some(ref sums_url) = rel.sha256_url {
+            self.emit("core-update:progress:88");
+            if let Ok(r) = fetch_url(
+                sums_url,
+                "GET",
+                &headers,
+                None,
+                pport,
+                Duration::from_secs(15),
+            )
+            .await
+            {
+                if (200..300).contains(&r.status) {
+                    let sums_text = String::from_utf8_lossy(&r.body);
+                    if let Err(err_msg) =
+                        verify_asset_sha256(&bytes, &rel.asset_name, &sums_text)
+                    {
+                        self.emit(format!("core-update:error:{err_msg}"));
+                        return;
+                    }
+                }
+            }
+        }
+
         self.emit("core-update:progress:92");
+        self.disconnect().await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
         match apply_self_binary_update(&target_exe, &bytes, &rel.asset_name) {
             Ok(replaced_in_place) => {
                 self.emit("core-update:progress:100");
                 let payload = json!({
                     "version": rel.version,
+                    "coreVersion": rel.version,
                     "restarting": replaced_in_place
                 });
                 self.emit(format!("core-update:done:{payload}"));
                 if replaced_in_place {
-                    self.disconnect().await;
-                    tokio::time::sleep(Duration::from_millis(900)).await;
+                    tokio::time::sleep(Duration::from_millis(750)).await;
                     schedule_relaunch_and_exit(&target_exe);
                 }
             }
@@ -2617,6 +3065,46 @@ struct GithubReleaseInfo {
     asset_name: String,
     asset_size: u64,
     download_url: String,
+    sha256_url: Option<String>,
+}
+
+fn verify_asset_sha256(bytes: &[u8], asset_name: &str, sums_text: &str) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    let target_name = asset_name.trim();
+    if target_name.is_empty() {
+        return Ok(());
+    }
+    for line in sums_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let Some(expected_hex) = parts.next() else {
+            continue;
+        };
+        let Some(raw_file) = parts.next() else {
+            continue;
+        };
+        let clean_file = raw_file.trim_start_matches('*').trim_start_matches("./");
+        if clean_file.eq_ignore_ascii_case(target_name) {
+            let mut hasher = Sha256::new();
+            hasher.update(bytes);
+            let actual_hex = hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            if actual_hex.eq_ignore_ascii_case(expected_hex) {
+                return Ok(());
+            } else {
+                return Err(format!(
+                    "Ошибка проверки SHA-256 для {target_name} (ожидался {expected_hex}, получен {actual_hex})"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn is_newer_semver(candidate: &str, current: &str) -> bool {
@@ -2718,6 +3206,7 @@ async fn fetch_latest_github_release(proxy_port: Option<u16>) -> Result<GithubRe
         let mut best_url = String::new();
         let mut best_size = 0u64;
         let mut best_score = 0i32;
+        let mut sha256_url = None;
 
         if let Some(assets) = doc.get("assets").and_then(Value::as_array) {
             for asset in assets {
@@ -2727,6 +3216,9 @@ async fn fetch_latest_github_release(proxy_port: Option<u16>) -> Result<GithubRe
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 let size = asset.get("size").and_then(Value::as_u64).unwrap_or(0);
+                if name.eq_ignore_ascii_case("SHA256SUMS.txt") && !dl.is_empty() {
+                    sha256_url = Some(dl.to_string());
+                }
                 let score = score_release_asset_for_current_os(name);
                 if score > best_score && !dl.is_empty() {
                     best_score = score;
@@ -2743,6 +3235,7 @@ async fn fetch_latest_github_release(proxy_port: Option<u16>) -> Result<GithubRe
             asset_name: best_name,
             asset_size: best_size,
             download_url: best_url,
+            sha256_url,
         });
     }
 
@@ -2817,15 +3310,42 @@ fn apply_self_binary_update(exe_path: &Path, bytes: &[u8], asset_name: &str) -> 
             let old_path = exe_path.with_extension("exe.old");
             let tmp_path = exe_path.with_extension("exe.new");
             let _ = fs::remove_file(&old_path);
-            fs::write(&tmp_path, bytes)
-                .map_err(|e| format!("Не удалось записать обновление: {e}"))?;
-            fs::rename(exe_path, &old_path)
-                .map_err(|e| format!("Не удалось переименовать текущий исполняемый файл: {e}"))?;
-            if let Err(e) = fs::rename(&tmp_path, exe_path) {
+            let _ = fs::remove_file(&tmp_path);
+            if fs::write(&tmp_path, bytes).is_ok() && fs::rename(exe_path, &old_path).is_ok() {
+                if fs::rename(&tmp_path, exe_path).is_ok() {
+                    return Ok(true);
+                }
                 let _ = fs::rename(&old_path, exe_path);
-                return Err(format!("Не удалось заменить исполняемый файл: {e}"));
             }
-            return Ok(true);
+            let _ = fs::remove_file(&tmp_path);
+
+            // Fallback when installed into a protected directory (e.g. Program Files):
+            // stage update in AppData and elevate replacement via UAC (RunAs)
+            let staged = app_data_dir().join("tachyon.update.exe");
+            fs::write(&staged, bytes)
+                .map_err(|e| format!("Не удалось записать обновление во временный каталог: {e}"))?;
+            use std::os::windows::process::CommandExt;
+            let inner_cmd = format!(
+                "Move-Item -LiteralPath '{}' -Destination '{}' -Force; Move-Item -LiteralPath '{}' -Destination '{}' -Force",
+                exe_path.to_string_lossy().replace('\'', "''"),
+                old_path.to_string_lossy().replace('\'', "''"),
+                staged.to_string_lossy().replace('\'', "''"),
+                exe_path.to_string_lossy().replace('\'', "''"),
+            );
+            let outer_ps = format!(
+                "$p = Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile','-WindowStyle','Hidden','-Command','{}' -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode",
+                inner_cmd.replace('\'', "''")
+            );
+            let status = Command::new("powershell")
+                .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &outer_ps])
+                .creation_flags(CREATE_NO_WINDOW)
+                .status()
+                .map_err(|e| format!("Ошибка запроса прав администратора для обновления: {e}"))?;
+            let _ = fs::remove_file(&staged);
+            if status.success() && exe_path.exists() {
+                return Ok(true);
+            }
+            return Err("Не удалось заменить исполняемый файл (отказ UAC или файл заблокирован)".to_string());
         }
     }
 
@@ -3504,6 +4024,315 @@ pub fn enumerate_apps() -> Vec<RunningApp> {
 
     apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     apps
+}
+
+pub fn build_subscription_servers_list(nodes: &[Value], handle: &str) -> Vec<Value> {
+    let mut leaf_by_tag: HashMap<String, BalancerMember> = HashMap::new();
+    let mut leaf_entries: Vec<(String, String, String, bool, String)> = Vec::new();
+
+    for (idx, node) in nodes.iter().enumerate() {
+        let ty = node
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ty == "urltest" {
+            continue;
+        }
+        let Some(share_link) = outbound_to_share_link(node) else {
+            continue;
+        };
+        let name = node
+            .get("tag")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("Узел #{}", idx + 1));
+        let country = detect_country_code(&name);
+        let is_hidden = node
+            .get("__tachyon_hidden")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let server_host = node
+            .get("server")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+
+        leaf_by_tag.insert(
+            name.clone(),
+            BalancerMember {
+                name: name.clone(),
+                vless: share_link.clone(),
+                country: country.clone(),
+            },
+        );
+        leaf_entries.push((name, share_link, country, is_hidden, server_host));
+    }
+
+    let mut servers = Vec::new();
+    let mut explicit_balancer_count = 0usize;
+
+    for node in nodes {
+        let ty = node
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ty != "urltest" {
+            continue;
+        }
+        let Some(member_tags) = node.get("outbounds").and_then(Value::as_array) else {
+            continue;
+        };
+        let mut members = Vec::new();
+        for mt in member_tags {
+            if let Some(t_str) = mt.as_str() {
+                if let Some(m) = leaf_by_tag.get(t_str) {
+                    members.push(m.clone());
+                }
+            }
+        }
+        if members.is_empty() {
+            continue;
+        }
+        explicit_balancer_count += 1;
+        let group_name = node
+            .get("remark")
+            .or_else(|| node.get("tag"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("Балансировщик #{explicit_balancer_count}"));
+        let mode = node
+            .get("mode")
+            .and_then(Value::as_str)
+            .map(normalize_balancer_mode)
+            .unwrap_or("stability")
+            .to_string();
+        let url = node
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(default_balancer_url);
+        let interval = node
+            .get("interval")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(default_balancer_interval);
+        let tolerance = node
+            .get("tolerance")
+            .and_then(Value::as_u64)
+            .map(|v| v as u32)
+            .unwrap_or_else(default_balancer_tolerance);
+
+        let mut group_country = detect_country_code(&group_name);
+        if group_country == "xx" {
+            let first_cc = members[0].country.as_str();
+            if first_cc != "xx" && members.iter().all(|m| m.country == first_cc) {
+                group_country = first_cc.to_string();
+            }
+        }
+
+        let payload = BalancerPayload {
+            name: group_name.clone(),
+            mode: mode.clone(),
+            url,
+            interval,
+            tolerance,
+            pool: default_balancer_pool(),
+            pool_tolerance: default_balancer_pool_tolerance(),
+            sticky_hash: default_balancer_sticky_hash(),
+            quota_mib: default_balancer_quota_mib(),
+            members: members.clone(),
+        };
+        let bal_uri = encode_balancer_uri(&payload);
+        servers.push(json!({
+            "id": format!("sub-bal-{explicit_balancer_count}"),
+            "name": group_name,
+            "vless": bal_uri,
+            "country": group_country,
+            "isBalancer": true,
+            "balancerMode": mode,
+            "memberCount": members.len()
+        }));
+    }
+
+    if explicit_balancer_count == 0 && leaf_entries.len() >= 2 {
+        let valid_members: Vec<BalancerMember> = leaf_entries
+            .iter()
+            .filter(|(_, _, _, _, host)| {
+                let h = host.trim();
+                !h.is_empty()
+                    && h != "0.0.0.0"
+                    && h != "127.0.0.1"
+                    && !h.eq_ignore_ascii_case("localhost")
+                    && !h.starts_with("127.")
+            })
+            .map(|(name, vless, country, _, _)| BalancerMember {
+                name: name.clone(),
+                vless: vless.clone(),
+                country: country.clone(),
+            })
+            .collect();
+
+        if valid_members.len() >= 2 {
+            let auto_name = if handle.trim().is_empty() || handle.trim() == "Подписка" {
+                "Автобалансировщик".to_string()
+            } else {
+                format!("Автобалансировщик · {}", handle.trim())
+            };
+            let payload = BalancerPayload {
+                name: auto_name.clone(),
+                mode: "stability".to_string(),
+                url: default_balancer_url(),
+                interval: default_balancer_interval(),
+                tolerance: default_balancer_tolerance(),
+                pool: default_balancer_pool(),
+                pool_tolerance: default_balancer_pool_tolerance(),
+                sticky_hash: default_balancer_sticky_hash(),
+                quota_mib: default_balancer_quota_mib(),
+                members: valid_members.clone(),
+            };
+            let bal_uri = encode_balancer_uri(&payload);
+            servers.push(json!({
+                "id": "sub-bal-auto",
+                "name": auto_name,
+                "vless": bal_uri,
+                "country": "xx",
+                "isBalancer": true,
+                "balancerMode": "stability",
+                "memberCount": valid_members.len()
+            }));
+        }
+    }
+
+    for (idx, (name, share_link, country, is_hidden, _)) in leaf_entries.into_iter().enumerate() {
+        if explicit_balancer_count > 0 && is_hidden {
+            continue;
+        }
+        servers.push(json!({
+            "id": format!("sub-{}", idx + 1),
+            "name": name,
+            "vless": share_link,
+            "country": country
+        }));
+    }
+
+    servers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn balancer_uri_round_trip_and_config_generation() {
+        let m1 = BalancerMember {
+            name: "NL-1 Amsterdam".to_string(),
+            vless: "vless://11111111-1111-1111-1111-111111111111@198.51.100.10:443?security=tls&type=tcp&sni=nl1.example.com#NL-1".to_string(),
+            country: "nl".to_string(),
+        };
+        let m2 = BalancerMember {
+            name: "DE-1 Frankfurt".to_string(),
+            vless: "vless://22222222-2222-2222-2222-222222222222@198.51.100.20:443?security=tls&type=tcp&sni=de1.example.com#DE-1".to_string(),
+            country: "de".to_string(),
+        };
+        let payload = BalancerPayload {
+            name: "EU Smart Balancer".to_string(),
+            mode: "stability".to_string(),
+            url: default_balancer_url(),
+            interval: default_balancer_interval(),
+            tolerance: 50,
+            pool: 4,
+            pool_tolerance: 80,
+            sticky_hash: default_balancer_sticky_hash(),
+            quota_mib: 256,
+            members: vec![m1, m2],
+        };
+        let uri = encode_balancer_uri(&payload);
+        assert!(uri.starts_with(BALANCER_URI_PREFIX));
+
+        let decoded = decode_balancer_uri(&uri).expect("decode balancer uri");
+        assert_eq!(decoded.name, "EU Smart Balancer");
+        assert_eq!(decoded.members.len(), 2);
+
+        let mgr = VpnManager::new(Arc::new(|_| {}));
+        for mode in [
+            "stability",
+            "least_test",
+            "sticky",
+            "least_load",
+            "weighted",
+            "passive",
+            "priority",
+            "hedged",
+            "throughput",
+            "quota",
+            "failover",
+            "round_robin",
+        ] {
+            let req = json!({
+                "vless": uri,
+                "mode": "proxy",
+                "route": "all",
+                "balancerMode": mode,
+                "balancer": {
+                    "pool": 4,
+                    "poolTolerance": 80,
+                    "stickyHash": ["domain", "dest_ip", "process"],
+                    "quotaMib": 512
+                }
+            });
+            let opts = ConnectOptions::parse(&req.to_string()).expect("parse options");
+            let (cfg, has_node) = mgr.build_config(&opts).expect("build config");
+            assert!(has_node);
+            let cfg_str = serde_json::to_string(&cfg).expect("serialize config");
+            core_config::check_str(&cfg_str)
+                .unwrap_or_else(|e| panic!("core_config::check_str failed for mode {mode}: {e}"));
+        }
+    }
+
+    #[test]
+    fn subscription_balancers_hide_internal_members_and_auto_synthesize() {
+        let raw_two_nodes = "vless://11111111-1111-1111-1111-111111111111@198.51.100.10:443?security=tls&type=tcp#NL-1\nvless://22222222-2222-2222-2222-222222222222@198.51.100.20:443?security=tls&type=tcp#DE-1";
+        let parsed = parse_subscription_payload(raw_two_nodes).expect("parse two nodes");
+        let list = build_subscription_servers_list(&parsed, "TestSub");
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0]["isBalancer"], json!(true));
+        assert_eq!(list[0]["memberCount"], json!(2));
+    }
+
+    #[test]
+    fn github_updater_semver_scoring_and_sha256_verification() {
+        assert!(is_newer_semver("v0.3.4", "0.3.3"));
+        assert!(is_newer_semver("0.3.9", "0.3.3"));
+        assert!(!is_newer_semver("0.3.3", "0.3.3"));
+        assert!(!is_newer_semver("0.3.2", "0.3.3"));
+
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(
+                score_release_asset_for_current_os("Tachyon-windows-x86_64.exe"),
+                100
+            );
+            assert_eq!(score_release_asset_for_current_os("SHA256SUMS.txt"), 0);
+        }
+
+        use sha2::{Digest, Sha256};
+        let payload = b"MZ-tachyon-test-binary";
+        let expected_hex = Sha256::digest(payload)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let sums = format!("{expected_hex}  Tachyon-windows-x86_64.exe\n");
+        assert!(verify_asset_sha256(payload, "Tachyon-windows-x86_64.exe", &sums).is_ok());
+
+        let bad_sums = "0000000000000000000000000000000000000000000000000000000000000000  Tachyon-windows-x86_64.exe\n";
+        assert!(verify_asset_sha256(payload, "Tachyon-windows-x86_64.exe", bad_sums).is_err());
+    }
 }
 
 #[cfg(target_os = "windows")]

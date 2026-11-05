@@ -41,16 +41,92 @@ window.API = (() => {
     return list;
   }
 
+  const BALANCER_PREFIX = "tachyon-balancer://";
+
+  function encodeBalancerUri(payload) {
+    try {
+      const jsonStr = JSON.stringify(payload);
+      const bytes = new TextEncoder().encode(jsonStr);
+      let bin = "";
+      for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+      const b64 = btoa(bin);
+      return BALANCER_PREFIX + b64 + "#" + encodeURIComponent(payload.name || "Балансировщик");
+    } catch {
+      return "";
+    }
+  }
+
+  function decodeBalancerUri(raw) {
+    try {
+      const s = String(raw || "").trim();
+      if (!s.startsWith(BALANCER_PREFIX)) return null;
+      const rest = s.slice(BALANCER_PREFIX.length);
+      const b64 = rest.split("#")[0];
+      const bin = atob(b64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const jsonStr = new TextDecoder().decode(bytes);
+      return JSON.parse(jsonStr);
+    } catch {
+      return null;
+    }
+  }
+
   function getAllServers() {
     const all = [];
     const subs = getSubscriptions();
     subs.forEach(sub => {
       if (sub.enabled !== false && Array.isArray(sub.servers)) {
+        const subName = sub.name || "Подписка";
+        const hasBalancer = sub.servers.some(
+          s => s.isBalancer || String(s.vless || "").startsWith(BALANCER_PREFIX)
+        );
+        if (!hasBalancer && sub.servers.length >= 2) {
+          const validMembers = sub.servers
+            .filter(s => {
+              const v = String(s.vless || "").trim();
+              return v && !v.startsWith(BALANCER_PREFIX) && !v.includes("@0.0.0.0:") && !v.includes("@127.0.0.1:");
+            })
+            .map(s => ({
+              name: s.name || "Узел",
+              vless: s.vless,
+              country: s.country || "xx"
+            }));
+          if (validMembers.length >= 2) {
+            const autoName = `Автобалансировщик · ${subName}`;
+            const uri = encodeBalancerUri({
+              name: autoName,
+              mode: "stability",
+              url: "https://www.gstatic.com/generate_204",
+              interval: "3m",
+              tolerance: 50,
+              pool: 4,
+              pool_tolerance: 80,
+              sticky_hash: ["domain", "dest_ip", "process"],
+              quota_mib: 256,
+              members: validMembers
+            });
+            if (uri) {
+              all.push({
+                id: `${sub.id}_auto_bal`,
+                name: autoName,
+                country: "xx",
+                code: "BAL",
+                vless: uri,
+                isBalancer: true,
+                balancerMode: "stability",
+                memberCount: validMembers.length,
+                subId: sub.id,
+                subName
+              });
+            }
+          }
+        }
         sub.servers.forEach(s => {
           all.push({
             ...s,
             subId: sub.id,
-            subName: sub.name || "Подписка"
+            subName
           });
         });
       }
@@ -436,6 +512,10 @@ window.API = (() => {
     else host.postMessage("conn:close:" + id);
   }
 
+  function selectBalancerMember(member) {
+    if (host && member) host.postMessage("balancer:select:" + member);
+  }
+
   return {
     hasNativeVpn,
     // Native bridge methods
@@ -494,6 +574,9 @@ window.API = (() => {
     saveSubscriptions,
     getCustomNodes,
     saveCustomNodes,
-    getAllServers
+    getAllServers,
+    encodeBalancerUri,
+    decodeBalancerUri,
+    selectBalancerMember
   };
 })();

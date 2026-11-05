@@ -260,6 +260,21 @@
     return 'xx';
   }
 
+  const BALANCER_MODE_LABELS = {
+    stability: 'STABILITY',
+    sticky: 'STICKY',
+    hedged: 'HEDGED',
+    least_load: 'LEAST LOAD',
+    weighted: 'WEIGHTED',
+    throughput: 'THROUGHPUT',
+    passive: 'PASSIVE',
+    priority: 'PRIORITY',
+    quota: 'QUOTA',
+    failover: 'FAILOVER',
+    round_robin: 'ROUND-ROBIN',
+    least_test: 'FASTEST RTT'
+  };
+
   function parseNodeMeta(vless) {
     const res = {
       proto: 'VLESS',
@@ -267,11 +282,36 @@
       trans: 'TCP',
       host: '',
       port: 443,
-      tags: ['VLESS']
+      tags: ['VLESS'],
+      isBalancer: false,
+      balancerMode: 'stability',
+      memberCount: 0,
+      members: []
     };
     if (!vless) return res;
     const raw = String(vless).trim();
     const low = raw.toLowerCase();
+
+    if (low.startsWith('tachyon-balancer://')) {
+      const bal = window.API?.decodeBalancerUri ? window.API.decodeBalancerUri(raw) : null;
+      const mode = (bal?.mode || 'stability').toLowerCase();
+      const members = Array.isArray(bal?.members) ? bal.members : [];
+      res.isBalancer = true;
+      res.proto = 'BALANCER';
+      res.sec = 'URLTEST';
+      res.trans = mode.toUpperCase();
+      res.host = 'balancer.tachyon.internal';
+      res.port = 443;
+      res.balancerMode = mode;
+      res.memberCount = members.length;
+      res.members = members;
+      res.tags = [
+        'BALANCER',
+        BALANCER_MODE_LABELS[mode] || mode.toUpperCase(),
+        `${members.length} узл.`
+      ];
+      return res;
+    }
 
     if (low.startsWith('amneziawg://') || low.startsWith('awg://') || low.startsWith('wireguard://')) {
       res.proto = 'AWG';
@@ -332,20 +372,39 @@
   function normalizeServer(s) {
     if (!s) return s;
     const rawName = s.rawName || s.name || s.country || 'Узел VPN';
-    const code = detectCountryCode({ ...s, rawName });
-    const clean = cleanServerName(rawName, code);
     const meta = parseNodeMeta(s.vless);
-    const endpointKey = meta.host ? `${meta.host.toLowerCase()}:${meta.port}` : '';
-    const cachedPing = endpointKey && Number.isFinite(pingCache[endpointKey]) && pingCache[endpointKey] > 1
+    const isBalancer = !!(s.isBalancer || meta.isBalancer);
+    const code = isBalancer ? 'xx' : detectCountryCode({ ...s, rawName });
+    const clean = cleanServerName(rawName, code);
+    const endpointKey = isBalancer
+      ? `balancer:${s.id || clean}`
+      : (meta.host ? `${meta.host.toLowerCase()}:${meta.port}` : '');
+    let cachedPing = endpointKey && Number.isFinite(pingCache[endpointKey]) && pingCache[endpointKey] > 1
       ? pingCache[endpointKey]
       : null;
+    if (isBalancer && cachedPing == null && Array.isArray(meta.members)) {
+      let bestMemberPing = null;
+      for (const m of meta.members) {
+        const mm = parseNodeMeta(m?.uri || '');
+        if (!mm.host) continue;
+        const mKey = `${mm.host.toLowerCase()}:${mm.port}`;
+        const p = pingCache[mKey];
+        if (Number.isFinite(p) && p > 1 && (bestMemberPing == null || p < bestMemberPing)) {
+          bestMemberPing = p;
+        }
+      }
+      cachedPing = bestMemberPing;
+    }
     return {
       ...s,
       rawName,
       name: clean,
-      code: code.toUpperCase(),
+      code: isBalancer ? 'BAL' : code.toUpperCase(),
       country: code,
-      countryName: COUNTRY_NAMES[code] || code.toUpperCase(),
+      countryName: isBalancer ? 'Балансировщики' : (COUNTRY_NAMES[code] || code.toUpperCase()),
+      isBalancer,
+      balancerMode: s.balancerMode || meta.balancerMode || 'stability',
+      memberCount: s.memberCount || meta.memberCount || 0,
       meta,
       endpointKey,
       ping: Number.isFinite(s.ping) && s.ping > 1 ? s.ping : cachedPing
@@ -359,6 +418,9 @@
   }
 
   function flagFor(codeOrServer) {
+    if (typeof codeOrServer === 'object' && codeOrServer !== null && (codeOrServer.isBalancer || codeOrServer.meta?.isBalancer)) {
+      return badgeFlagSvg('BL');
+    }
     const code = typeof codeOrServer === 'object' && codeOrServer !== null
       ? (codeOrServer.country && codeOrServer.country.length === 2 ? codeOrServer.country : detectCountryCode(codeOrServer))
       : String(codeOrServer || '').trim().toLowerCase();
@@ -407,6 +469,88 @@
     return pool.find(s => s.id === activeId) || servers.find(s => s.id === activeId) || pool[0] || null;
   }
 
+  let lastLiveBalancerInfo = null;
+
+  function renderBalancerDock(liveBal = lastLiveBalancerInfo) {
+    const dock = $('#balancerDock');
+    if (!dock) return;
+    const s = activeServer();
+    const isDesyncOnly = vpnPrefs?.route === 'desync-only';
+    const isBal = !isDesyncOnly && !!(s?.isBalancer || liveBal);
+    dock.hidden = !isBal;
+    if (!isBal) return;
+
+    const effectiveMode = (vpnPrefs?.balancerMode || liveBal?.mode || s?.balancerMode || 'stability').toLowerCase();
+    const modeSel = $('#balancerModeSelect');
+    if (modeSel && modeSel.value !== effectiveMode) {
+      modeSel.value = effectiveMode;
+    }
+
+    const nowBadge = $('#balancerNowBadge');
+    const members = Array.isArray(s?.meta?.members) ? s.meta.members : [];
+    const allTags = Array.isArray(liveBal?.all) && liveBal.all.length
+      ? liveBal.all
+      : members.map((m, i) => m.name || `NODE_${i + 1}`);
+    const nowTag = liveBal?.now || '';
+
+    if (nowBadge) {
+      nowBadge.textContent = nowTag ? `Активен: ${nowTag}` : `Пул: ${allTags.length} узл.`;
+    }
+
+    const cntLbl = $('#balancerPoolCountLbl');
+    if (cntLbl) {
+      cntLbl.textContent = `Узлы (${allTags.length})`;
+    }
+
+    const listEl = $('#balancerNodeList');
+    if (!listEl) return;
+
+    const telemMap = (liveBal && typeof liveBal.telemetry === 'object' && liveBal.telemetry) ? liveBal.telemetry : {};
+    listEl.innerHTML = allTags.map(tag => {
+      const t = telemMap[tag] || null;
+      const isNow = tag === nowTag;
+      const isQ = !!(t && t.quarantined);
+      let metricsStr = 'ожидание проб';
+      let loadStr = '0 сесс.';
+      if (t) {
+        const rtt = t.rtt_ms > 0 ? `${t.rtt_ms} мс` : '–';
+        const ewma = t.ewma_rtt_ms > 0 ? `${t.ewma_rtt_ms}` : '–';
+        const jit = t.jitter_ms > 0 ? `±${t.jitter_ms}` : '±0';
+        metricsStr = isQ ? 'карантин' : `${rtt} / ${ewma} / ${jit}`;
+        const conns = t.active_conns || 0;
+        const thr = t.throughput_kib_s > 0 ? ` · ${t.throughput_kib_s} КБ/с` : '';
+        loadStr = `${conns} сесс.${thr}`;
+      }
+      return `
+        <li class="balancer-node-row ${isNow ? 'is-now' : ''} ${isQ ? 'is-quarantined' : ''}" data-bal-member="${escapeHtml(tag)}" title="Нажмите, чтобы переключить балансировщик на ${escapeHtml(tag)}">
+          <span class="balancer-node-row__name">
+            <i class="dot ${isNow ? 'dot--emerald' : 'dot--accent'}"></i>
+            <span>${escapeHtml(tag)}</span>
+          </span>
+          <span class="balancer-node-row__metrics">${escapeHtml(metricsStr)}</span>
+          <span class="balancer-node-row__load">${escapeHtml(loadStr)}</span>
+        </li>
+      `;
+    }).join('');
+
+    $$('.balancer-node-row[data-bal-member]', listEl).forEach(row => {
+      row.addEventListener('click', async () => {
+        const memberTag = row.dataset.balMember;
+        if (!memberTag) return;
+        if (!connected) {
+          toast('Включите соединение для переключения активного участника пула');
+          return;
+        }
+        await window.API.selectBalancerMember(memberTag);
+        if (lastLiveBalancerInfo) {
+          lastLiveBalancerInfo.now = memberTag;
+          renderBalancerDock(lastLiveBalancerInfo);
+        }
+        toast(`Активный узел пула: ${memberTag}`);
+      });
+    });
+  }
+
   function updateActiveServerDisplay() {
     const s = activeServer();
     if (vpnPrefs?.route === 'desync-only') {
@@ -416,11 +560,16 @@
       const flagEl = $('#pickFlag');
       if (flagEl) flagEl.src = 'flags/globe.svg';
       $('#mPing').textContent = '–';
+      renderBalancerDock(null);
       return;
     }
     if (s) {
       $('#currentServerName').textContent = s.name || 'Узел VPN';
-      const tagsStr = (s.meta?.tags || [detectProtocol(s.vless)]).join(' · ');
+      const effectiveMode = (vpnPrefs?.balancerMode || s.balancerMode || 'stability').toLowerCase();
+      const tags = s.isBalancer
+        ? ['BALANCER', BALANCER_MODE_LABELS[effectiveMode] || effectiveMode.toUpperCase(), `${s.memberCount || s.meta?.memberCount || 0} узл.`]
+        : (s.meta?.tags || [detectProtocol(s.vless)]);
+      const tagsStr = tags.join(' · ');
       const subLabel = s.subName ? `${s.subName} · ${tagsStr}` : tagsStr;
       const subEl = $('#currentServerSub');
       if (subEl) subEl.textContent = subLabel;
@@ -430,12 +579,14 @@
         flagEl.src = flagFor(s);
       }
       $('#mPing').textContent = s.ping != null && s.ping > 0 ? s.ping : '–';
+      renderBalancerDock(s.isBalancer ? lastLiveBalancerInfo : null);
     } else {
       $('#currentServerName').textContent = 'Выберите сервер';
       const subEl = $('#currentServerSub');
       if (subEl) subEl.textContent = 'Добавьте подписку или включите режим «Desync»';
       $('#pickFlag').src = 'flags/globe.svg';
       $('#mPing').textContent = '–';
+      renderBalancerDock(null);
     }
   }
 
@@ -710,6 +861,9 @@
               country: s.country || 'xx',
               code: s.code || 'XX',
               vless: s.vless,
+              isBalancer: !!s.isBalancer,
+              balancerMode: s.balancerMode || 'stability',
+              memberCount: s.memberCount || 0,
               ping: null
             };
           }),
@@ -741,6 +895,9 @@
             country: s.country || 'xx',
             code: s.code || 'XX',
             vless: s.vless,
+            isBalancer: !!s.isBalancer,
+            balancerMode: s.balancerMode || 'stability',
+            memberCount: s.memberCount || 0,
             ping: null
           };
         });
@@ -829,6 +986,7 @@
   const PROMO_REGEX = /(t\.me\/|@[a-z0-9_]{3,}|осталось|трафик|подписк[аиу]|истек|expired|renew|купить|оплат|bot\b|канал|новости|0\.0\.0\.0|127\.0\.0\.1|localhost)/i;
 
   function isPromoOrBogusNode(s) {
+    if (s.isBalancer || s.meta?.isBalancer) return false;
     const n = s.name || '';
     const h = s.meta?.host || '';
     if (!h || h === '0.0.0.0' || h === '127.0.0.1' || h === 'localhost' || h.startsWith('127.')) return true;
@@ -837,8 +995,11 @@
 
   function matchProtoFilter(s, pf) {
     if (!pf || pf === 'all') return true;
-    if (pf === 'alive') return s.ping != null && s.ping > 0;
     const m = s.meta || parseNodeMeta(s.vless);
+    const isBal = !!(s.isBalancer || m.isBalancer);
+    if (pf === 'BALANCER') return isBal;
+    if (pf === 'alive') return s.ping != null && s.ping > 0;
+    if (isBal) return true;
     if (pf === 'REALITY') return m.sec === 'REALITY';
     if (pf === 'XHTTP') return m.trans === 'XHTTP';
     if (pf === 'TCP') return m.trans === 'TCP' && m.proto === 'VLESS';
@@ -859,7 +1020,7 @@
     for (const s of servers) {
       if (nodeFilters.hidePromo && isPromoOrBogusNode(s)) continue;
 
-      if (nodeFilters.excludedCountries.includes(s.country)) continue;
+      if (!s.isBalancer && nodeFilters.excludedCountries.includes(s.country)) continue;
 
       if (exTokens.length) {
         const hay = `${s.name} ${s.country} ${s.countryName} ${s.meta?.host || ''} ${s.subName || ''}`.toLowerCase();
@@ -897,7 +1058,7 @@
   function getStrictlyFilteredServers(searchQuery = '') {
     const base = getBaseFilteredServers(searchQuery);
     return nodeFilters.countries.length
-      ? base.filter(s => nodeFilters.countries.includes(s.country))
+      ? base.filter(s => s.isBalancer || nodeFilters.countries.includes(s.country))
       : base;
   }
 
@@ -975,6 +1136,7 @@
   }
 
   function compareByPingThenName(a, b) {
+    if (!!a.isBalancer !== !!b.isBalancer) return a.isBalancer ? -1 : 1;
     const pa = a.ping != null && a.ping > 0 ? a.ping : 999999;
     const pb = b.ping != null && b.ping > 0 ? b.ping : 999999;
     if (pa !== pb) return pa - pb;
@@ -987,7 +1149,7 @@
     const pingClass = s.ping != null ? (s.ping < 120 ? 'is-good' : (s.ping < 250 ? 'is-med' : 'is-slow')) : '';
     const tags = s.meta?.tags || [detectProtocol(s.vless)];
     const badgesHtml = tags.map(t => {
-      const cls = t === 'REALITY' ? 'proto-badge--reality' : (t === 'XHTTP' ? 'proto-badge--xhttp' : (t === 'HY2' || t === 'AWG' ? 'proto-badge--hy2' : ''));
+      const cls = t === 'BALANCER' ? 'proto-badge--balancer' : (t === 'REALITY' ? 'proto-badge--reality' : (t === 'XHTTP' ? 'proto-badge--xhttp' : (t === 'HY2' || t === 'AWG' ? 'proto-badge--hy2' : '')));
       return `<span class="proto-badge ${cls}">${escapeHtml(t)}</span>`;
     }).join(' ');
 
@@ -1027,7 +1189,7 @@
         e.stopPropagation();
         const g = btn.dataset.pingGroup;
         const subset = lastFilteredServers.filter(s =>
-          (nodeFilters.sort === 'country_ping' ? (s.country || 'xx') : (s.subName || 'Узлы')) === g
+          (nodeFilters.sort === 'country_ping' ? (s.isBalancer ? '__balancers__' : (s.country || 'xx')) : (s.subName || 'Узлы')) === g
         );
         measurePingsForList(subset);
       });
@@ -1051,7 +1213,7 @@
     renderCountryChips(baseFiltered);
 
     const filtered = nodeFilters.countries.length
-      ? baseFiltered.filter(s => nodeFilters.countries.includes(s.country))
+      ? baseFiltered.filter(s => s.isBalancer || nodeFilters.countries.includes(s.country))
       : baseFiltered;
 
     lastFilteredServers = filtered;
@@ -1091,7 +1253,7 @@
       const groups = new Map();
       filtered.forEach(s => {
         const gKey = nodeFilters.sort === 'country_ping'
-          ? (s.country || 'xx')
+          ? (s.isBalancer ? '__balancers__' : (s.country || 'xx'))
           : (s.subName || 'Узлы');
         if (!groups.has(gKey)) groups.set(gKey, []);
         groups.get(gKey).push(s);
@@ -1110,6 +1272,8 @@
 
       if (nodeFilters.sort === 'country_ping') {
         groupEntries.sort((a, b) => {
+          if (a.gKey === '__balancers__') return -1;
+          if (b.gKey === '__balancers__') return 1;
           if (a.gKey === 'xx' && b.gKey !== 'xx') return 1;
           if (b.gKey === 'xx' && a.gKey !== 'xx') return -1;
           const pa = a.bestPing ?? 999999;
@@ -1122,10 +1286,10 @@
       for (const { gKey, items, bestPing } of groupEntries) {
         const isCollapsed = collapsedGroups.has(gKey);
         const title = nodeFilters.sort === 'country_ping'
-          ? (COUNTRY_NAMES[gKey] || gKey.toUpperCase())
+          ? (gKey === '__balancers__' ? 'Балансировщики нагрузки' : (COUNTRY_NAMES[gKey] || gKey.toUpperCase()))
           : gKey;
         const flagHtml = nodeFilters.sort === 'country_ping'
-          ? `<img class="server-group-head__flag" src="${flagFor(gKey)}" onerror="this.onerror=null;this.src='flags/globe.svg'" alt="" />`
+          ? `<img class="server-group-head__flag" src="${gKey === '__balancers__' ? badgeFlagSvg('BL') : flagFor(gKey)}" onerror="this.onerror=null;this.src='flags/globe.svg'" alt="" />`
           : '';
         const bestHtml = bestPing != null ? `<span class="server-group-head__best"><svg class="ic"><use href="#ic-bolt"/></svg>${bestPing} мс</span>` : '';
 
@@ -1440,14 +1604,28 @@
 
     /* Группируем отфильтрованные узлы по host:port, чтобы не пинговать одинаковые IP многократно */
     const endpointMap = new Map();
+    const balancerTargets = [];
     for (const s of cleanTargetList) {
+      if (s.isBalancer) {
+        balancerTargets.push(s);
+        const members = Array.isArray(s.meta?.members) ? s.meta.members : [];
+        for (const m of members) {
+          const mm = parseNodeMeta(m?.uri || '');
+          if (!mm.host) continue;
+          const key = `${mm.host.toLowerCase()}:${mm.port}`;
+          if (!endpointMap.has(key)) endpointMap.set(key, { host: mm.host, port: mm.port, nodes: [], balancers: [] });
+          endpointMap.get(key).balancers.push(s);
+        }
+        continue;
+      }
       const host = s.meta?.host || extractHost(s.vless);
       const port = s.meta?.port || 443;
-      if (!host) continue;
+      if (!host || host === 'balancer.tachyon.internal') continue;
       const key = `${host.toLowerCase()}:${port}`;
-      if (!endpointMap.has(key)) endpointMap.set(key, { host, port, nodes: [] });
+      if (!endpointMap.has(key)) endpointMap.set(key, { host, port, nodes: [], balancers: [] });
       endpointMap.get(key).nodes.push(s);
     }
+    for (const b of balancerTargets) b.ping = null;
 
     const tasks = [...endpointMap.values()];
     const total = tasks.length;
@@ -1477,6 +1655,13 @@
           for (const srv of item.nodes) {
             srv.ping = ms;
             if (srv.id === activeId) $('#mPing').textContent = ms;
+          }
+          for (const balSrv of (item.balancers || [])) {
+            if (balSrv.ping == null || ms < balSrv.ping) {
+              balSrv.ping = ms;
+              if (balSrv.endpointKey) pingCache[balSrv.endpointKey] = ms;
+              if (balSrv.id === activeId) $('#mPing').textContent = ms;
+            }
           }
           for (const srv of servers) {
             if (allowedIds.has(srv.id) && srv.endpointKey === key) srv.ping = ms;
@@ -1649,6 +1834,10 @@
     proxyTlsFragment: false,
     logLevel: 'info',
     detourNodeId: '',
+    balancerMode: '',
+    balancerPool: 4,
+    balancerTolerance: 50,
+    balancerQuotaMib: 256,
     theme: 'dark'
   };
   try {
@@ -2848,6 +3037,8 @@
       ? servers.find(x => x.id === vpnPrefs.detourNodeId)
       : null;
 
+    const effectiveBalancerMode = (vpnPrefs.balancerMode || s?.balancerMode || 'stability').toLowerCase();
+
     return {
       mode: vpnPrefs.mode || 'tun',
       route,
@@ -2862,6 +3053,13 @@
       logLevel: vpnPrefs.logLevel || 'info',
       detourVless: detourSrv && detourSrv.id !== s?.id ? (detourSrv.vless || '') : '',
       vless: route === 'desync-only' ? '' : (s?.vless || ''),
+      balancerMode: effectiveBalancerMode,
+      balancer: {
+        mode: effectiveBalancerMode,
+        pool: Number(vpnPrefs.balancerPool) || 4,
+        tolerance: Number(vpnPrefs.balancerTolerance) || 50,
+        quotaMib: Number(vpnPrefs.balancerQuotaMib) || 256
+      },
       desync: {
         ...desyncPrefs,
         enabled: route === 'desync-only' ? true : !!desyncPrefs.enabled
@@ -2871,6 +3069,22 @@
       extraNodes
     };
   }
+
+  /* Управление панелью балансировщика на главном экране */
+  $('#balancerModeSelect')?.addEventListener('change', e => {
+    const m = e.target.value || 'stability';
+    vpnPrefs.balancerMode = m;
+    saveVpnPrefs();
+    updateActiveServerDisplay();
+    toast(`Алгоритм балансировки: ${BALANCER_MODE_LABELS[m] || m.toUpperCase()}`);
+    applyReconnectIfActive();
+  });
+
+  $('#toggleBalancerTelemetryBtn')?.addEventListener('click', () => {
+    const pane = $('#balancerTelemetryPane');
+    if (!pane) return;
+    pane.hidden = !pane.hidden;
+  });
 
   /* ---------- Подключение VPN и Orb ---------- */
   let connected = false;
@@ -2959,9 +3173,11 @@
   function disconnect() {
     connected = false;
     connecting = false;
+    lastLiveBalancerInfo = null;
     window.API.vpnDisconnect();
     setState('off');
     stopTimers();
+    renderBalancerDock(null);
     $('#mDown').textContent = '0.0';
     $('#mUp').textContent = '0.0';
     toast('Туннель отключён');
@@ -3010,6 +3226,10 @@
         $('#mPing').textContent = st.ping;
         pushPingSparkline(Number(st.ping) || 0);
       }
+      if (st.balancer) {
+        lastLiveBalancerInfo = st.balancer;
+        renderBalancerDock(st.balancer);
+      }
       if (st.down != null) {
         const dMB = (st.down / (1024 * 1024)).toFixed(1);
         const uMB = (st.up / (1024 * 1024)).toFixed(1);
@@ -3029,19 +3249,25 @@
     } else if (st.state === 'disconnected' || st.state === 'off' || st.state === 'idle-direct') {
       connected = false;
       connecting = false;
+      lastLiveBalancerInfo = null;
       setState('off');
       stopTimers();
+      renderBalancerDock(null);
     } else if (st.state === 'dropped') {
       connected = false;
       connecting = false;
+      lastLiveBalancerInfo = null;
       setState('off');
       stopTimers();
+      renderBalancerDock(null);
       toast('Соединение прервано (' + (st.reason || 'перезапуск') + ')', true);
     } else if (st.state === 'error') {
       connected = false;
       connecting = false;
+      lastLiveBalancerInfo = null;
       setState('off');
       stopTimers();
+      renderBalancerDock(null);
       toast('Ошибка: ' + (st.error || st.message || 'Сбой соединения'), true);
     }
   });
@@ -3132,19 +3358,26 @@
     if (typeof pendingBannerAction === 'function') pendingBannerAction();
   });
 
-  function applyVersionBadges(ver) {
+  function applyVersionBadges(ver, explicitCoreVer) {
     if (!ver) return;
-    const clean = String(ver).replace(/^v/i, '');
-    if (coreVerBadge) coreVerBadge.textContent = 'v' + clean;
+    const raw = String(ver);
+    const parts = raw.split('|');
+    const cleanApp = String(parts[0] || '').replace(/^v/i, '');
+    const cleanCore = String(explicitCoreVer || parts[1] || window.__tachyonCoreVersion || cleanApp).replace(/^v/i, '');
+    if (coreVerBadge) {
+      coreVerBadge.textContent = cleanCore !== cleanApp
+        ? `Клиент v${cleanApp} · Ядро v${cleanCore}`
+        : `v${cleanApp}`;
+    }
     const tb = $('.topbar__ver');
-    if (tb) tb.textContent = clean;
+    if (tb) tb.textContent = cleanApp;
     const ab = $('#aboutVersion');
-    if (ab) ab.textContent = 'v' + clean;
+    if (ab) ab.textContent = cleanCore !== cleanApp ? `v${cleanApp} (core v${cleanCore})` : `v${cleanApp}`;
     const fc = $('#footerCoreVer');
-    if (fc) fc.textContent = 'tachyon-core ' + clean;
+    if (fc) fc.textContent = `tachyon-core ${cleanCore}`;
   }
 
-  applyVersionBadges(window.__tachyonVersion || window.TACHYON_CONFIG?.version);
+  applyVersionBadges(window.__tachyonVersion || window.TACHYON_CONFIG?.version, window.__tachyonCoreVersion);
   window.API.onCoreVersion(ver => applyVersionBadges(ver));
   window.API.requestCoreVersion?.();
 
@@ -3166,10 +3399,10 @@
   window.API.onCoreUpdate(ev => {
     checkCoreUpdBtn?.classList.remove('is-busy');
     if (ev.type === 'available' && ev.info) {
-      const { current, latest, size } = ev.info;
-      if (current) applyVersionBadges(current);
+      const { current, coreVersion, latest, size } = ev.info;
+      if (current) applyVersionBadges(current, coreVersion);
       const mb = size ? ` (${(size / (1024 * 1024)).toFixed(1)} МБ)` : '';
-      if (coreUpdStatus) coreUpdStatus.textContent = `Доступна новая версия v${latest}${mb}`;
+      if (coreUpdStatus) coreUpdStatus.textContent = `Доступна новая версия клиента и ядра v${latest}${mb}`;
       if (installCoreUpdBtn) {
         installCoreUpdBtn.hidden = false;
         installCoreUpdBtn.disabled = false;
@@ -3177,7 +3410,7 @@
       if (installCoreUpdTxt) installCoreUpdTxt.textContent = `Обновить до v${latest}`;
 
       if (updBar && updText && updAction) {
-        updText.textContent = `Доступно обновление Tachyon v${latest} (установлено v${current})`;
+        updText.textContent = `Доступно обновление Tachyon Desktop + Core v${latest} (установлено v${current})`;
         updAction.textContent = 'Обновить';
         updBar.hidden = false;
         pendingBannerAction = () => {
@@ -3187,10 +3420,13 @@
       }
     } else if (ev.type === 'up-to-date') {
       const ver = ev.info?.current || '';
-      if (ver) applyVersionBadges(ver);
-      if (coreUpdStatus) coreUpdStatus.textContent = `Установлена актуальная версия (v${ver})`;
+      const coreVer = ev.info?.coreVersion || window.__tachyonCoreVersion || ver;
+      if (ver) applyVersionBadges(ver, coreVer);
+      if (coreUpdStatus) coreUpdStatus.textContent = `Актуальная версия: клиент v${ver}, ядро tachyon-core v${coreVer}`;
       if (installCoreUpdBtn) installCoreUpdBtn.hidden = true;
-      toast(`Tachyon v${ver} — установлена актуальная версия`);
+      if (!ev.info?.silent) {
+        toast(`Tachyon v${ver} (ядро v${coreVer}) — установлена актуальная версия`);
+      }
     } else if (ev.type === 'progress') {
       if (coreUpdProgressWrap) coreUpdProgressWrap.hidden = false;
       if (coreUpdProgressBar) coreUpdProgressBar.style.width = `${ev.percent}%`;
@@ -3200,16 +3436,13 @@
       }
     } else if (ev.type === 'done') {
       const newVer = ev.info?.version || '';
+      const newCoreVer = ev.info?.coreVersion || newVer;
       const restarting = !!ev.info?.restarting;
       if (coreUpdProgressWrap) coreUpdProgressWrap.hidden = true;
       if (installCoreUpdBtn) installCoreUpdBtn.hidden = true;
       if (updBar) updBar.hidden = true;
       if (newVer) {
-        if (coreVerBadge) coreVerBadge.textContent = 'v' + newVer;
-        const tb = $('.topbar__ver');
-        if (tb) tb.textContent = newVer;
-        const ab = $('#aboutVersion');
-        if (ab) ab.textContent = 'v' + newVer;
+        applyVersionBadges(newVer, newCoreVer);
       }
       if (coreUpdStatus) {
         coreUpdStatus.textContent = restarting
@@ -3474,6 +3707,14 @@
     const s = activeServer();
     if (!s || !s.vless) {
       toast('Сначала выберите узел', true);
+      return;
+    }
+    if (s.isBalancer) {
+      await measurePingsForList([s]);
+      if (s.ping != null && s.ping > 0) {
+        $('#mPing').textContent = s.ping;
+        pushPingSparkline(s.ping);
+      }
       return;
     }
     const host = s.meta?.host || extractHost(s.vless);

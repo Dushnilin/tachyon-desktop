@@ -414,10 +414,12 @@ fn main() {
         String::new()
     };
 
+    let core_version_str = option_env!("TACHYON_CORE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
     let platform_init = format!(
-        "window.__tachyonPlatform = {:?};\nwindow.__tachyonVersion = {:?};\n{}{}",
+        "window.__tachyonPlatform = {:?};\nwindow.__tachyonVersion = {:?};\nwindow.__tachyonCoreVersion = {:?};\n{}{}",
         current_platform_tag(),
         env!("CARGO_PKG_VERSION"),
+        core_version_str,
         migrated_js,
         INIT_BRIDGE_JS
     );
@@ -446,8 +448,14 @@ fn main() {
 
         match event {
             Event::NewEvents(StartCause::Init) => {
-                let ver = env!("CARGO_PKG_VERSION");
-                let _ = proxy.send_event(UserEvent::SendJs(format!("core:version:{ver}")));
+                let app_ver = env!("CARGO_PKG_VERSION");
+                let core_ver = option_env!("TACHYON_CORE_VERSION").unwrap_or(app_ver);
+                let _ = proxy.send_event(UserEvent::SendJs(format!("core:version:{app_ver}|{core_ver}")));
+                let v = vpn_loop.clone();
+                rt_loop.spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                    v.check_github_update(true).await;
+                });
             }
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
@@ -506,8 +514,9 @@ fn handle_ipc_message(
             });
         }
         "core:version" => {
-            let ver = env!("CARGO_PKG_VERSION");
-            let _ = proxy.send_event(UserEvent::SendJs(format!("core:version:{ver}")));
+            let app_ver = env!("CARGO_PKG_VERSION");
+            let core_ver = option_env!("TACHYON_CORE_VERSION").unwrap_or(app_ver);
+            let _ = proxy.send_event(UserEvent::SendJs(format!("core:version:{app_ver}|{core_ver}")));
         }
         "lists:refresh" => {
             let v = vpn.clone();
@@ -609,7 +618,13 @@ fn handle_ipc_message(
         "update:check" | "core-update:check" => {
             let v = vpn.clone();
             rt.spawn(async move {
-                v.check_github_update().await;
+                v.check_github_update(false).await;
+            });
+        }
+        "update:check:silent" | "core-update:check:silent" => {
+            let v = vpn.clone();
+            rt.spawn(async move {
+                v.check_github_update(true).await;
             });
         }
         "update:install" | "core-update:install" => {
@@ -698,6 +713,12 @@ fn handle_ipc_message(
                 let v = vpn.clone();
                 rt.spawn(async move {
                     v.refresh_rulesets(Some(names)).await;
+                });
+            } else if let Some(member) = msg.strip_prefix("balancer:select:") {
+                let member = member.to_string();
+                let v = vpn.clone();
+                rt.spawn(async move {
+                    v.select_balancer_member(&member).await;
                 });
             } else if let Some(url) = msg.strip_prefix("open:") {
                 open_external_url(url);

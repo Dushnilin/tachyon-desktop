@@ -186,6 +186,44 @@
               </button>
             </div>
           </div>
+
+          <!-- Панель управления и телеметрии балансировщика (tachyon-core 0.3.9) -->
+          <div class="balancer-dock" id="balancerDock" hidden>
+            <div class="balancer-dock__bar">
+              <div class="balancer-dock__left">
+                <span class="t-stat__lbl"><i class="dot dot--accent"></i>Балансировщик</span>
+                <span class="tachyon-pill" id="balancerNowBadge">Автовыбор</span>
+              </div>
+              <div class="balancer-dock__right">
+                <select id="balancerModeSelect" class="c-select c-select--sm" title="Алгоритм балансировки нагрузки (tachyon-core 0.3.9)">
+                  <option value="stability">Stability (Composite EWMA + Jitter)</option>
+                  <option value="sticky">Sticky (Привязка к подсети /24)</option>
+                  <option value="hedged">Hedged (Параллельная гонка 2 узлов)</option>
+                  <option value="least_load">Least Load (P2C по активным сессиям)</option>
+                  <option value="weighted">Weighted (Сглаженный инверсный RTT)</option>
+                  <option value="throughput">Throughput (Макс. скорость потока)</option>
+                  <option value="passive">Passive (Пассивный RTT без проб)</option>
+                  <option value="priority">Priority (Строгий порядок из списка)</option>
+                  <option value="quota">Quota (Ротация по квоте трафика)</option>
+                  <option value="failover">Failover (Резервирование при обрыве)</option>
+                  <option value="round_robin">Round-Robin (Циклический пул)</option>
+                  <option value="least_test">Fastest RTT (Классический минимум)</option>
+                </select>
+                <button type="button" class="mini-link-btn" id="toggleBalancerTelemetryBtn" title="Показать живую телеметрию участников балансировщика">
+                  <span id="balancerPoolCountLbl">Узлы</span>
+                  <svg class="ic"><use href="#ic-chevron"/></svg>
+                </button>
+              </div>
+            </div>
+            <div class="balancer-telemetry" id="balancerTelemetryPane" hidden>
+              <div class="balancer-telemetry__head">
+                <span>Участник пула (клик — закрепить)</span>
+                <span>RTT / EWMA / Джиттер</span>
+                <span>Сессии / Поток</span>
+              </div>
+              <ul class="balancer-node-list" id="balancerNodeList"></ul>
+            </div>
+          </div>
         </div>
 
         <!-- ВЫХОДНОЙ УЗЕЛ И ТЕЛЕМЕТРИЯ В ОДИН РЯД -->
@@ -764,6 +802,7 @@
             <div class="chip-bar" id="protoChips">
               <button type="button" class="f-chip is-active" data-proto="all">Все</button>
               <button type="button" class="f-chip f-chip--alive" data-proto="alive"><svg class="ic"><use href="#ic-bolt"/></svg><span>С пингом</span></button>
+              <button type="button" class="f-chip" data-proto="BALANCER"><svg class="ic"><use href="#ic-shuffle"/></svg><span>Балансировщики</span></button>
               <button type="button" class="f-chip" data-proto="REALITY">REALITY</button>
               <button type="button" class="f-chip" data-proto="XHTTP">XHTTP</button>
               <button type="button" class="f-chip" data-proto="TCP">TCP</button>

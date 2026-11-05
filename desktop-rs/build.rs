@@ -47,8 +47,34 @@ fn mime_for(path: &str) -> &'static str {
     }
 }
 
+fn extract_workspace_version(cargo_toml_path: &Path) -> Option<String> {
+    let text = fs::read_to_string(cargo_toml_path).ok()?;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("version") {
+            let rest = rest.trim_start();
+            if let Some(val) = rest.strip_prefix('=') {
+                let ver = val.trim().trim_matches('"').trim_matches('\'').trim();
+                if !ver.is_empty() {
+                    return Some(ver.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let core_cargo_toml = manifest_dir
+        .join("..")
+        .join("..")
+        .join("tachyon-core")
+        .join("Cargo.toml");
+    println!("cargo:rerun-if-changed={}", core_cargo_toml.display());
+    let core_ver = extract_workspace_version(&core_cargo_toml).unwrap_or_else(|| "0.3.9".to_string());
+    println!("cargo:rustc-env=TACHYON_CORE_VERSION={core_ver}");
+
     let web_dir = manifest_dir
         .join("..")
         .join("src")
