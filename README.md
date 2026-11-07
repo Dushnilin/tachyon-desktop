@@ -20,9 +20,9 @@
 
 | Платформа | Файл в релизе | Особенности запуска и установки |
 | :--- | :--- | :--- |
-| **Windows 10 / 11** (`x86_64`) | `Tachyon-windows-x86_64.exe`<br/>`Tachyon-windows-x86_64.zip` | Портативный одиночный `.exe` — драйвер `wintun.dll`, ядро `tachyon-core` и интерфейс уже вшиты внутрь бинарника. |
-| **Linux** (`x86_64` / `amd64`) | `tachyon_0.3.1_amd64.deb`<br/>`tachyon-linux-amd64.tar.gz` | Пакет `.deb` для Ubuntu/Debian/Mint или архив с `install.sh` для Arch/Fedora. Автоматически выставляет `cap_net_admin,cap_net_raw+eip` через `setcap`. |
-| **macOS 11+** (`Universal`) | `Tachyon-0.3.1-macOS.dmg` | Универсальный образ (`Apple Silicon M1–M4 + Intel x86_64`). Перетащите `Tachyon.app` в `Applications`. |
+| **Windows 10 / 11** (`x86_64`) | `Tachyon-windows-x86_64.exe`<br/>`Tachyon-windows-x86_64.zip` | Портативный одиночный `.exe` — драйвер `wintun.sys`, ядро `tachyon-core` и интерфейс уже вшиты внутрь бинарника (без внешних `.dll`). |
+| **Linux** (`x86_64` / `amd64`) | `tachyon_0.3.5_amd64.deb`<br/>`tachyon-linux-amd64.tar.gz` | Пакет `.deb` для Ubuntu/Debian/Mint или архив с `install.sh` для Arch/Fedora. Автоматически выставляет `cap_net_admin,cap_net_raw+eip` через `setcap`. |
+| **macOS 11+** (`Universal`) | `Tachyon-0.3.5-macOS.dmg` | Универсальный образ (`Apple Silicon M1–M4 + Intel x86_64`). Перетащите `Tachyon.app` в `Applications`. |
 
 > **Автообновление из клиента:** в разделе **Опции → Движок и обновления** встроена прямая проверка релизов `Dushnilin/tachyon-desktop` через GitHub Releases API с загрузкой свежего бинарного файла под текущую ОС и атомарной заменой на лету.
 

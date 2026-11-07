@@ -8,6 +8,7 @@ use flate2::read::GzDecoder;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct HttpResponse {
     pub status: u16,
@@ -15,6 +16,7 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
 }
 
+#[allow(dead_code)]
 impl HttpResponse {
     pub fn header(&self, name: &str) -> Option<&str> {
         let lower = name.to_ascii_lowercase();

@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ROOT_DIR="$(cd "${PROJECT_DIR}/.." && pwd)"
 
-VERSION="${1:-0.3.1}"
+VERSION="${1:-0.3.5}"
 ARCH_RAW="$(uname -m)"
 case "${ARCH_RAW}" in
   x86_64|amd64) DEB_ARCH="amd64" ;;
@@ -36,8 +36,8 @@ cat > "${STAGE_DEB}/usr/share/applications/tachyon.desktop" << 'EOF'
 [Desktop Entry]
 Type=Application
 Name=Tachyon VPN
-GenericName=VPN & DPI Bypass Client
-Comment=Клиент Tachyon VPN и встроенный обход блокировок (Desync)
+GenericName=VPN & Routing Client
+Comment=Нативный клиент маршрутизации и туннелирования Tachyon (Desync)
 Exec=/usr/bin/tachyon
 Icon=tachyon
 Terminal=false
@@ -70,9 +70,9 @@ Priority: optional
 Architecture: ${DEB_ARCH}
 Depends: libwebkit2gtk-4.1-0 | libwebkit2gtk-4.0-37, libgtk-3-0, libcap2-bin, policykit-1
 Maintainer: Dushnilin <https://github.com/Dushnilin>
-Description: Tachyon VPN & Adaptive DPI Bypass Client (tachyon-core embedded)
+Description: Tachyon Routing & Tunneling Client (tachyon-core embedded)
  Нативный кроссплатформенный клиент Tachyon со встроенным движком tachyon-core,
- адаптивным обходом блокировок ТСПУ (Desync AdaptiveBrain) и маршрутизацией tachyon-lists.
+ адаптивной десинхронизацией пакетов (Desync AdaptiveBrain) и маршрутизацией tachyon-lists.
 EOF
 
 cat > "${STAGE_DEB}/DEBIAN/postinst" << 'EOF'

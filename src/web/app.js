@@ -313,15 +313,94 @@
       return res;
     }
 
-    if (low.startsWith('amneziawg://') || low.startsWith('awg://') || low.startsWith('wireguard://')) {
+    if (low.startsWith('tachyon-node://')) {
+      try {
+        const rest = raw.slice('tachyon-node://'.length).split('#')[0];
+        const decoded = JSON.parse(decodeURIComponent(escape(atob(rest))));
+        const t = String(decoded.type || 'PROXY').toUpperCase();
+        res.proto = t;
+        res.host = String(decoded.server || '');
+        res.port = Number(decoded.server_port) || 443;
+        res.tags = [t];
+      } catch {
+        res.proto = 'NODE';
+        res.tags = ['NODE'];
+      }
+      return res;
+    }
+
+    if (low.startsWith('amneziawg://') || low.startsWith('awg://')) {
       res.proto = 'AWG';
       res.trans = 'UDP';
       res.tags = ['AWG'];
-    } else if (low.startsWith('hysteria2://') || low.startsWith('hy2://')) {
+    } else if (low.startsWith('wireguard://') || low.startsWith('wg://')) {
+      res.proto = 'WG';
+      res.trans = 'UDP';
+      res.tags = ['WG'];
+    } else if (low.startsWith('wdtt://') || low.startsWith('qwdtt://') || low.startsWith('csqtt://')) {
+      res.proto = 'WDTT';
+      res.sec = 'NOISE';
+      res.trans = 'UDP';
+      res.tags = ['WDTT'];
+    } else if (low.startsWith('tewfai://')) {
+      res.proto = 'TEWFAI';
+      res.sec = 'PQC';
+      res.trans = 'QUIC';
+      res.tags = ['TEWFAI', 'PQC'];
+    } else if (low.startsWith('mieru://') || low.startsWith('mierus://')) {
+      res.proto = 'MIERU';
+      res.tags = ['MIERU'];
+    } else if (low.startsWith('hysteria2://') || low.startsWith('hy2://') || low.startsWith('hysteria://')) {
       res.proto = 'HY2';
       res.sec = 'TLS';
       res.trans = 'QUIC';
       res.tags = ['HY2', 'QUIC'];
+    } else if (low.startsWith('tuic://')) {
+      res.proto = 'TUIC';
+      res.sec = 'TLS';
+      res.trans = 'QUIC';
+      res.tags = ['TUIC', 'QUIC'];
+    } else if (low.startsWith('anytls://')) {
+      res.proto = 'ANYTLS';
+      res.sec = 'TLS';
+      res.tags = ['ANYTLS'];
+    } else if (low.startsWith('shadowtls://')) {
+      res.proto = 'SHADOWTLS';
+      res.sec = 'TLS';
+      res.tags = ['SHADOWTLS'];
+    } else if (low.startsWith('naive+')) {
+      res.proto = 'NAIVE';
+      res.sec = 'TLS';
+      res.tags = ['NAIVE'];
+    } else if (low.startsWith('trusttunnel://')) {
+      res.proto = 'TRUST';
+      res.sec = 'TLS';
+      res.tags = ['TRUST'];
+    } else if (low.startsWith('masque://')) {
+      res.proto = 'MASQUE';
+      res.sec = 'TLS';
+      res.trans = 'QUIC';
+      res.tags = ['MASQUE'];
+    } else if (low.startsWith('openconnect://')) {
+      res.proto = 'OPENCONNECT';
+      res.sec = 'TLS';
+      res.tags = ['OPENCONNECT'];
+    } else if (low.startsWith('snell://')) {
+      res.proto = 'SNELL';
+      res.tags = ['SNELL'];
+    } else if (low.startsWith('tg://') || low.startsWith('mtproto://')) {
+      res.proto = 'MTPROTO';
+      res.tags = ['MTPROTO'];
+    } else if (low.startsWith('trojan://')) {
+      res.proto = 'TROJAN';
+      res.sec = 'TLS';
+      res.tags = ['TROJAN'];
+    } else if (low.startsWith('vmess://')) {
+      res.proto = 'VMESS';
+      res.tags = ['VMESS'];
+    } else if (low.startsWith('socks5://') || low.startsWith('socks://')) {
+      res.proto = 'SOCKS5';
+      res.tags = ['SOCKS5'];
     } else if (low.startsWith('ss://')) {
       res.proto = 'SS';
       res.tags = ['SS'];
@@ -776,11 +855,11 @@
     subNameInput.value = '';
     if (isNodeOnly) {
       $('#addSubTitle').textContent = 'Добавить ключ узла';
-      subInput.placeholder = 'vless://, awg://, ss:// или hysteria2://';
+      subInput.placeholder = 'vless://, awg://, wg://, wdtt://, tewfai://, tuic://, ss://, hy2://';
       subNameInput.placeholder = 'Название узла (например: NL-1)';
     } else {
       $('#addSubTitle').textContent = 'Добавить подписку';
-      subInput.placeholder = 'URL подписки (https://…) или ключ';
+      subInput.placeholder = 'URL подписки (https://…), happ://, vpn:// или ключ';
       subNameInput.placeholder = 'Название (например: Основная)';
     }
     subInput.focus();
@@ -819,15 +898,15 @@
 
     if (pendingImport) {
       const low = pendingImport.input.toLowerCase();
-      const isSingleNode = low.startsWith('vless://') ||
-                           low.startsWith('awg://') ||
-                           low.startsWith('amneziawg://') ||
-                           low.startsWith('wireguard://') ||
-                           low.startsWith('ss://') ||
-                           low.startsWith('hysteria2://') ||
-                           low.startsWith('hy2://');
+      const isRemoteOrSubLink = low.startsWith('http://') ||
+                                low.startsWith('https://') ||
+                                low.startsWith('happ://') ||
+                                low.startsWith('v2raytun://') ||
+                                low.startsWith('incy://') ||
+                                low.startsWith('vpn://');
+      const isSingleNode = !isRemoteOrSubLink && srvs.length === 1 && !srvs[0]?.isBalancer;
 
-      if (isSingleNode && srvs.length === 1) {
+      if (isSingleNode) {
         const customs = window.API.getCustomNodes();
         const s = normalizeServer(srvs[0]);
         customs.push({

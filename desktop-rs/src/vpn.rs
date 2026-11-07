@@ -9,10 +9,13 @@ use std::time::{Duration, Instant, SystemTime};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use core_config::subscription::{
-    extract_subscription_metadata, outbound_to_share_link, parse_share_uri,
-    parse_subscription_payload, wireguard_node_to_endpoint,
+    extract_subscription_metadata, is_stub_or_dummy_outbound, outbound_to_share_link,
+    parse_share_uri, parse_subscription_payload_with_hwid, resolve_subscription_input,
+    wireguard_node_to_endpoint,
 };
 use core_runtime::BoxInstance;
+use core_runtime::hardware::HardwareIdentity;
+use core_runtime::subscription::fetch_url_standalone_with_options;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -109,6 +112,77 @@ pub struct ExtraNodeRef {
 }
 
 pub const BALANCER_URI_PREFIX: &str = "tachyon-balancer://";
+pub const INLINE_NODE_URI_PREFIX: &str = "tachyon-node://";
+
+pub fn encode_inline_node_uri(node: &Value) -> String {
+    let json_bytes = serde_json::to_vec(node).unwrap_or_default();
+    let b64 = B64.encode(&json_bytes);
+    let tag = node
+        .get("tag")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Сервер");
+    let frag = core_config::subscription::percent_encode_component(tag);
+    format!("{INLINE_NODE_URI_PREFIX}{b64}#{frag}")
+}
+
+pub fn decode_inline_node_uri(raw: &str) -> Option<Value> {
+    let rest = raw.trim().strip_prefix(INLINE_NODE_URI_PREFIX)?;
+    let (b64_part, frag_part) = match rest.split_once('#') {
+        Some((b, f)) => (b.trim(), Some(f.trim())),
+        None => (rest.trim(), None),
+    };
+    let bytes = B64.decode(b64_part).ok()?;
+    let mut node: Value = serde_json::from_slice(&bytes).ok()?;
+    if let Some(obj) = node.as_object_mut() {
+        let has_tag = obj
+            .get("tag")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty());
+        if !has_tag {
+            if let Some(f) = frag_part.filter(|s| !s.is_empty()) {
+                obj.insert("tag".to_string(), json!(f.replace("%20", " ")));
+            }
+        }
+    }
+    Some(node)
+}
+
+pub fn node_to_share_link(node: &Value) -> Option<String> {
+    if is_stub_or_dummy_outbound(node) {
+        return None;
+    }
+    if let Some(link) = outbound_to_share_link(node) {
+        return Some(link);
+    }
+    let ty = node
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if matches!(
+        ty.as_str(),
+        "" | "urltest" | "selector" | "direct" | "block" | "dns" | "desync" | "tlsspoof"
+    ) {
+        return None;
+    }
+    if node
+        .get("server")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        return Some(encode_inline_node_uri(node));
+    }
+    None
+}
+
+pub fn parse_node_uri(raw: &str) -> Result<Value, String> {
+    let trimmed = raw.trim();
+    if let Some(val) = decode_inline_node_uri(trimmed) {
+        return Ok(val);
+    }
+    parse_share_uri(trimmed)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BalancerMember {
@@ -276,15 +350,10 @@ pub struct ConnectOptions {
 impl ConnectOptions {
     pub fn parse(raw: &str) -> Result<Self, String> {
         let raw = raw.trim();
-        if raw.starts_with("vless://")
-            || raw.starts_with("vmess://")
-            || raw.starts_with("trojan://")
-            || raw.starts_with("ss://")
-            || raw.starts_with("hy2://")
-            || raw.starts_with("hysteria2://")
-            || raw.starts_with("amneziawg://")
-            || raw.starts_with("awg://")
-            || raw.starts_with(BALANCER_URI_PREFIX)
+        if !raw.starts_with('{')
+            && (raw.starts_with(BALANCER_URI_PREFIX)
+                || raw.starts_with(INLINE_NODE_URI_PREFIX)
+                || parse_share_uri(raw).is_ok())
         {
             return Ok(Self {
                 vless: raw.to_string(),
@@ -1117,7 +1186,7 @@ impl VpnManager {
         tls_fragment: bool,
         detour_tag: Option<&str>,
     ) -> Result<(bool, Value, Option<String>), String> {
-        let mut node = parse_share_uri(raw_uri.trim())?;
+        let mut node = parse_node_uri(raw_uri.trim())?;
         let server_host = node
             .get("server")
             .and_then(Value::as_str)
@@ -2381,9 +2450,14 @@ impl VpnManager {
             return;
         }
 
-        // Single share link or balancer URI
-        if !input.starts_with("http://") && !input.starts_with("https://") {
-            if let Some(bal) = decode_balancer_uri(input) {
+        let hwid = HardwareIdentity::detect();
+        let resolved = resolve_subscription_input(input, Some(&hwid.hwid), None)
+            .unwrap_or_else(|_| input.to_string());
+        let resolved = resolved.trim();
+
+        // Single share link, balancer URI, inline node, or offline container/bundle
+        if !resolved.starts_with("http://") && !resolved.starts_with("https://") {
+            if let Some(bal) = decode_balancer_uri(resolved) {
                 let name = if bal.name.trim().is_empty() {
                     "Балансировщик".to_string()
                 } else {
@@ -2394,7 +2468,7 @@ impl VpnManager {
                     "servers": [{
                         "id": "custom-bal-1",
                         "name": name,
-                        "vless": input,
+                        "vless": resolved,
                         "country": detect_country_code(&name),
                         "isBalancer": true,
                         "balancerMode": bal.mode,
@@ -2404,7 +2478,80 @@ impl VpnManager {
                 self.emit(format!("sub:{payload}"));
                 return;
             }
-            match parse_share_uri(input) {
+            if let Some(val) = decode_inline_node_uri(resolved) {
+                let tag = val
+                    .get("tag")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("Сервер");
+                let payload = json!({
+                    "user": { "handle": tag },
+                    "servers": [{
+                        "id": "custom-1",
+                        "name": tag,
+                        "vless": resolved,
+                        "country": detect_country_code(tag)
+                    }]
+                });
+                self.emit(format!("sub:{payload}"));
+                return;
+            }
+            if let Ok(nodes) =
+                parse_subscription_payload_with_hwid(resolved, Some(&hwid.hwid), None)
+            {
+                let real_nodes: Vec<Value> = nodes
+                    .into_iter()
+                    .filter(|n| !is_stub_or_dummy_outbound(n))
+                    .collect();
+                let is_container = input.starts_with("vpn://")
+                    || input.starts_with("happ://")
+                    || input.starts_with("v2raytun://")
+                    || input.starts_with("incy://")
+                    || input.starts_with("fptn:")
+                    || input.starts_with("fptnb:")
+                    || resolved.contains('\n');
+                if real_nodes.len() >= 2 || (is_container && !real_nodes.is_empty()) {
+                    let meta = extract_subscription_metadata(resolved, None, None);
+                    let handle = meta
+                        .profile_title
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "Подписка".to_string());
+                    let servers = build_subscription_servers_list(&real_nodes, &handle);
+                    if !servers.is_empty() {
+                        let result = json!({
+                            "user": { "handle": handle },
+                            "subscription": {
+                                "status": "active",
+                                "trafficUsed": 0,
+                                "trafficTotal": 0
+                            },
+                            "servers": servers
+                        });
+                        self.emit(format!("sub:{result}"));
+                        return;
+                    }
+                } else if real_nodes.len() == 1 {
+                    let node = &real_nodes[0];
+                    let tag = node
+                        .get("tag")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("Сервер");
+                    let uri = node_to_share_link(node).unwrap_or_else(|| resolved.to_string());
+                    let payload = json!({
+                        "user": { "handle": tag },
+                        "servers": [{
+                            "id": "custom-1",
+                            "name": tag,
+                            "vless": uri,
+                            "country": detect_country_code(tag)
+                        }]
+                    });
+                    self.emit(format!("sub:{payload}"));
+                    return;
+                }
+            }
+            match parse_share_uri(resolved) {
                 Ok(val) => {
                     let tag = val
                         .get("tag")
@@ -2416,7 +2563,7 @@ impl VpnManager {
                         "servers": [{
                             "id": "custom-1",
                             "name": tag,
-                            "vless": input,
+                            "vless": resolved,
                             "country": detect_country_code(tag)
                         }]
                     });
@@ -2429,52 +2576,57 @@ impl VpnManager {
             return;
         }
 
-        // Remote subscription URL
-        let resp = match fetch_url(
+        // Remote subscription URL: delegate to tachyon-core 0.4.0 adaptive fetcher
+        // (UA cascade, X-HWID headers, Encrypt-Tag AES-GCM decryption, WireGuard peer synthesis)
+        let proxy_url = if self.is_running().await {
+            Some(format!("socks5://127.0.0.1:{PROXY_PORT}"))
+        } else {
+            None
+        };
+
+        let fetched_res = match fetch_url_standalone_with_options(
             input,
-            "GET",
-            &[("User-Agent", "v2rayN/6.42"), ("Accept", "*/*")],
             None,
+            true,
+            Some(&hwid.hwid),
+            false,
             None,
-            Duration::from_secs(20),
+            &[],
         )
         .await
         {
-            Ok(r) => r,
-            Err(e) => {
-                self.emit(format!("sub:{}", json!({ "error": e.to_string() })));
-                return;
+            Ok(r) => Ok(r),
+            Err(_) if proxy_url.is_some() => {
+                fetch_url_standalone_with_options(
+                    input,
+                    None,
+                    true,
+                    Some(&hwid.hwid),
+                    false,
+                    proxy_url.as_deref(),
+                    &[],
+                )
+                .await
             }
+            Err(e) => Err(e),
         };
 
-        if !(200..300).contains(&resp.status) {
-            self.emit(format!(
-                "sub:{}",
-                json!({ "error": format!("Сервер вернул HTTP {}", resp.status) })
-            ));
-            return;
-        }
-
-        let body_text = resp.text();
-        let meta = extract_subscription_metadata(
-            &body_text,
-            resp.header("subscription-userinfo"),
-            resp.header("profile-title"),
-        );
-        let nodes = match parse_subscription_payload(&body_text) {
-            Ok(n) => n,
+        let fetched = match fetched_res {
+            Ok(f) => f,
             Err(e) => {
                 self.emit(format!("sub:{}", json!({ "error": e })));
                 return;
             }
         };
 
+        let meta = fetched.metadata;
         let handle = meta
             .profile_title
+            .or(meta.file_name)
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "Подписка".to_string());
 
-        let servers = build_subscription_servers_list(&nodes, &handle);
+        let servers = build_subscription_servers_list(&fetched.nodes, &handle);
 
         if servers.is_empty() {
             self.emit(format!(
@@ -2483,21 +2635,26 @@ impl VpnManager {
             ));
             return;
         }
-        let mut traffic_used = 0u64;
-        let mut traffic_total = 0u64;
-        if let Some(ref ui) = meta.user_info_raw {
-            for part in ui.split(';') {
-                if let Some((k, v)) = part.trim().split_once('=') {
-                    if let Ok(num) = v.trim().parse::<u64>() {
-                        match k.trim() {
-                            "upload" | "download" => traffic_used += num,
-                            "total" => traffic_total = num,
-                            _ => {}
+        let (traffic_used, traffic_total) = if let Some(ui) = fetched.user_info {
+            (ui.upload.saturating_add(ui.download), ui.total)
+        } else {
+            let mut u = 0u64;
+            let mut t = 0u64;
+            if let Some(ref ui_raw) = meta.user_info_raw {
+                for part in ui_raw.split(';') {
+                    if let Some((k, v)) = part.trim().split_once('=') {
+                        if let Ok(num) = v.trim().parse::<u64>() {
+                            match k.trim() {
+                                "upload" | "download" => u += num,
+                                "total" => t = num,
+                                _ => {}
+                            }
                         }
                     }
                 }
             }
-        }
+            (u, t)
+        };
 
         let result = json!({
             "user": { "handle": handle },
@@ -4036,10 +4193,10 @@ pub fn build_subscription_servers_list(nodes: &[Value], handle: &str) -> Vec<Val
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_ascii_lowercase();
-        if ty == "urltest" {
+        if ty == "urltest" || is_stub_or_dummy_outbound(node) {
             continue;
         }
-        let Some(share_link) = outbound_to_share_link(node) else {
+        let Some(share_link) = node_to_share_link(node) else {
             continue;
         };
         let name = node
@@ -4298,7 +4455,8 @@ mod tests {
     #[test]
     fn subscription_balancers_hide_internal_members_and_auto_synthesize() {
         let raw_two_nodes = "vless://11111111-1111-1111-1111-111111111111@198.51.100.10:443?security=tls&type=tcp#NL-1\nvless://22222222-2222-2222-2222-222222222222@198.51.100.20:443?security=tls&type=tcp#DE-1";
-        let parsed = parse_subscription_payload(raw_two_nodes).expect("parse two nodes");
+        let parsed =
+            parse_subscription_payload_with_hwid(raw_two_nodes, None, None).expect("parse two nodes");
         let list = build_subscription_servers_list(&parsed, "TestSub");
         assert_eq!(list.len(), 3);
         assert_eq!(list[0]["isBalancer"], json!(true));
@@ -4332,6 +4490,68 @@ mod tests {
 
         let bad_sums = "0000000000000000000000000000000000000000000000000000000000000000  Tachyon-windows-x86_64.exe\n";
         assert!(verify_asset_sha256(payload, "Tachyon-windows-x86_64.exe", bad_sums).is_err());
+    }
+
+    #[test]
+    fn tachyon_core_0_4_0_protocols_and_containers_roundtrip() {
+        let mgr = VpnManager::new(Arc::new(|_| {}));
+
+        // 1. Test new 0.4.0 share links (wdtt, tewfai, mieru, tuic, anytls, naive)
+        let uris = [
+            "wdtt://mywdttpass@198.51.100.10:56000?mode=wg&obfs=audio&hashes=0123456789abcdef#WDTT-1",
+            "tewfai://secretpass@198.51.100.11:443?sni=example.com&pqc=true&fec=true#Tewfai-PQC",
+            "mieru://alice:pa55@198.51.100.12:8443?transport=TCP&multiplexing=MULTIPLEXING_HIGH#Mieru-1",
+            "tuic://11111111-1111-1111-1111-111111111111:secret@198.51.100.13:443?congestion_control=bbr&sni=example.com#TUIC-1",
+            "anytls://secret@198.51.100.14:443?sni=example.com#AnyTLS-1",
+            "naive+https://user:pass@198.51.100.15:443#Naive-1",
+        ];
+
+        for uri in uris {
+            let opts = ConnectOptions::parse(uri).expect("ConnectOptions::parse should accept 0.4.0 URI");
+            let (cfg, has_node) = mgr.build_config(&opts).expect("build_config for 0.4.0 URI");
+            assert!(has_node);
+            let cfg_str = serde_json::to_string(&cfg).expect("serialize config");
+            core_config::check_str(&cfg_str)
+                .unwrap_or_else(|e| panic!("core_config::check_str failed for {uri}: {e}"));
+        }
+
+        // 2. Test inline node URI fallback (fptn / sudoku / ssh)
+        let fptn_node = json!({
+            "type": "fptn",
+            "tag": "FPTN-NL",
+            "server": "198.51.100.50",
+            "server_port": 443,
+            "sni": "fptn.example.com",
+            "md5_fingerprint": "0123456789abcdef0123456789abcdef"
+        });
+        let inline_link = node_to_share_link(&fptn_node).expect("node_to_share_link for fptn");
+        assert!(inline_link.starts_with(INLINE_NODE_URI_PREFIX));
+        let parsed_back = parse_node_uri(&inline_link).expect("parse_node_uri for inline fptn");
+        assert_eq!(parsed_back["type"], json!("fptn"));
+        assert_eq!(parsed_back["server"], json!("198.51.100.50"));
+
+        // 3. Test happ://add redirect resolution & stub filtering
+        let resolved = resolve_subscription_input(
+            "happ://add/https://example.com/sub",
+            Some("0123456789abcdef"),
+            None,
+        )
+        .expect("resolve happ://add");
+        assert_eq!(resolved, "https://example.com/sub");
+
+        let stub_and_real = vec![
+            json!({
+                "type": "vless",
+                "tag": "⏳ Тариф закончился",
+                "server": "127.0.0.1",
+                "server_port": 443,
+                "uuid": "00000000-0000-0000-0000-000000000000"
+            }),
+            fptn_node,
+        ];
+        let srv_list = build_subscription_servers_list(&stub_and_real, "Test040");
+        assert_eq!(srv_list.len(), 1);
+        assert_eq!(srv_list[0]["name"], json!("FPTN-NL"));
     }
 }
 

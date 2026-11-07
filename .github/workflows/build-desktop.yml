@@ -67,7 +67,7 @@ jobs:
         run: |
           RAW_TAG="${{ inputs.release_tag != '' && inputs.release_tag || github.ref_name }}"
           VER="${RAW_TAG#v}"
-          if [[ ! "${VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then VER="0.3.4"; fi
+          if [[ ! "${VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then VER="0.3.5"; fi
           chmod +x desktop-rs/scripts/package-linux.sh
           ./desktop-rs/scripts/package-linux.sh "${VER}"
 
@@ -121,7 +121,7 @@ jobs:
         run: |
           RAW_TAG="${{ inputs.release_tag != '' && inputs.release_tag || github.ref_name }}"
           VER="${RAW_TAG#v}"
-          if [[ ! "${VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then VER="0.3.4"; fi
+          if [[ ! "${VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then VER="0.3.5"; fi
           chmod +x desktop-rs/scripts/package-macos.sh
           ./desktop-rs/scripts/package-macos.sh --universal "${VER}"
 

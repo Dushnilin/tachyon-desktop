@@ -386,7 +386,7 @@
                 <label class="desync-switch-row">
                   <div class="desync-switch-row__txt">
                     <b>3-уровневое самообучение L1/L2/L3 + контроль окна 32 КБ (auto_tune)</b>
-                    <small>Автоподбор из 12 рецептов ядра, детектор порога 16/32 КБ и шейпера потока, сохранение стратегий в cache.db</small>
+                    <small>Автоподбор из 16 рецептов ядра, классификация STUN/Discord/WireGuard UDP, детектор порога 16/32 КБ и сохранение в cache.db</small>
                   </div>
                   <label class="toggle toggle--inline">
                     <input type="checkbox" id="desyncAutoTuneToggle" checked />
@@ -422,7 +422,7 @@
             <div class="desync-section">
               <div class="desync-sec-title">Профиль десинхронизации</div>
               <div class="preset-chips" id="desyncPresetsBar">
-                <button type="button" class="p-chip is-active" data-dpreset="auto" title="Автоматический выбор из 12 рецептов AdaptiveBrain под маршрут"><svg class="ic"><use href="#ic-bolt"/></svg><span>Авто (Adaptive)</span></button>
+                <button type="button" class="p-chip is-active" data-dpreset="auto" title="Автоматический выбор из 16 рецептов AdaptiveBrain под маршрут"><svg class="ic"><use href="#ic-bolt"/></svg><span>Авто (Adaptive)</span></button>
                 <button type="button" class="p-chip" data-dpreset="youtube_discord" title="Fake + Split по SLD + UDP Fake для голоса Discord и YouTube GGC"><svg class="ic"><use href="#ic-play"/></svg><span>YouTube + Discord</span></button>
                 <button type="button" class="p-chip" data-dpreset="multi_disorder" title="TLSRec + каскадный разрез на 4 сегмента в обратном порядке + BadSum"><svg class="ic"><use href="#ic-shuffle"/></svg><span>Multi-Disorder</span></button>
                 <button type="button" class="p-chip" data-dpreset="fake_split" title="Отправка фейкового ClientHello + разрез реального пакета"><svg class="ic"><use href="#ic-split"/></svg><span>Fake + Split</span></button>
@@ -723,7 +723,7 @@
           <div class="sub-fields">
             <label class="field">
               <svg class="ic field__ic"><use href="#ic-globe"/></svg>
-              <input type="text" id="subInput" placeholder="https://… или ключ vless://, ss://, awg://, hy2://, trojan://, vmess://" autocomplete="off" />
+              <input type="text" id="subInput" placeholder="https://…, happ://, vpn:// или ключ vless://, awg://, wg://, wdtt://, tewfai://, tuic://, ss://, hy2://" autocomplete="off" />
             </label>
             <label class="field">
               <svg class="ic field__ic"><use href="#ic-edit"/></svg>
@@ -749,7 +749,7 @@
         <div class="sub-empty" id="subsEmpty" hidden>
           <div class="sub-empty__icon"><svg class="ic"><use href="#ic-server"/></svg></div>
           <h3>Нет источников</h3>
-          <p>Добавьте URL подписки, нажмите «WARP AWG» выше или вставьте ключ vless, shadowsocks, wireguard, hysteria2.</p>
+          <p>Добавьте URL подписки, контейнер happ:// / vpn://, нажмите «WARP AWG» выше или вставьте ключ vless, wireguard, wdtt, tewfai, shadowsocks, hysteria2.</p>
           <button class="btn btn--primary btn--sm" id="emptyAddBtn" type="button" style="width:auto;padding:8px 16px">
             <svg class="ic"><use href="#ic-plus"/></svg>Добавить источник
           </button>

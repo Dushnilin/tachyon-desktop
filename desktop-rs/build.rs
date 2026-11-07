@@ -72,7 +72,7 @@ fn main() {
         .join("tachyon-core")
         .join("Cargo.toml");
     println!("cargo:rerun-if-changed={}", core_cargo_toml.display());
-    let core_ver = extract_workspace_version(&core_cargo_toml).unwrap_or_else(|| "0.3.9".to_string());
+    let core_ver = extract_workspace_version(&core_cargo_toml).unwrap_or_else(|| "0.4.0".to_string());
     println!("cargo:rustc-env=TACHYON_CORE_VERSION={core_ver}");
 
     let web_dir = manifest_dir
