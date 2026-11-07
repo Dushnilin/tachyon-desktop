@@ -82,7 +82,7 @@ jobs:
 
   build-macos:
     name: macOS (Universal Apple Silicon + Intel .dmg)
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - name: Checkout tachyon-desktop
         uses: actions/checkout@v4
