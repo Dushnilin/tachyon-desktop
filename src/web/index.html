@@ -54,6 +54,7 @@
     <symbol id="ic-ban" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m5.7 5.7 12.6 12.6"/></symbol>
     <symbol id="ic-ext" viewBox="0 0 24 24"><path d="M7 17 17 7M9 7h8v8"/></symbol>
     <symbol id="ic-heart" viewBox="0 0 24 24"><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/></symbol>
+    <symbol id="ic-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6M9 13h6M9 17h4"/></symbol>
   </defs></svg>
 
   <!-- ===== ЕДИНАЯ ШАПКА TACHYON + НАВИГАЦИЯ ===== -->
@@ -706,9 +707,10 @@
             <button class="btn-act" id="openAddNodeBtn" type="button">
               <svg class="ic"><use href="#ic-bolt"/></svg><span>Ключ</span>
             </button>
-            <button class="btn-act" id="createWarpAwgBtn" type="button" title="Сгенерировать бесплатный профиль Cloudflare WARP (AmneziaWG)">
-              <svg class="ic"><use href="#ic-shield"/></svg><span id="createWarpAwgTxt">WARP AWG</span>
+            <button class="btn-act" id="importConfFileBtn" type="button" title="Загрузить файл конфигурации WireGuard / AmneziaWG (.conf, .vpn, .json)">
+              <svg class="ic"><use href="#ic-file"/></svg><span>Файл .conf</span>
             </button>
+            <input type="file" id="confFileInput" accept=".conf,.vpn,.json,.txt,.yaml,.yml" multiple hidden />
             <button class="btn-icon" id="refreshAllSubsBtn" type="button" title="Обновить все подписки">
               <svg class="ic"><use href="#ic-refresh"/></svg>
             </button>
@@ -721,9 +723,9 @@
             <h2 id="addSubTitle">Новая подписка</h2>
           </div>
           <div class="sub-fields">
-            <label class="field">
+            <label class="field field--textarea">
               <svg class="ic field__ic"><use href="#ic-globe"/></svg>
-              <input type="text" id="subInput" placeholder="https://…, happ://, vpn:// или ключ vless://, awg://, wg://, wdtt://, tewfai://, tuic://, ss://, hy2://" autocomplete="off" />
+              <textarea id="subInput" rows="3" placeholder="https://…, vpn://, happ://, ключ vless://, awg://, wg:// или текст файла .conf ([Interface] … [Peer])" autocomplete="off" spellcheck="false"></textarea>
             </label>
             <label class="field">
               <svg class="ic field__ic"><use href="#ic-edit"/></svg>
@@ -731,6 +733,9 @@
             </label>
           </div>
           <div class="sub-add-card__foot">
+            <button class="btn btn--ghost btn--sm" id="pickConfFromModalBtn" type="button" style="margin-right:auto">
+              <svg class="ic"><use href="#ic-file"/></svg>Файл .conf / .vpn
+            </button>
             <button class="btn btn--ghost btn--sm" id="cancelSubBtn" type="button">Отмена</button>
             <button class="btn btn--primary btn--sm" id="saveSubBtn" type="button">Сохранить</button>
           </div>
@@ -749,7 +754,7 @@
         <div class="sub-empty" id="subsEmpty" hidden>
           <div class="sub-empty__icon"><svg class="ic"><use href="#ic-server"/></svg></div>
           <h3>Нет источников</h3>
-          <p>Добавьте URL подписки, контейнер happ:// / vpn://, нажмите «WARP AWG» выше или вставьте ключ vless, wireguard, wdtt, tewfai, shadowsocks, hysteria2.</p>
+          <p>Добавьте URL подписки, контейнер happ:// / vpn://, загрузите файл .conf или вставьте ключ vless, awg, wireguard, wdtt, tewfai, shadowsocks, hysteria2.</p>
           <button class="btn btn--primary btn--sm" id="emptyAddBtn" type="button" style="width:auto;padding:8px 16px">
             <svg class="ic"><use href="#ic-plus"/></svg>Добавить источник
           </button>

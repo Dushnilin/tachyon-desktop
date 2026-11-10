@@ -1,6 +1,6 @@
 [package]
 name = "tachyon-desktop"
-version = "0.3.5"
+version = "0.3.6"
 edition = "2024"
 description = "Tachyon Cross-Platform Desktop Client (Linux, macOS, Windows) with embedded tachyon-core"
 license = "LicenseRef-Proprietary"
@@ -21,9 +21,10 @@ regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
-tao = { version = "0.30", features = ["rwh_06"] }
+gpui-kit = "0.9.1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+smallvec = "1"
 tokio = { version = "1", features = ["full"] }
-wry = { version = "0.47", default-features = false, features = ["protocol", "os-webview", "drag-drop"] }
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 
 [target.'cfg(unix)'.dependencies]
@@ -34,6 +35,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Networking_WinSock",
     "Win32_Graphics_Dwm",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_Shell",
 ] }
 
 [patch.crates-io]

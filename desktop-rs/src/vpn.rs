@@ -181,6 +181,14 @@ pub fn parse_node_uri(raw: &str) -> Result<Value, String> {
     if let Some(val) = decode_inline_node_uri(trimmed) {
         return Ok(val);
     }
+    if let Ok(val) = parse_share_uri(trimmed) {
+        return Ok(val);
+    }
+    if let Ok(mut nodes) = parse_subscription_payload_with_hwid(trimmed, None, None)
+        && let Some(first) = nodes.drain(..).find(|n| !is_stub_or_dummy_outbound(n))
+    {
+        return Ok(first);
+    }
     parse_share_uri(trimmed)
 }
 
@@ -353,7 +361,7 @@ impl ConnectOptions {
         if !raw.starts_with('{')
             && (raw.starts_with(BALANCER_URI_PREFIX)
                 || raw.starts_with(INLINE_NODE_URI_PREFIX)
-                || parse_share_uri(raw).is_ok())
+                || parse_node_uri(raw).is_ok())
         {
             return Ok(Self {
                 vless: raw.to_string(),
@@ -1187,10 +1195,17 @@ impl VpnManager {
         detour_tag: Option<&str>,
     ) -> Result<(bool, Value, Option<String>), String> {
         let mut node = parse_node_uri(raw_uri.trim())?;
-        let server_host = node
+        let mut server_host = node
             .get("server")
             .and_then(Value::as_str)
-            .map(str::to_string);
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                node.pointer("/peers/0/address")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string)
+            });
         let ntype = node
             .get("type")
             .and_then(Value::as_str)
@@ -1202,8 +1217,18 @@ impl VpnManager {
                 obj.insert("tag".to_string(), json!(tag));
             }
             let mut ep = wireguard_node_to_endpoint(&node);
+            if server_host.is_none() {
+                server_host = ep
+                    .pointer("/peers/0/address")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string);
+            }
             if let Some(obj) = ep.as_object_mut() {
                 obj.insert("tag".to_string(), json!(tag));
+                if let Some(dt) = detour_tag {
+                    obj.insert("detour".to_string(), json!(dt));
+                }
             }
             return Ok((true, ep, server_host));
         }
@@ -1557,18 +1582,12 @@ impl VpnManager {
             "dns_remote"
         };
 
-        let mut dns_obj = json!({
+        let dns_obj = json!({
             "servers": dns_servers,
             "rules": dns_rules,
             "final": final_dns_tag,
             "strategy": "prefer_ipv4"
         });
-        if fake_ip_enabled {
-            dns_obj["fakeip"] = json!({
-                "enabled": true,
-                "inet4_range": "198.18.0.0/15"
-            });
-        }
 
         let mut inbounds = Vec::new();
         if !opts.proxy_mode {
@@ -1601,6 +1620,7 @@ impl VpnManager {
         let mut endpoints = Vec::new();
         let mut outbounds = Vec::new();
         let mut server_hosts = HashSet::new();
+        let mut min_endpoint_mtu: Option<u32> = None;
 
         let need_desync = opts.desync.enabled
             || opts.route == RouteMode::DesyncOnly
@@ -1636,6 +1656,14 @@ impl VpnManager {
             for h in hosts {
                 server_hosts.insert(h);
             }
+            for ep in &eps {
+                let ep_mtu = ep
+                    .get("mtu")
+                    .and_then(Value::as_u64)
+                    .map(|m| (m as u32).clamp(1280, 9000))
+                    .unwrap_or(1408);
+                min_endpoint_mtu = Some(min_endpoint_mtu.map_or(ep_mtu, |cur| cur.min(ep_mtu)));
+            }
             endpoints.extend(eps);
             outbounds.extend(obs);
         }
@@ -1654,6 +1682,21 @@ impl VpnManager {
             outbounds.extend(obs.clone());
         }
 
+        if let Some(ep_mtu) = min_endpoint_mtu {
+            if let Some(tun_obj) = inbounds.first_mut().and_then(Value::as_object_mut) {
+                if tun_obj.get("type").and_then(Value::as_str) == Some("tun") {
+                    let cur_mtu = tun_obj
+                        .get("mtu")
+                        .and_then(Value::as_u64)
+                        .map(|m| m as u32)
+                        .unwrap_or(1420);
+                    if ep_mtu < cur_mtu {
+                        tun_obj.insert("mtu".to_string(), json!(ep_mtu));
+                    }
+                }
+            }
+        }
+
         if need_desync {
             outbounds.push(Self::build_desync_outbound("DESYNC", &opts.desync));
         }
@@ -1670,7 +1713,7 @@ impl VpnManager {
         let mut rules = vec![
             json!({ "action": "sniff" }),
             json!({ "protocol": "dns", "action": "hijack-dns" }),
-            json!({ "process_name": ["tachyon", "tachyon-desktop", "tachyon-core", "tachyon-core.exe", "Tachyon.exe"], "outbound": "direct" }),
+            json!({ "process_name": ["tachyon", "tachyon-desktop", "tachyon-core", "tachyon-core.exe", "Tachyon.exe", "tachyon.exe"], "outbound": "direct" }),
             json!({ "network": "udp", "port": [135, 137, 138, 139, 445, 1900, 3702, 5353, 5355], "action": "reject" }),
             json!({ "ip_is_private": true, "outbound": "direct" }),
             json!({ "ip_cidr": [format!("{bootstrap_ip}/32")], "outbound": "direct" }),
@@ -1679,10 +1722,24 @@ impl VpnManager {
         let mut server_ips = Vec::new();
         let mut server_domains = Vec::new();
         for h in server_hosts {
-            if h.parse::<IpAddr>().is_ok() {
-                server_ips.push(format!("{h}/32"));
+            if let Ok(ip) = h.parse::<IpAddr>() {
+                let cidr = if ip.is_ipv4() {
+                    format!("{ip}/32")
+                } else {
+                    format!("{ip}/128")
+                };
+                server_ips.push(cidr);
             } else if !h.is_empty() {
                 server_domains.push(h);
+            }
+        }
+        if !opts.proxy_mode && !server_ips.is_empty() {
+            if let Some(tun_obj) = inbounds.first_mut().and_then(Value::as_object_mut)
+                && let Some(Value::Array(excl)) = tun_obj.get_mut("route_exclude_address")
+            {
+                for cidr in &server_ips {
+                    excl.push(Value::String(cidr.clone()));
+                }
             }
         }
         if !server_ips.is_empty() {
@@ -2088,43 +2145,88 @@ impl VpnManager {
         #[cfg(target_os = "windows")]
         refresh_cached_windows_phys_ifindex();
 
-        // Start in-process core-runtime first
         let mut started_in_proc: Option<BoxInstance> = None;
         let mut started_worker: Option<Child> = None;
 
-        match core_runtime::start(&cfg_val).await {
-            Ok(bx) => {
-                started_in_proc = Some(bx);
-            }
-            Err(err) => {
-                let err_str = format!("{err:#}");
-                let need_elevation = !opts.proxy_mode
-                    && (err_str.to_ascii_lowercase().contains("permission")
-                        || err_str.to_ascii_lowercase().contains("operation not permitted")
-                        || err_str.to_ascii_lowercase().contains("access is denied")
-                        || err_str.to_ascii_lowercase().contains("eperm")
-                        || err_str.to_ascii_lowercase().contains("eacces")
-                        || err_str.to_ascii_lowercase().contains("tun"));
+        // On Windows/macOS/Linux, opening a TUN adapter (Wintun / utun / /dev/net/tun)
+        // requires administrator/root privileges. Note that `core_runtime::inbound::tun::Tun::bind`
+        // logs a warning and falls back to `PlatformTun::Passive` instead of returning `Err`
+        // when the process is not elevated! Therefore, if `opts.proxy_mode == false` and the
+        // current process is not elevated (or on Windows lacks an active Wintun outbound interface
+        // after `start()`), we must spawn the elevated worker `--run-core` so TUN actually routes traffic.
+        let try_in_proc_first = opts.proxy_mode || opts.block_only || is_current_process_elevated();
 
-                if need_elevation {
-                    match spawn_elevated_worker(&cfg_path, &self.secret).await {
-                        Ok(child) => {
-                            started_worker = Some(child);
+        if try_in_proc_first {
+            match core_runtime::start(&cfg_val).await {
+                Ok(mut bx) => {
+                    #[cfg(target_os = "windows")]
+                    let tun_failed_passively = !opts.proxy_mode
+                        && !opts.block_only
+                        && core_runtime::inbound::tun::active_win_outbound_if_index().is_none();
+                    #[cfg(not(target_os = "windows"))]
+                    let tun_failed_passively = false;
+
+                    if tun_failed_passively {
+                        bx.shutdown_wait().await;
+                        match spawn_elevated_worker(&cfg_path, &self.secret).await {
+                            Ok(child) => {
+                                started_worker = Some(child);
+                            }
+                            Err(elev_err) => {
+                                self.emit_vpn(json!({
+                                    "state": "error",
+                                    "error": format!("Не удалось поднять TUN-интерфейс ({elev_err}). Вы можете переключиться в режим «Системный прокси» или выдать права администратора.")
+                                }));
+                                return;
+                            }
                         }
-                        Err(elev_err) => {
-                            self.emit_vpn(json!({
-                                "state": "error",
-                                "error": format!("Не удалось поднять TUN-интерфейс ({elev_err}). Вы можете переключиться в режим «Системный прокси» или выдать права администратора."),
-                                "details": err_str
-                            }));
-                            return;
-                        }
+                    } else {
+                        started_in_proc = Some(bx);
                     }
-                } else {
+                }
+                Err(err) => {
+                    let err_str = format!("{err:#}");
+                    let need_elevation = !opts.proxy_mode
+                        && (err_str.to_ascii_lowercase().contains("permission")
+                            || err_str.to_ascii_lowercase().contains("operation not permitted")
+                            || err_str.to_ascii_lowercase().contains("access is denied")
+                            || err_str.to_ascii_lowercase().contains("eperm")
+                            || err_str.to_ascii_lowercase().contains("eacces")
+                            || err_str.to_ascii_lowercase().contains("tun"));
+
+                    if need_elevation {
+                        match spawn_elevated_worker(&cfg_path, &self.secret).await {
+                            Ok(child) => {
+                                started_worker = Some(child);
+                            }
+                            Err(elev_err) => {
+                                self.emit_vpn(json!({
+                                    "state": "error",
+                                    "error": format!("Не удалось поднять TUN-интерфейс ({elev_err}). Вы можете переключиться в режим «Системный прокси» или выдать права администратора."),
+                                    "details": err_str
+                                }));
+                                return;
+                            }
+                        }
+                    } else {
+                        self.emit_vpn(json!({
+                            "state": "error",
+                            "error": format!("Ошибка запуска ядра: {err}"),
+                            "details": err_str
+                        }));
+                        return;
+                    }
+                }
+            }
+        } else {
+            match spawn_elevated_worker(&cfg_path, &self.secret).await {
+                Ok(child) => {
+                    started_worker = Some(child);
+                }
+                Err(elev_err) => {
                     self.emit_vpn(json!({
                         "state": "error",
-                        "error": format!("Ошибка запуска ядра: {err}"),
-                        "details": err_str
+                        "error": format!("Не удалось поднять TUN-интерфейс ({elev_err}). Вы можете переключиться в режим «Системный прокси» или выдать права администратора.")
                     }));
                     return;
                 }
@@ -2444,7 +2546,23 @@ impl VpnManager {
     }
 
     pub async fn import_subscription(&self, input: String) {
-        let input = input.trim();
+        let raw_trimmed = input.trim();
+        let (actual_input, custom_handle_opt) = if raw_trimmed.starts_with('{')
+            && let Ok(doc) = serde_json::from_str::<Value>(raw_trimmed)
+            && let Some(u) = doc.get("url").and_then(Value::as_str)
+        {
+            let h = doc
+                .get("handle")
+                .or_else(|| doc.get("name"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            (u.trim().to_string(), h)
+        } else {
+            (raw_trimmed.to_string(), None)
+        };
+        let input = actual_input.as_str();
         if input.is_empty() {
             self.emit(format!("sub:{}", json!({ "error": "Пустая ссылка" })));
             return;
@@ -2458,12 +2576,16 @@ impl VpnManager {
         // Single share link, balancer URI, inline node, or offline container/bundle
         if !resolved.starts_with("http://") && !resolved.starts_with("https://") {
             if let Some(bal) = decode_balancer_uri(resolved) {
-                let name = if bal.name.trim().is_empty() {
+                let name = if let Some(h) = &custom_handle_opt {
+                    h.clone()
+                } else if bal.name.trim().is_empty() {
                     "Балансировщик".to_string()
                 } else {
                     bal.name.clone()
                 };
                 let payload = json!({
+                    "handle": name,
+                    "url": input,
                     "user": { "handle": name },
                     "servers": [{
                         "id": "custom-bal-1",
@@ -2479,12 +2601,13 @@ impl VpnManager {
                 return;
             }
             if let Some(val) = decode_inline_node_uri(resolved) {
-                let tag = val
-                    .get("tag")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
+                let tag = custom_handle_opt
+                    .as_deref()
+                    .or_else(|| val.get("tag").and_then(Value::as_str).filter(|s| !s.is_empty()))
                     .unwrap_or("Сервер");
                 let payload = json!({
+                    "handle": tag,
+                    "url": input,
                     "user": { "handle": tag },
                     "servers": [{
                         "id": "custom-1",
@@ -2503,22 +2626,22 @@ impl VpnManager {
                     .into_iter()
                     .filter(|n| !is_stub_or_dummy_outbound(n))
                     .collect();
-                let is_container = input.starts_with("vpn://")
-                    || input.starts_with("happ://")
+                let is_container = input.starts_with("happ://")
                     || input.starts_with("v2raytun://")
                     || input.starts_with("incy://")
                     || input.starts_with("fptn:")
-                    || input.starts_with("fptnb:")
-                    || resolved.contains('\n');
+                    || input.starts_with("fptnb:");
                 if real_nodes.len() >= 2 || (is_container && !real_nodes.is_empty()) {
                     let meta = extract_subscription_metadata(resolved, None, None);
-                    let handle = meta
-                        .profile_title
-                        .filter(|s| !s.is_empty())
+                    let handle = custom_handle_opt
+                        .clone()
+                        .or(meta.profile_title.filter(|s| !s.is_empty()))
                         .unwrap_or_else(|| "Подписка".to_string());
                     let servers = build_subscription_servers_list(&real_nodes, &handle);
                     if !servers.is_empty() {
                         let result = json!({
+                            "handle": handle,
+                            "url": input,
                             "user": { "handle": handle },
                             "subscription": {
                                 "status": "active",
@@ -2532,13 +2655,18 @@ impl VpnManager {
                     }
                 } else if real_nodes.len() == 1 {
                     let node = &real_nodes[0];
-                    let tag = node
-                        .get("tag")
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.is_empty())
+                    let tag = custom_handle_opt
+                        .as_deref()
+                        .or_else(|| {
+                            node.get("tag")
+                                .and_then(Value::as_str)
+                                .filter(|s| !s.is_empty())
+                        })
                         .unwrap_or("Сервер");
                     let uri = node_to_share_link(node).unwrap_or_else(|| resolved.to_string());
                     let payload = json!({
+                        "handle": tag,
+                        "url": input,
                         "user": { "handle": tag },
                         "servers": [{
                             "id": "custom-1",
@@ -2553,12 +2681,13 @@ impl VpnManager {
             }
             match parse_share_uri(resolved) {
                 Ok(val) => {
-                    let tag = val
-                        .get("tag")
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.is_empty())
+                    let tag = custom_handle_opt
+                        .as_deref()
+                        .or_else(|| val.get("tag").and_then(Value::as_str).filter(|s| !s.is_empty()))
                         .unwrap_or("Сервер");
                     let payload = json!({
+                        "handle": tag,
+                        "url": input,
                         "user": { "handle": tag },
                         "servers": [{
                             "id": "custom-1",
@@ -2620,8 +2749,8 @@ impl VpnManager {
         };
 
         let meta = fetched.metadata;
-        let handle = meta
-            .profile_title
+        let handle = custom_handle_opt
+            .or(meta.profile_title)
             .or(meta.file_name)
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "Подписка".to_string());
@@ -2635,11 +2764,16 @@ impl VpnManager {
             ));
             return;
         }
-        let (traffic_used, traffic_total) = if let Some(ui) = fetched.user_info {
-            (ui.upload.saturating_add(ui.download), ui.total)
+        let (traffic_used, traffic_total, expire_unix) = if let Some(ui) = fetched.user_info {
+            (
+                ui.upload.saturating_add(ui.download),
+                ui.total,
+                if ui.expire > 0 { Some(ui.expire) } else { None },
+            )
         } else {
             let mut u = 0u64;
             let mut t = 0u64;
+            let mut ex = None;
             if let Some(ref ui_raw) = meta.user_info_raw {
                 for part in ui_raw.split(';') {
                     if let Some((k, v)) = part.trim().split_once('=') {
@@ -2647,21 +2781,34 @@ impl VpnManager {
                             match k.trim() {
                                 "upload" | "download" => u += num,
                                 "total" => t = num,
+                                "expire" if num > 0 => ex = Some(num),
                                 _ => {}
                             }
                         }
                     }
                 }
             }
-            (u, t)
+            (u, t, ex)
         };
 
         let result = json!({
+            "handle": handle,
+            "url": input,
             "user": { "handle": handle },
+            "meta": {
+                "title": handle,
+                "usedBytes": traffic_used,
+                "totalBytes": traffic_total,
+                "expireUnix": expire_unix,
+                "supportUrl": meta.support_url,
+                "webPageUrl": meta.web_page_url,
+                "announce": meta.announce
+            },
             "subscription": {
                 "status": "active",
                 "trafficUsed": traffic_used,
-                "trafficTotal": traffic_total
+                "trafficTotal": traffic_total,
+                "expireUnix": expire_unix
             },
             "servers": servers
         });
@@ -2740,11 +2887,41 @@ impl VpnManager {
             .and_then(Value::as_str)
             .unwrap_or("bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=");
 
+        let peer_endpoint = cfg
+            .pointer("/peers/0/endpoint/v4")
+            .and_then(Value::as_str)
+            .or_else(|| cfg.pointer("/peers/0/endpoint/host").and_then(Value::as_str))
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| {
+                let st = s.trim();
+                if let Some((h, p)) = st.rsplit_once(':') {
+                    let port_num = p.trim().parse::<u16>().unwrap_or(0);
+                    if port_num == 0 {
+                        format!("{}:2408", h.trim())
+                    } else {
+                        st.to_string()
+                    }
+                } else {
+                    format!("{st}:2408")
+                }
+            })
+            .unwrap_or_else(|| "188.114.96.1:2408".to_string());
+
+        let reserved_param = cfg
+            .get("client_id")
+            .and_then(Value::as_str)
+            .and_then(|cid| B64.decode(cid.trim()).ok())
+            .filter(|b| b.len() >= 3)
+            .map(|b| format!("&reserved={},{},{}", b[0], b[1], b[2]))
+            .unwrap_or_default();
+
         let awg_uri = format!(
-            "amneziawg://{}@162.159.192.1:2408?pub={}&ip={}&mtu=1280&jc=4&jmin=40&jmax=70&s1=0&s2=0&h1=1&h2=2&h3=3&h4=4#Cloudflare%20WARP%20(AmneziaWG)",
+            "awg://{}@{}?publickey={}&address={}{}&mtu=1280&jc=4&jmin=40&jmax=70&s1=0&s2=0&h1=1&h2=2&h3=3&h4=4#Cloudflare%20WARP%20(AmneziaWG)",
             core_config::subscription::percent_encode_component(&priv_b64),
+            peer_endpoint,
             core_config::subscription::percent_encode_component(peer_pub),
             core_config::subscription::percent_encode_component(&client_ip),
+            reserved_param,
         );
 
         json!({
@@ -3620,6 +3797,21 @@ async fn probe_proxy_delay(secret: &str) -> Option<u64> {
     None
 }
 
+fn is_current_process_elevated() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        #[link(name = "shell32")]
+        unsafe extern "system" {
+            fn IsUserAnAdmin() -> i32;
+        }
+        unsafe { IsUserAnAdmin() != 0 }
+    }
+    #[cfg(unix)]
+    {
+        unsafe { libc::geteuid() == 0 }
+    }
+}
+
 async fn spawn_elevated_worker(cfg_path: &Path, secret: &str) -> Result<Child, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let cfg_str = cfg_path.to_string_lossy().into_owned();
@@ -3697,6 +3889,111 @@ async fn spawn_elevated_worker(cfg_path: &Path, secret: &str) -> Result<Child, S
 
     let _ = child.kill();
     Err("Таймаут ожидания запуска привилегированного процесса".to_string())
+}
+
+pub async fn icmp_or_tcp_ping_ms(host: &str, timeout_ms: u64) -> i64 {
+    let host_owned = host.trim().trim_matches(['[', ']']).to_string();
+    #[cfg(target_os = "windows")]
+    {
+        let h = host_owned.clone();
+        let res = tokio::task::spawn_blocking(move || windows_icmp_ping_ms(&h, timeout_ms))
+            .await
+            .ok()
+            .flatten();
+        if let Some(ms) = res {
+            return ms;
+        }
+    }
+    let ms443 = tcp_connect_ms(&host_owned, 443, timeout_ms / 2).await;
+    if ms443 > 0 {
+        return ms443;
+    }
+    let ms80 = tcp_connect_ms(&host_owned, 80, timeout_ms / 2).await;
+    if ms80 > 0 {
+        return ms80;
+    }
+    tcp_connect_ms(&host_owned, 22, timeout_ms / 2).await
+}
+
+#[cfg(target_os = "windows")]
+fn windows_icmp_ping_ms(host: &str, timeout_ms: u64) -> Option<i64> {
+    use std::ffi::c_void;
+    #[repr(C)]
+    struct IpOptionInformation {
+        ttl: u8,
+        tos: u8,
+        flags: u8,
+        options_size: u8,
+        options_data: *mut u8,
+    }
+    #[repr(C)]
+    struct IcmpEchoReply {
+        address: u32,
+        status: u32,
+        round_trip_time: u32,
+        data_size: u16,
+        reserved: u16,
+        data: *mut c_void,
+        options: IpOptionInformation,
+    }
+    #[link(name = "iphlpapi")]
+    unsafe extern "system" {
+        fn IcmpCreateFile() -> *mut c_void;
+        fn IcmpCloseHandle(icmp_handle: *mut c_void) -> i32;
+        fn IcmpSendEcho(
+            icmp_handle: *mut c_void,
+            destination_address: u32,
+            request_data: *const u8,
+            request_size: u16,
+            request_options: *const IpOptionInformation,
+            reply_buffer: *mut u8,
+            reply_size: u32,
+            timeout: u32,
+        ) -> u32;
+    }
+
+    let ipv4 = if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+        ip
+    } else {
+        let mut addrs = (host, 0u16).to_socket_addrs().ok()?;
+        addrs.find_map(|a| match a.ip() {
+            IpAddr::V4(v4) if !is_fake_or_tun_ip(IpAddr::V4(v4)) => Some(v4),
+            _ => None,
+        })?
+    };
+
+    let dest_in_addr = u32::from_ne_bytes(ipv4.octets());
+    let handle = unsafe { IcmpCreateFile() };
+    if handle.is_null() || handle == (-1isize as *mut c_void) {
+        return None;
+    }
+    let payload = b"tachyon";
+    let mut reply_buf = vec![0u8; std::mem::size_of::<IcmpEchoReply>() + payload.len() + 32];
+    let sw = Instant::now();
+    let count = unsafe {
+        IcmpSendEcho(
+            handle,
+            dest_in_addr,
+            payload.as_ptr(),
+            payload.len() as u16,
+            std::ptr::null(),
+            reply_buf.as_mut_ptr(),
+            reply_buf.len() as u32,
+            timeout_ms.clamp(200, 5000) as u32,
+        )
+    };
+    let elapsed_ms = sw.elapsed().as_millis() as i64;
+    unsafe {
+        IcmpCloseHandle(handle);
+    }
+    if count > 0 {
+        let reply = unsafe { &*(reply_buf.as_ptr() as *const IcmpEchoReply) };
+        if reply.status == 0 {
+            let rtt = (reply.round_trip_time as i64).max(elapsed_ms).max(1);
+            return Some(rtt);
+        }
+    }
+    None
 }
 
 pub async fn tcp_connect_ms(host: &str, port: u16, timeout_ms: u64) -> i64 {
@@ -4552,6 +4849,189 @@ mod tests {
         let srv_list = build_subscription_servers_list(&stub_and_real, "Test040");
         assert_eq!(srv_list.len(), 1);
         assert_eq!(srv_list[0]["name"], json!("FPTN-NL"));
+    }
+
+    #[test]
+    fn test_awg_all_versions_and_formats() {
+        use base64::Engine as _;
+        use flate2::{Compression, write::ZlibEncoder};
+        use std::io::Write as _;
+
+        let mgr = VpnManager::new(Arc::new(|_| {}));
+        let priv_k = "YAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=";
+        let pub_k = "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=";
+        let hpk = "aGVsbG8td29ybGQtaGVsbG8td29ybGQtaGVsbG8td28=";
+
+        // 1. AWG 1.0 / 1.5 / 2.0 / 3.x full .conf (multiline)
+        let awg2_conf = format!(
+            "[Interface]\n\
+             PrivateKey = {priv_k}\n\
+             Address = 10.8.1.2/32\n\
+             MTU = 1360\n\
+             Jc = 5\n\
+             Jmin = 50\n\
+             Jmax = 1000\n\
+             S1 = 24\n\
+             S2 = 32\n\
+             S3 = 16\n\
+             S4 = 20\n\
+             H1 = 100-200\n\
+             H2 = 300-400\n\
+             H3 = 500-600\n\
+             H4 = 700-800\n\
+             I1 = <b 0xc000000001><rc 8>\n\
+             ID = example.com\n\
+             IP = quic\n\
+             HeaderProtectionKey = {hpk}\n\
+             ContentPaddingAddition = 0-64\n\
+             RandomTrailers = true\n\
+             DisableCookies = 1\n\
+             \n\
+             [Peer]\n\
+             PublicKey = {pub_k}\n\
+             Endpoint = 198.51.100.77:51820\n\
+             AllowedIPs = 0.0.0.0/0, ::/0\n\
+             PersistentKeepalive = 25\n"
+        );
+
+        let nodes =
+            parse_subscription_payload_with_hwid(&awg2_conf, None, None).expect("parse awg2 conf");
+        assert_eq!(nodes.len(), 1);
+        let share_link = node_to_share_link(&nodes[0]).expect("awg2 node_to_share_link");
+        assert!(
+            share_link.starts_with("awg://"),
+            "expected awg:// scheme, got {share_link}"
+        );
+
+        let opts = ConnectOptions::parse(&share_link).expect("ConnectOptions::parse awg2 link");
+        let (cfg, _) = mgr
+            .build_config(&opts)
+            .expect("build_config awg2 link");
+        core_config::check_str(&cfg.to_string()).expect("core_config::check_str awg2");
+
+        // 2. Single-line pasted .conf (when browser <input> strips newlines)
+        let single_line_conf = awg2_conf.replace('\n', " ");
+        let sl_nodes = parse_subscription_payload_with_hwid(&single_line_conf, None, None)
+            .expect("parse single-line pasted .conf");
+        assert_eq!(sl_nodes.len(), 1);
+        let sl_link = node_to_share_link(&sl_nodes[0]).expect("sl_link");
+        assert!(sl_link.starts_with("awg://"));
+
+        // 3. Direct ConnectOptions::parse with raw .conf
+        let raw_conf_opts =
+            ConnectOptions::parse(&awg2_conf).expect("ConnectOptions::parse raw .conf");
+        let (raw_conf_cfg, _) = mgr
+            .build_config(&raw_conf_opts)
+            .expect("build_config raw .conf");
+        core_config::check_str(&raw_conf_cfg.to_string()).expect("check_str raw .conf");
+
+        // 4. Amnezia `vpn://` Qt qCompress container with `amnezia-awg2`
+        let amnezia_json = json!({
+            "containers": [{
+                "container": "amnezia-awg2",
+                "awg": {
+                    "last_config": awg2_conf
+                }
+            }],
+            "defaultContainer": "amnezia-awg2",
+            "description": "Amnezia AWG 2.0 Server",
+            "hostName": "198.51.100.77"
+        })
+        .to_string();
+        let raw_bytes = amnezia_json.as_bytes();
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(raw_bytes).unwrap();
+        let compressed = enc.finish().unwrap();
+        let mut qcompress_buf = Vec::with_capacity(4 + compressed.len());
+        qcompress_buf.extend_from_slice(&(raw_bytes.len() as u32).to_be_bytes());
+        qcompress_buf.extend_from_slice(&compressed);
+        let vpn_uri = format!(
+            "vpn://{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&qcompress_buf)
+        );
+
+        let vpn_nodes =
+            parse_subscription_payload_with_hwid(&vpn_uri, None, None).expect("parse vpn://");
+        assert_eq!(vpn_nodes.len(), 1);
+        let vpn_link = node_to_share_link(&vpn_nodes[0]).expect("vpn:// node_to_share_link");
+        assert!(vpn_link.starts_with("awg://"));
+        let vpn_opts = ConnectOptions::parse(&vpn_link).expect("ConnectOptions vpn_link");
+        let (vpn_cfg, _) = mgr
+            .build_config(&vpn_opts)
+            .expect("build_config vpn_link");
+        core_config::check_str(&vpn_cfg.to_string()).expect("check_str vpn_link");
+
+        // 5. Legacy `amneziawg://...?pub=...&ip=172.16.0.2/32` URI (must not collide with AWG masque `ip`)
+        let legacy_warp_uri = format!(
+            "amneziawg://{}@162.159.192.1:2408?pub={}&ip=172.16.0.2/32&mtu=1280&jc=4&jmin=40&jmax=70&s1=0&s2=0&h1=1&h2=2&h3=3&h4=4#WARP",
+            core_config::subscription::percent_encode_component(priv_k),
+            core_config::subscription::percent_encode_component(pub_k),
+        );
+        let warp_opts =
+            ConnectOptions::parse(&legacy_warp_uri).expect("ConnectOptions legacy_warp_uri");
+        let (warp_cfg, _) = mgr
+            .build_config(&warp_opts)
+            .expect("build_config legacy_warp_uri");
+        core_config::check_str(&warp_cfg.to_string()).expect("check_str legacy_warp_uri");
+        assert!(warp_cfg["endpoints"][0].get("ip").is_none());
+
+        // 6. End-to-end integration test: PersistedState::build_connect_payload -> ConnectOptions::parse -> build_config
+        let mut st = crate::state::PersistedState::default();
+        st.servers.push(crate::state::ServerNode {
+            id: "node-awg-1".to_string(),
+            name: "Cloudflare WARP (AWG)".to_string(),
+            vless: share_link.clone(),
+            country: "us".to_string(),
+            sub_id: None,
+            is_balancer: false,
+            balancer_mode: None,
+            member_count: None,
+            ping_ms: Some(18),
+            alive: Some(true),
+        });
+        st.active_id = "node-awg-1".to_string();
+        st.vpn_prefs.mode = "tun".to_string();
+        st.vpn_prefs.route = "all".to_string();
+        st.desync_prefs.enabled = true;
+        st.desync_prefs.preset = "auto".to_string();
+        let json_payload = st.build_connect_payload(None);
+        let parsed_opts =
+            ConnectOptions::parse(&json_payload).expect("ConnectOptions from PersistedState");
+        assert!(!parsed_opts.proxy_mode && !parsed_opts.block_only);
+        assert_eq!(parsed_opts.route, RouteMode::All);
+        assert!(parsed_opts.desync.enabled);
+        let (state_cfg, _) = mgr
+            .build_config(&parsed_opts)
+            .expect("build_config from PersistedState");
+        core_config::check_str(&state_cfg.to_string()).expect("check_str from PersistedState");
+        assert_eq!(state_cfg["endpoints"][0]["type"], "wireguard");
+        // Verify TUN MTU is clamped down to the AWG endpoint MTU (1360)
+        assert_eq!(state_cfg["inbounds"][0]["mtu"], 1360);
+
+        // 7. Desync-only mode WITHOUT any subscription or server nodes
+        let empty_st = crate::state::PersistedState::default();
+        assert!(empty_st.servers.is_empty());
+        assert!(empty_st.subscriptions.is_empty());
+        let desync_only_payload = empty_st.build_connect_payload(None);
+        let desync_only_opts = ConnectOptions::parse(&desync_only_payload)
+            .expect("ConnectOptions for desync-only without servers");
+        assert_eq!(desync_only_opts.route, RouteMode::DesyncOnly);
+        assert!(desync_only_opts.vless.is_empty());
+        assert!(desync_only_opts.desync.enabled);
+        let (desync_only_cfg, has_main_node) = mgr
+            .build_config(&desync_only_opts)
+            .expect("build_config for desync-only without servers");
+        assert!(!has_main_node);
+        core_config::check_str(&desync_only_cfg.to_string())
+            .expect("check_str for desync-only without servers");
+        assert_eq!(desync_only_cfg["route"]["final"], "DESYNC");
+        assert!(
+            desync_only_cfg["outbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|o| o["tag"] == "DESYNC")
+        );
     }
 }
 

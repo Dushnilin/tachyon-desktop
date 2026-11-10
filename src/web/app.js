@@ -332,11 +332,14 @@
     if (low.startsWith('amneziawg://') || low.startsWith('awg://')) {
       res.proto = 'AWG';
       res.trans = 'UDP';
+      res.port = 51820;
       res.tags = ['AWG'];
     } else if (low.startsWith('wireguard://') || low.startsWith('wg://')) {
-      res.proto = 'WG';
+      const isAwg = /[?&](jc|jmin|jmax|s1|s2|s3|s4|h1|h2|h3|h4|i1|i2|i3|i4|i5|awg_ip|header_protection_key|hpk|content_padding_addition)=/i.test(low);
+      res.proto = isAwg ? 'AWG' : 'WG';
       res.trans = 'UDP';
-      res.tags = ['WG'];
+      res.port = 51820;
+      res.tags = [isAwg ? 'AWG' : 'WG'];
     } else if (low.startsWith('wdtt://') || low.startsWith('qwdtt://') || low.startsWith('csqtt://')) {
       res.proto = 'WDTT';
       res.sec = 'NOISE';
@@ -854,12 +857,12 @@
     subInput.value = '';
     subNameInput.value = '';
     if (isNodeOnly) {
-      $('#addSubTitle').textContent = 'Добавить ключ узла';
-      subInput.placeholder = 'vless://, awg://, wg://, wdtt://, tewfai://, tuic://, ss://, hy2://';
-      subNameInput.placeholder = 'Название узла (например: NL-1)';
+      $('#addSubTitle').textContent = 'Добавить ключ или .conf (WireGuard / AmneziaWG)';
+      subInput.placeholder = 'vpn://, awg://, wg://, vless://, wdtt://, tewfai://, tuic://, ss://, hy2:// или текст файла .conf ([Interface] … [Peer])';
+      subNameInput.placeholder = 'Название узла (например: AWG NL-1)';
     } else {
-      $('#addSubTitle').textContent = 'Добавить подписку';
-      subInput.placeholder = 'URL подписки (https://…), happ://, vpn:// или ключ';
+      $('#addSubTitle').textContent = 'Добавить подписку или конфигурацию';
+      subInput.placeholder = 'URL подписки (https://…), happ://, vpn://, ключ или текст .conf';
       subNameInput.placeholder = 'Название (например: Основная)';
     }
     subInput.focus();
@@ -871,11 +874,66 @@
   $('#cancelSubBtn')?.addEventListener('click', () => { if (addSubCard) addSubCard.hidden = true; });
 
   let pendingImport = null;
+  const confFileQueue = [];
+
+  function processNextConfFile() {
+    if (pendingImport || !confFileQueue.length) return;
+    const item = confFileQueue.shift();
+    toast(`Импорт «${item.name}»…`);
+    pendingImport = { name: item.name, input: item.content };
+    window.API.importSubscription(item.content);
+  }
+
+  function importFilesList(fileList) {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+    let remaining = files.length;
+    for (const file of files) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const content = String(reader.result || '').trim();
+        if (content) {
+          const cleanFileName = String(file.name || 'AWG')
+            .replace(/\.(conf|vpn|json|txt|yaml|yml)$/i, '')
+            .trim();
+          confFileQueue.push({ name: cleanFileName || 'AWG', content });
+        }
+        remaining -= 1;
+        if (remaining <= 0) processNextConfFile();
+      };
+      reader.onerror = () => {
+        remaining -= 1;
+        if (remaining <= 0) processNextConfFile();
+      };
+      reader.readAsText(file);
+    }
+  }
+
+  const confFileInput = $('#confFileInput');
+  $('#importConfFileBtn')?.addEventListener('click', () => confFileInput?.click());
+  $('#pickConfFromModalBtn')?.addEventListener('click', () => confFileInput?.click());
+  confFileInput?.addEventListener('change', (e) => {
+    importFilesList(e.target?.files);
+    e.target.value = '';
+  });
+
+  window.addEventListener('dragover', (e) => {
+    if (e.dataTransfer?.types?.includes('Files')) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+    }
+  });
+  window.addEventListener('drop', (e) => {
+    if (e.dataTransfer?.files?.length) {
+      e.preventDefault();
+      importFilesList(e.dataTransfer.files);
+    }
+  });
 
   $('#saveSubBtn')?.addEventListener('click', () => {
     const input = (subInput?.value || '').trim();
     const name = (subNameInput?.value || '').trim();
-    if (!input) { toast('Вставьте ссылку на подписку или ключ', true); return; }
+    if (!input) { toast('Вставьте ссылку, vpn:// или текст .conf', true); return; }
 
     toast('Загрузка конфигурации…');
     pendingImport = { name, input };
@@ -886,6 +944,7 @@
     if (res.error) {
       toast('Ошибка: ' + res.error, true);
       pendingImport = null;
+      processNextConfFile();
       return;
     }
 
@@ -893,6 +952,7 @@
     if (!srvs.length) {
       toast('Не найдено узлов в ответе', true);
       pendingImport = null;
+      processNextConfFile();
       return;
     }
 
@@ -902,8 +962,7 @@
                                 low.startsWith('https://') ||
                                 low.startsWith('happ://') ||
                                 low.startsWith('v2raytun://') ||
-                                low.startsWith('incy://') ||
-                                low.startsWith('vpn://');
+                                low.startsWith('incy://');
       const isSingleNode = !isRemoteOrSubLink && srvs.length === 1 && !srvs[0]?.isBalancer;
 
       if (isSingleNode) {
@@ -957,6 +1016,7 @@
       pendingImport = null;
       renderSubscriptions();
       loadAllServers();
+      processNextConfFile();
     } else if (activeUpdatingSubId) {
       const subs = window.API.getSubscriptions();
       const target = subs.find(x => x.id === activeUpdatingSubId);
@@ -1083,6 +1143,7 @@
     if (pf === 'XHTTP') return m.trans === 'XHTTP';
     if (pf === 'TCP') return m.trans === 'TCP' && m.proto === 'VLESS';
     if (pf === 'WS_GRPC') return m.trans === 'WS' || m.trans === 'GRPC';
+    if (pf === 'AWG') return m.proto === 'AWG' || m.proto === 'WG';
     return m.proto === pf;
   }
 
@@ -1682,6 +1743,7 @@
     homeBtn?.classList.add('btn-act--primary');
 
     /* Группируем отфильтрованные узлы по host:port, чтобы не пинговать одинаковые IP многократно */
+    const UDP_ONLY_PROTOS = new Set(['AWG', 'WG', 'HY2', 'TUIC', 'QUIC', 'WDTT']);
     const endpointMap = new Map();
     const balancerTargets = [];
     for (const s of cleanTargetList) {
@@ -1692,16 +1754,17 @@
           const mm = parseNodeMeta(m?.uri || '');
           if (!mm.host) continue;
           const key = `${mm.host.toLowerCase()}:${mm.port}`;
-          if (!endpointMap.has(key)) endpointMap.set(key, { host: mm.host, port: mm.port, nodes: [], balancers: [] });
+          if (!endpointMap.has(key)) endpointMap.set(key, { host: mm.host, port: mm.port, udpOnly: UDP_ONLY_PROTOS.has(mm.proto), nodes: [], balancers: [] });
           endpointMap.get(key).balancers.push(s);
         }
         continue;
       }
       const host = s.meta?.host || extractHost(s.vless);
       const port = s.meta?.port || 443;
+      const proto = s.meta?.proto || detectProtocol(s.vless);
       if (!host || host === 'balancer.tachyon.internal') continue;
       const key = `${host.toLowerCase()}:${port}`;
-      if (!endpointMap.has(key)) endpointMap.set(key, { host, port, nodes: [], balancers: [] });
+      if (!endpointMap.has(key)) endpointMap.set(key, { host, port, udpOnly: UDP_ONLY_PROTOS.has(proto), nodes: [], balancers: [] });
       endpointMap.get(key).nodes.push(s);
     }
     for (const b of balancerTargets) b.ping = null;
@@ -1722,9 +1785,17 @@
     async function worker() {
       while (!pingJobAbort && idx < total) {
         const item = tasks[idx++];
-        let ms = await window.API.nativeTcpPing(item.host, item.port, 2400);
-        if (ms == null) {
-          ms = await window.API.nativePing(item.host, 1800);
+        let ms = null;
+        if (item.udpOnly) {
+          ms = await window.API.nativePing(item.host, 2000);
+          if (ms == null) {
+            ms = await window.API.nativeTcpPing(item.host, item.port, 1500);
+          }
+        } else {
+          ms = await window.API.nativeTcpPing(item.host, item.port, 2400);
+          if (ms == null) {
+            ms = await window.API.nativePing(item.host, 1800);
+          }
         }
         done++;
         if (ms != null && ms > 0) {
@@ -3798,15 +3869,19 @@
     }
     const host = s.meta?.host || extractHost(s.vless);
     const port = s.meta?.port || 443;
+    const proto = s.meta?.proto || detectProtocol(s.vless);
+    const isUdpProto = ['AWG', 'WG', 'HY2', 'TUIC', 'QUIC', 'WDTT'].includes(proto);
     toast(`Проверка задержки до ${s.name}…`);
-    const ms = await window.API.pingHost(host, port);
+    const ms = isUdpProto
+      ? (await window.API.nativePing(host, 2000) ?? await window.API.pingHost(host, port))
+      : await window.API.pingHost(host, port);
     if (ms != null && ms > 0) {
       s.ping = ms;
       $('#mPing').textContent = ms;
       pushPingSparkline(ms);
       toast(`${s.name}: отклик ${ms} мс`);
     } else {
-      toast(`${s.name}: узел не ответил на TCP-пинг`, true);
+      toast(`${s.name}: узел не ответил на проверку`, true);
     }
   });
 
@@ -3924,47 +3999,8 @@
   });
 
   /* ============================================================
-     ГЕНЕРАТОР CLOUDFLARE WARP (AMNEZIAWG) & БЕСПЛАТНЫЙ ПУЛ SHARD
+     БЕСПЛАТНЫЙ ПУЛ SHARD
      ============================================================ */
-  $('#createWarpAwgBtn')?.addEventListener('click', async () => {
-    const btn = $('#createWarpAwgBtn');
-    const txt = $('#createWarpAwgTxt');
-    if (btn) btn.disabled = true;
-    if (txt) txt.textContent = 'WARP…';
-    toast('Генерация ключей X25519 и регистрация Cloudflare WARP (AmneziaWG)…');
-    try {
-      const res = await window.API.createWarpAwg();
-      if (res && res.ok && res.uri) {
-        const customs = window.API.getCustomNodes();
-        const newId = 'custom_' + Date.now();
-        customs.unshift({
-          id: newId,
-          name: cleanServerName(res.name || 'Cloudflare WARP (AWG)'),
-          country: 'us',
-          code: 'US',
-          vless: res.uri,
-          ping: null
-        });
-        window.API.saveCustomNodes(customs);
-        activeId = newId;
-        try { localStorage.setItem('tachyon.active_server_id', newId); } catch {}
-        renderSubscriptions();
-        loadAllServers();
-        renderServers($('#nodesSearchInput')?.value || '');
-        syncDetourAndRuleNodeSelects();
-        toast(`Профиль ${res.name || 'Cloudflare WARP AWG'} создан и выбран!`);
-        if (connected) applyReconnectIfActive();
-      } else {
-        toast('Ошибка регистрации WARP: ' + (res?.error || 'Неизвестная ошибка'), true);
-      }
-    } catch (err) {
-      toast('Ошибка генерации WARP: ' + (err?.message || ''), true);
-    } finally {
-      if (btn) btn.disabled = false;
-      if (txt) txt.textContent = 'WARP AWG';
-    }
-  });
-
   $('#loadShardFreeBtn')?.addEventListener('click', () => {
     const freeUrl = 'https://raw.githubusercontent.com/barry-far/V2ray-Config/main/Sub1.txt';
     toast('Загрузка резервного пула бесплатных узлов…');

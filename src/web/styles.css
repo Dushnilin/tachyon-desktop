@@ -1182,8 +1182,15 @@ body {
 .field:focus-within {
   border-color: var(--accent);
 }
-.field .field__ic { width: 16px; height: 16px; color: var(--muted); }
-.field input {
+.field .field__ic { width: 16px; height: 16px; color: var(--muted); flex-shrink: 0; }
+.field--textarea {
+  align-items: flex-start;
+}
+.field--textarea .field__ic {
+  margin-top: 2px;
+}
+.field input,
+.field textarea {
   border: none;
   outline: none;
   background: transparent;
@@ -1193,7 +1200,16 @@ body {
   color: var(--ink);
   user-select: text;
 }
-.field input::placeholder { color: var(--muted); }
+.field textarea {
+  resize: vertical;
+  min-height: 44px;
+  max-height: 180px;
+  line-height: 1.4;
+  font-family: var(--f-mono);
+  font-size: 12px;
+}
+.field input::placeholder,
+.field textarea::placeholder { color: var(--muted); font-family: var(--f-ui); }
 
 .sub-add-card__foot {
   display: flex;

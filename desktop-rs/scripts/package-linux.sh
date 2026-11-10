@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ROOT_DIR="$(cd "${PROJECT_DIR}/.." && pwd)"
 
-VERSION="${1:-0.3.5}"
+VERSION="${1:-0.3.6}"
 ARCH_RAW="$(uname -m)"
 case "${ARCH_RAW}" in
   x86_64|amd64) DEB_ARCH="amd64" ;;
@@ -68,7 +68,7 @@ Version: ${VERSION}
 Section: net
 Priority: optional
 Architecture: ${DEB_ARCH}
-Depends: libwebkit2gtk-4.1-0 | libwebkit2gtk-4.0-37, libgtk-3-0, libcap2-bin, policykit-1
+Depends: libxkbcommon0, libxkbcommon-x11-0, libxcb1, libvulkan1 | mesa-vulkan-drivers, libcap2-bin, policykit-1
 Maintainer: Dushnilin <https://github.com/Dushnilin>
 Description: Tachyon Routing & Tunneling Client (tachyon-core embedded)
  Нативный кроссплатформенный клиент Tachyon со встроенным движком tachyon-core,

@@ -121,6 +121,43 @@ fn main() {
     writeln!(f, "    }}").unwrap();
     writeln!(f, "}}").unwrap();
 
+    let flags_dir = web_dir.join("flags");
+    let flags_dest = out_dir.join("flags_assets.rs");
+    let mut ff = fs::File::create(&flags_dest).unwrap();
+    writeln!(
+        ff,
+        "pub fn get_embedded_flag_svg(cc: &str) -> Option<&'static [u8]> {{"
+    )
+    .unwrap();
+    writeln!(ff, "    match cc.to_ascii_lowercase().as_str() {{").unwrap();
+    if let Ok(entries) = fs::read_dir(&flags_dir) {
+        let mut flag_files: Vec<(String, PathBuf)> = entries
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                if p.extension()?.to_str()? == "svg" {
+                    let stem = p.file_stem()?.to_str()?.to_ascii_lowercase();
+                    Some((stem, p))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        flag_files.sort_by(|a, b| a.0.cmp(&b.0));
+        for (stem, abs) in &flag_files {
+            let abs_escaped = abs.to_string_lossy().replace('\\', "/");
+            writeln!(
+                ff,
+                "        {:?} => Some(include_bytes!({:?})),",
+                stem, abs_escaped
+            )
+            .unwrap();
+        }
+    }
+    writeln!(ff, "        _ => None,").unwrap();
+    writeln!(ff, "    }}").unwrap();
+    writeln!(ff, "}}").unwrap();
+
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         let ico_path = manifest_dir
             .join("..")
