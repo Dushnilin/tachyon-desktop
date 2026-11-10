@@ -128,6 +128,24 @@ pub struct VpnPrefs {
     pub balancer_tolerance: u32,
     #[serde(default = "default_balancer_quota")]
     pub balancer_quota_mib: u32,
+    #[serde(default = "default_balancer_interval")]
+    pub balancer_interval: String,
+    #[serde(default = "default_dns_strategy")]
+    pub dns_strategy: String, // "prefer_ipv4" | "prefer_ipv6" | "ipv4_only" | "ipv6_only"
+    #[serde(default = "default_true")]
+    pub dns_reverse_mapping: bool,
+    #[serde(default = "default_true")]
+    pub route_find_process: bool,
+    #[serde(default = "default_true")]
+    pub route_fullcone_nat: bool,
+    #[serde(default)]
+    pub route_smart_queue: bool,
+    #[serde(default = "default_tun_stack")]
+    pub tun_stack: String, // "mixed" | "system" | "gvisor"
+    #[serde(default)]
+    pub tcp_fast_open: bool,
+    #[serde(default)]
+    pub tcp_multi_path: bool,
 }
 
 fn default_mode() -> String {
@@ -169,6 +187,15 @@ fn default_balancer_tolerance() -> u32 {
 fn default_balancer_quota() -> u32 {
     256
 }
+fn default_balancer_interval() -> String {
+    "3m".to_string()
+}
+fn default_dns_strategy() -> String {
+    "prefer_ipv4".to_string()
+}
+fn default_tun_stack() -> String {
+    "mixed".to_string()
+}
 
 impl Default for VpnPrefs {
     fn default() -> Self {
@@ -198,6 +225,15 @@ impl Default for VpnPrefs {
             balancer_pool: default_balancer_pool(),
             balancer_tolerance: default_balancer_tolerance(),
             balancer_quota_mib: default_balancer_quota(),
+            balancer_interval: default_balancer_interval(),
+            dns_strategy: default_dns_strategy(),
+            dns_reverse_mapping: true,
+            route_find_process: true,
+            route_fullcone_nat: true,
+            route_smart_queue: false,
+            tun_stack: default_tun_stack(),
+            tcp_fast_open: false,
+            tcp_multi_path: false,
         }
     }
 }
@@ -263,6 +299,8 @@ pub struct DesyncPrefs {
     pub discord_udp_fake: bool,
     #[serde(default = "default_true")]
     pub stun_fake: bool,
+    #[serde(default = "default_true")]
+    pub anticheat_bypass: bool,
 }
 
 fn default_desync_preset() -> String {
@@ -328,6 +366,7 @@ impl Default for DesyncPrefs {
             quic_repeats: default_quic_repeats(),
             discord_udp_fake: true,
             stun_fake: true,
+            anticheat_bypass: true,
         }
     }
 }
@@ -770,6 +809,12 @@ pub struct PersistedState {
     pub routed_apps: Vec<String>,
     #[serde(default)]
     pub light_theme: bool,
+    #[serde(default = "default_language")]
+    pub language: String,
+}
+
+fn default_language() -> String {
+    "ru".to_string()
 }
 
 fn default_route_actions() -> BTreeMap<String, String> {
@@ -794,6 +839,7 @@ impl Default for PersistedState {
             custom_rules: Vec::new(),
             routed_apps: Vec::new(),
             light_theme: false,
+            language: default_language(),
         }
     }
 }
@@ -803,6 +849,30 @@ impl PersistedState {
         let base = crate::vpn::app_data_dir();
         let _ = fs::create_dir_all(&base);
         base.join("state.json")
+    }
+
+    pub fn normalize_servers(&mut self) -> bool {
+        let mut changed = false;
+        for srv in &mut self.servers {
+            let detected = detect_country_code(&srv.name);
+            let cur_cc = srv.country.trim().to_ascii_lowercase();
+            if (cur_cc.is_empty() || cur_cc == "auto" || cur_cc == "xx")
+                && detected != "auto"
+                && detected != cur_cc
+            {
+                srv.country = detected.clone();
+                changed = true;
+            } else if detected != "auto" && has_regional_indicator_flags(&srv.name) && cur_cc != detected {
+                srv.country = detected;
+                changed = true;
+            }
+            let cleaned = clean_node_display_name(&srv.name);
+            if !cleaned.is_empty() && cleaned != srv.name {
+                srv.name = cleaned;
+                changed = true;
+            }
+        }
+        changed
     }
 
     pub fn load() -> Self {
@@ -818,10 +888,15 @@ impl PersistedState {
                 if parsed.active_id.is_empty() && !parsed.servers.is_empty() {
                     parsed.active_id = parsed.servers[0].id.clone();
                 }
+                let normalized = parsed.normalize_servers();
                 if !parsed.servers.is_empty() || !parsed.subscriptions.is_empty() {
+                    if normalized {
+                        parsed.save();
+                    }
                     return parsed;
                 }
                 if migrate_from_webview_localstorage(&mut parsed) {
+                    parsed.normalize_servers();
                     parsed.save();
                 }
                 return parsed;
@@ -829,6 +904,7 @@ impl PersistedState {
         }
         let mut state = Self::default();
         if migrate_from_webview_localstorage(&mut state) {
+            state.normalize_servers();
             state.save();
         }
         state
@@ -1006,6 +1082,7 @@ impl PersistedState {
             "poolTolerance": self.vpn_prefs.balancer_tolerance,
             "tolerance": 50,
             "quotaMib": self.vpn_prefs.balancer_quota_mib,
+            "interval": self.vpn_prefs.balancer_interval,
             "stickyHash": ["domain", "dest_ip", "process"]
         });
 
@@ -1031,6 +1108,7 @@ impl PersistedState {
             "udpFakeTtl": self.desync_prefs.udp_fake_ttl,
             "autoTune": self.desync_prefs.auto_tune,
             "blockQuic": self.desync_prefs.block_quic,
+            "anticheatBypass": self.desync_prefs.anticheat_bypass,
         });
 
         let payload = serde_json::json!({
@@ -1044,6 +1122,16 @@ impl PersistedState {
             "dnsBootstrap": self.vpn_prefs.dns_bootstrap,
             "fakeIp": self.vpn_prefs.fake_ip,
             "dnsRouteMode": self.vpn_prefs.dns_route_mode,
+            "dnsStrategy": self.vpn_prefs.dns_strategy,
+            "dnsReverseMapping": self.vpn_prefs.dns_reverse_mapping,
+            "routeFindProcess": self.vpn_prefs.route_find_process,
+            "routeFullconeNat": self.vpn_prefs.route_fullcone_nat,
+            "routeSmartQueue": self.vpn_prefs.route_smart_queue,
+            "tunStack": self.vpn_prefs.tun_stack,
+            "strictRoute": self.vpn_prefs.strict_route,
+            "sniff": self.vpn_prefs.sniff,
+            "tcpFastOpen": self.vpn_prefs.tcp_fast_open,
+            "tcpMultiPath": self.vpn_prefs.tcp_multi_path,
             "mtu": self.vpn_prefs.tun_mtu,
             "allowLan": self.vpn_prefs.allow_lan,
             "proxyTlsFragment": self.vpn_prefs.tls_fragment,
@@ -1101,6 +1189,237 @@ pub fn extract_host_port_from_uri(uri: &str) -> Option<(String, u16)> {
     Some((host_port.to_string(), 443))
 }
 
+pub fn has_regional_indicator_flags(s: &str) -> bool {
+    s.chars().any(|c| ('\u{1F1E6}'..='\u{1F1FF}').contains(&c))
+}
+
+/// Remove leading Unicode Regional Indicator flag pairs (e.g. `🇫🇮`, `🇪🇺`) and duplicate
+/// leading 2-letter country prefixes when followed by the country name, so DirectWrite
+/// never renders broken `fi`/`ee`/`eu` glyphs in front of node names.
+pub fn clean_node_display_name(name: &str) -> String {
+    let mut chars = name.trim().chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if ('\u{1F1E6}'..='\u{1F1FF}').contains(&c)
+            || c == '\u{FE0F}'
+            || c == '\u{200D}'
+            || c.is_whitespace()
+        {
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    let rest: String = chars.collect();
+    let trimmed = rest.trim();
+    if trimmed.is_empty() {
+        name.trim().to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+pub fn detect_country_code(name: &str) -> String {
+    // 1. Check Unicode Regional Indicator pairs (`🇫🇮` = U+1F1EB U+1F1EE -> "fi")
+    let chars: Vec<char> = name.chars().collect();
+    let mut i = 0;
+    while i + 1 < chars.len() {
+        let c1 = chars[i] as u32;
+        let c2 = chars[i + 1] as u32;
+        if (0x1F1E6..=0x1F1FF).contains(&c1) && (0x1F1E6..=0x1F1FF).contains(&c2) {
+            let b1 = b'a' + (c1 - 0x1F1E6) as u8;
+            let b2 = b'a' + (c2 - 0x1F1E6) as u8;
+            let code = String::from_utf8_lossy(&[b1, b2]).to_string();
+            return if code == "uk" { "gb".to_string() } else { code };
+        }
+        i += 1;
+    }
+
+    // 2. Check Russian & English country / city names
+    let lower = name.to_lowercase();
+    for (needles, cc) in [
+        (&["финлянд", "finland", "хельсинки", "helsinki"][..], "fi"),
+        (&["эстон", "estonia", "таллин", "tallinn"][..], "ee"),
+        (&["бельг", "belgium", "брюссел", "brussels"][..], "be"),
+        (
+            &[
+                "великобритан",
+                "британи",
+                "англи",
+                "лондон",
+                "london",
+                "united kingdom",
+                "great britain",
+            ][..],
+            "gb",
+        ),
+        (
+            &[
+                "герман",
+                "germany",
+                "франкфурт",
+                "frankfurt",
+                "берлин",
+                "berlin",
+                "фалькенштайн",
+                "нюрнберг",
+            ][..],
+            "de",
+        ),
+        (&["испан", "spain", "мадрид", "madrid", "барселон"][..], "es"),
+        (&["итали", "italy", "милан", "milan", "рим", "rome"][..], "it"),
+        (&["латви", "latvia", "рига", "riga"][..], "lv"),
+        (&["литв", "lithuania", "вильнюс", "vilnius"][..], "lt"),
+        (
+            &[
+                "нидерланд",
+                "голланди",
+                "netherlands",
+                "holland",
+                "амстердам",
+                "amsterdam",
+            ][..],
+            "nl",
+        ),
+        (&["польш", "poland", "варшав", "warsaw"][..], "pl"),
+        (
+            &[
+                "сша",
+                "америк",
+                "usa",
+                "united states",
+                "нью-йорк",
+                "new york",
+                "лос-анджелес",
+                "майами",
+                "чикаго",
+                "даллас",
+            ][..],
+            "us",
+        ),
+        (&["турци", "turkey", "türkiye", "стамбул", "istanbul", "анталья"][..], "tr"),
+        (&["франц", "france", "париж", "paris", "марсель"][..], "fr"),
+        (&["швеци", "sweden", "стокгольм", "stockholm"][..], "se"),
+        (&["швейцар", "switzerland", "цюрих", "zurich", "женев"][..], "ch"),
+        (&["австри", "austria", "вена", "vienna"][..], "at"),
+        (&["чехи", "czech", "прага", "prague"][..], "cz"),
+        (&["беларус", "минск", "belarus", "minsk"][..], "by"),
+        (&["казахст", "алмат", "астан", "kazakhstan", "almaty"][..], "kz"),
+        (
+            &[
+                "росси",
+                "russia",
+                "москва",
+                "moscow",
+                "мск",
+                "спб",
+                "петербург",
+                "питер",
+                "новосибирск",
+                "екатеринбург",
+            ][..],
+            "ru",
+        ),
+        (&["украин", "ukraine", "киев", "kyiv"][..], "ua"),
+        (&["сингапур", "singapore"][..], "sg"),
+        (&["япони", "japan", "токио", "tokyo", "осака"][..], "jp"),
+        (&["коре", "korea", "сеул", "seoul"][..], "kr"),
+        (&["гонконг", "hong kong", "hongkong"][..], "hk"),
+        (&["оаэ", "эмират", "дубай", "dubai", "uae"][..], "ae"),
+        (&["канад", "canada", "торонто", "toronto", "монреаль"][..], "ca"),
+        (&["болгар", "bulgaria", "софия", "sofia"][..], "bg"),
+        (&["румын", "romania", "бухарест", "bucharest"][..], "ro"),
+        (&["венгр", "hungary", "будапешт", "budapest"][..], "hu"),
+        (&["норвег", "norway", "осло", "oslo"][..], "no"),
+        (&["дани", "denmark", "копенгаген", "copenhagen"][..], "dk"),
+        (&["ирланд", "ireland", "дублин", "dublin"][..], "ie"),
+        (&["израил", "israel", "тель-авив"][..], "il"),
+        (&["инди", "india", "мумбаи", "mumbai"][..], "in"),
+        (&["бразил", "brazil", "сан-паулу"][..], "br"),
+        (&["австрал", "australia", "сидней", "sydney"][..], "au"),
+        (&["молдов", "moldova", "кишин"][..], "md"),
+        (&["грузи", "georgia", "тбилиси", "tbilisi"][..], "ge"),
+        (&["армени", "armenia", "ереван", "yerevan"][..], "am"),
+        (&["азербайджан", "azerbaijan", "баку", "baku"][..], "az"),
+        (&["узбекист", "uzbekistan", "ташкент", "tashkent"][..], "uz"),
+        (&["европ", "europe", "авто | белые списки", "автовыбор"][..], "eu"),
+    ] {
+        if needles.iter().any(|n| lower.contains(n)) {
+            return cc.to_string();
+        }
+    }
+
+    // 3. Fallback: explicit 2-letter ISO code token
+    const KNOWN_CODES: &[&str] = &[
+        "nl", "de", "fi", "us", "gb", "uk", "fr", "se", "pl", "tr", "kz", "ru", "ee", "lv", "lt",
+        "ch", "at", "cz", "it", "es", "be", "sg", "jp", "kr", "hk", "ae", "ca", "bg", "ro", "hu",
+        "no", "dk", "ie", "il", "in", "br", "au", "ua", "by", "md", "ge", "am", "az", "uz", "eu",
+    ];
+    for token in lower.split(|c: char| !c.is_alphabetic()) {
+        if token.len() == 2 && KNOWN_CODES.contains(&token) {
+            return if token == "uk" {
+                "gb".to_string()
+            } else {
+                token.to_string()
+            };
+        }
+    }
+    "auto".to_string()
+}
+
+pub fn country_title_for_lang(cc: &str, lang: &str) -> &'static str {
+    if lang == "en" {
+        return match cc.to_ascii_lowercase().as_str() {
+            "nl" => "Netherlands",
+            "de" => "Germany",
+            "fi" => "Finland",
+            "us" => "United States",
+            "gb" | "uk" => "United Kingdom",
+            "fr" => "France",
+            "se" => "Sweden",
+            "pl" => "Poland",
+            "tr" => "Turkey",
+            "kz" => "Kazakhstan",
+            "ru" => "Russia",
+            "ee" => "Estonia",
+            "lv" => "Latvia",
+            "lt" => "Lithuania",
+            "ch" => "Switzerland",
+            "at" => "Austria",
+            "cz" => "Czechia",
+            "it" => "Italy",
+            "es" => "Spain",
+            "be" => "Belgium",
+            "sg" => "Singapore",
+            "jp" => "Japan",
+            "kr" => "South Korea",
+            "hk" => "Hong Kong",
+            "ae" => "UAE",
+            "ca" => "Canada",
+            "bg" => "Bulgaria",
+            "ro" => "Romania",
+            "hu" => "Hungary",
+            "no" => "Norway",
+            "dk" => "Denmark",
+            "ie" => "Ireland",
+            "il" => "Israel",
+            "in" => "India",
+            "br" => "Brazil",
+            "au" => "Australia",
+            "ua" => "Ukraine",
+            "by" => "Belarus",
+            "md" => "Moldova",
+            "ge" => "Georgia",
+            "am" => "Armenia",
+            "az" => "Azerbaijan",
+            "uz" => "Uzbekistan",
+            "eu" => "Europe",
+            "xx" => "Balancer",
+            _ => "Location",
+        };
+    }
+    country_title_ru(cc)
+}
+
 pub fn country_title_ru(cc: &str) -> &'static str {
     match cc.to_ascii_lowercase().as_str() {
         "nl" => "Нидерланды",
@@ -1122,6 +1441,7 @@ pub fn country_title_ru(cc: &str) -> &'static str {
         "cz" => "Чехия",
         "it" => "Италия",
         "es" => "Испания",
+        "be" => "Бельгия",
         "sg" => "Сингапур",
         "jp" => "Япония",
         "kr" => "Южная Корея",
@@ -1145,31 +1465,133 @@ pub fn country_title_ru(cc: &str) -> &'static str {
         "am" => "Армения",
         "az" => "Азербайджан",
         "uz" => "Узбекистан",
+        "eu" => "Европа",
+        "xx" => "Балансировщик",
         _ => "Локация",
     }
 }
 
 pub fn detect_protocol_badge(uri: &str) -> &'static str {
-    let lower = uri.trim().to_ascii_lowercase();
+    let trimmed = uri.trim();
+    let lower = trimmed.to_ascii_lowercase();
     if lower.starts_with("tachyon-balancer://") || lower.starts_with("balancer://") {
-        "BALANCER"
-    } else if lower.starts_with("awg://") || lower.starts_with("vpn://") {
+        return "BALANCER";
+    }
+    if let Some(rest) = trimmed.strip_prefix("tachyon-node://") {
+        let b64_part = rest.split('#').next().unwrap_or(rest).trim();
+        if let Ok(bytes) = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            b64_part,
+        )
+        .or_else(|_| {
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64_part)
+        }) && let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            && let Some(ty) = val.get("type").and_then(|v| v.as_str())
+        {
+            return match ty.to_ascii_lowercase().as_str() {
+                "urltest" | "selector" => "BALANCER",
+                "chain" => "CHAIN",
+                "wireguard" => {
+                    if val.get("jc").is_some()
+                        || val.get("h1").is_some()
+                        || val.get("i1").is_some()
+                        || val.get("header_protection_key").is_some()
+                    {
+                        "AWG"
+                    } else {
+                        "WG"
+                    }
+                }
+                "hysteria2" | "hysteria" => "HY2",
+                "tuic" => "TUIC",
+                "wdtt" => {
+                    if val.get("mode").and_then(|m| m.as_str()) == Some("csqtt") {
+                        "CSQTT"
+                    } else {
+                        "WDTT"
+                    }
+                }
+                "tewfai" => "TEWFAI",
+                "mieru" => "MIERU",
+                "anytls" => "ANYTLS",
+                "shadowtls" => "SHADOWTLS",
+                "naive" => "NAIVE",
+                "trusttunnel" => "TRUSTTUNNEL",
+                "masque" => "MASQUE",
+                "openconnect" => "OPENCONNECT",
+                "snell" => "SNELL",
+                "mtproto" => "MTPROTO",
+                "fptn" => "FPTN",
+                "sudoku" => "SUDOKU",
+                "ssh" => "SSH",
+                "tor" => "TOR",
+                "tailscale" => "TAILSCALE",
+                "shadowsocks" => "SS",
+                "trojan" => "TROJAN",
+                "vmess" => "VMESS",
+                "vless" => "VLESS",
+                "socks" => "SOCKS5",
+                "http" => "HTTP",
+                _ => "PROXY",
+            };
+        }
+        return "NODE";
+    }
+    if lower.starts_with("awg://") || lower.starts_with("amneziawg://") || lower.starts_with("vpn://") {
         "AWG"
     } else if lower.starts_with("wg://") || lower.starts_with("wireguard://") {
         "WG"
-    } else if lower.starts_with("hy2://") || lower.starts_with("hysteria2://") {
+    } else if lower.starts_with("hy2://")
+        || lower.starts_with("hysteria2://")
+        || lower.starts_with("hysteria://")
+        || lower.starts_with("hy://")
+    {
         "HY2"
     } else if lower.starts_with("tuic://") {
         "TUIC"
+    } else if lower.starts_with("qwdtt://") {
+        "QWDTT"
+    } else if lower.starts_with("csqtt://") {
+        "CSQTT"
+    } else if lower.starts_with("wdtt://") {
+        "WDTT"
+    } else if lower.starts_with("tewfai://") {
+        "TEWFAI"
+    } else if lower.starts_with("mieru://") || lower.starts_with("mierus://") {
+        "MIERU"
+    } else if lower.starts_with("anytls://") {
+        "ANYTLS"
+    } else if lower.starts_with("shadowtls://") || lower.starts_with("stls://") {
+        "SHADOWTLS"
+    } else if lower.starts_with("naive+") || lower.starts_with("naive://") {
+        "NAIVE"
+    } else if lower.starts_with("trusttunnel://") {
+        "TRUSTTUNNEL"
+    } else if lower.starts_with("masque://") {
+        "MASQUE"
+    } else if lower.starts_with("openconnect://") || lower.starts_with("anyconnect://") {
+        "OPENCONNECT"
+    } else if lower.starts_with("snell://") {
+        "SNELL"
+    } else if lower.starts_with("mtproto://") || lower.starts_with("tg://") {
+        "MTPROTO"
+    } else if lower.starts_with("fptn:") || lower.starts_with("fptnb:") || lower.starts_with("fptn://") {
+        "FPTN"
+    } else if lower.starts_with("sudoku://") {
+        "SUDOKU"
+    } else if lower.starts_with("ssh://") {
+        "SSH"
+    } else if lower.starts_with("tor://") {
+        "TOR"
+    } else if lower.starts_with("tailscale://") {
+        "TAILSCALE"
     } else if lower.starts_with("trojan://") {
         "TROJAN"
     } else if lower.starts_with("vmess://") {
         "VMESS"
-    } else if lower.starts_with("ss://") {
+    } else if lower.starts_with("ss://") || lower.starts_with("shadowsocks://") {
         "SS"
-    } else if lower.starts_with("anytls://") {
-        "ANYTLS"
-    } else if lower.starts_with("socks5://") || lower.starts_with("socks://") {
+    } else if lower.starts_with("socks5://") || lower.starts_with("socks://") || lower.starts_with("socks5h://") {
         "SOCKS5"
     } else if lower.starts_with("http://") || lower.starts_with("https://") {
         "HTTP"

@@ -15,10 +15,13 @@ use serde_json::{Value, json};
 use crate::icons::flag_image;
 use crate::state::{
     CustomRule, PersistedState, ROUTE_CATALOG, ServerNode, SubscriptionItem, SubscriptionMeta,
-    country_title_ru, detect_protocol_badge, extract_host_port_from_uri,
+    country_title_for_lang, detect_protocol_badge, extract_host_port_from_uri,
 };
 use crate::theme::Theme;
-use crate::vpn::{RunningApp, VpnManager, enumerate_apps, icmp_or_tcp_ping_ms, tcp_connect_ms};
+use crate::vpn::{
+    BalancerMember, BalancerPayload, RunningApp, VpnManager, encode_balancer_uri, enumerate_apps,
+    icmp_or_tcp_ping_ms, tcp_connect_ms,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
@@ -106,6 +109,7 @@ pub struct ActiveConnectionRow {
     pub id: String,
     pub net: String,
     pub host: String,
+    pub ip_port: String,
     pub process: String,
     pub chain: String,
     pub rule: String,
@@ -174,9 +178,22 @@ pub struct TachyonApp {
     pub log_tail: String,
     pub toast: Option<(String, Instant)>,
     pub update_banner: UpdateBanner,
+    pub last_conns_poll: Instant,
 }
 
 impl TachyonApp {
+    pub fn is_en(&self) -> bool {
+        self.state.language.eq_ignore_ascii_case("en")
+    }
+
+    pub fn tr(&self, ru: &'static str, en: &'static str) -> &'static str {
+        if self.is_en() { en } else { ru }
+    }
+
+    pub fn country_title(&self, cc: &str) -> &'static str {
+        country_title_for_lang(cc, &self.state.language)
+    }
+
     pub fn new(
         vpn: Arc<VpnManager>,
         rt: Arc<tokio::runtime::Runtime>,
@@ -230,6 +247,7 @@ impl TachyonApp {
             log_tail: String::new(),
             toast: None,
             update_banner: UpdateBanner::default(),
+            last_conns_poll: Instant::now(),
         };
 
         // Initial background tasks
@@ -285,6 +303,17 @@ impl TachyonApp {
         }
         if self.vpn_status == "connected" {
             needs_notify = true;
+            if self.tab == Tab::Traffic && self.last_conns_poll.elapsed() >= Duration::from_millis(1800) {
+                self.last_conns_poll = Instant::now();
+                let v = self.vpn.clone();
+                let eq = self.event_queue.clone();
+                self.rt.spawn(async move {
+                    let data = v.get_connections_json().await;
+                    if let Ok(mut g) = eq.lock() {
+                        g.push(format!("conn:data:{data}"));
+                    }
+                });
+            }
         }
 
         for msg in drained {
@@ -548,26 +577,39 @@ impl TachyonApp {
                                 })
                                 .unwrap_or("tcp")
                                 .to_ascii_uppercase();
+                            let ip_raw = item
+                                .get("ip")
+                                .and_then(Value::as_str)
+                                .filter(|s| !s.is_empty())
+                                .or_else(|| {
+                                    item.get("metadata")
+                                        .and_then(|m| m.get("destinationIP"))
+                                        .and_then(Value::as_str)
+                                })
+                                .unwrap_or("");
+                            let port_str = item
+                                .get("port")
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            let ip_port = if !ip_raw.is_empty() && !port_str.is_empty() {
+                                format!("{ip_raw}:{port_str}")
+                            } else if !ip_raw.is_empty() {
+                                ip_raw.to_string()
+                            } else {
+                                String::new()
+                            };
                             let host_raw = item
                                 .get("host")
                                 .and_then(Value::as_str)
                                 .filter(|s| !s.is_empty())
-                                .or_else(|| item.get("ip").and_then(Value::as_str).filter(|s| !s.is_empty()))
                                 .or_else(|| {
                                     item.get("metadata").and_then(|m| {
                                         m.get("host")
                                             .and_then(Value::as_str)
                                             .filter(|s| !s.is_empty())
-                                            .or_else(|| {
-                                                m.get("destinationIP").and_then(Value::as_str)
-                                            })
                                     })
                                 })
-                                .unwrap_or("—");
-                            let port_str = item
-                                .get("port")
-                                .and_then(Value::as_str)
-                                .unwrap_or("");
+                                .unwrap_or(if ip_raw.is_empty() { "—" } else { ip_raw });
                             let host = if !port_str.is_empty() && !host_raw.contains(':') {
                                 format!("{host_raw}:{port_str}")
                             } else {
@@ -591,6 +633,7 @@ impl TachyonApp {
                                 id,
                                 net,
                                 host,
+                                ip_port,
                                 process,
                                 chain,
                                 rule,
@@ -836,6 +879,69 @@ impl TachyonApp {
         });
     }
 
+    async fn probe_single_uri_ms(uri: &str) -> i64 {
+        let badge = detect_protocol_badge(uri);
+        if let Some((host, port)) = extract_host_port_from_uri(uri) {
+            if matches!(badge, "AWG" | "WG" | "HY2" | "TUIC" | "WDTT") {
+                let icmp = icmp_or_tcp_ping_ms(&host, 1800).await;
+                if icmp > 0 {
+                    icmp
+                } else {
+                    tcp_connect_ms(&host, port, 1500).await
+                }
+            } else {
+                let tcp = tcp_connect_ms(&host, port, 2000).await;
+                if tcp > 0 {
+                    tcp
+                } else {
+                    icmp_or_tcp_ping_ms(&host, 1500).await
+                }
+            }
+        } else {
+            -1
+        }
+    }
+
+    pub fn ping_single_node(&mut self, id: String) {
+        let Some(srv) = self.state.servers.iter_mut().find(|s| s.id == id) else {
+            return;
+        };
+        if srv.is_balancer {
+            self.ping_all_nodes();
+            return;
+        }
+        srv.ping_ms = None;
+        let uri = srv.vless.clone();
+        let name = srv.name.clone();
+        let eq = self.event_queue.clone();
+        let is_en = self.is_en();
+        self.show_toast(if is_en {
+            format!("Pinging {name}...")
+        } else {
+            format!("Пинг узла: {name}...")
+        });
+        self.rt.spawn(async move {
+            let ms = Self::probe_single_uri_ms(&uri).await;
+            if let Ok(mut g) = eq.lock() {
+                g.push(format!("pong:{id}:{ms}"));
+            }
+        });
+    }
+
+    pub fn ping_country_nodes(&mut self, cc: String) {
+        let mut targets = Vec::new();
+        for srv in &mut self.state.servers {
+            if !srv.is_balancer && srv.country == cc {
+                srv.ping_ms = None;
+                targets.push((srv.id.clone(), srv.vless.clone()));
+            }
+        }
+        if targets.is_empty() {
+            return;
+        }
+        self.spawn_ping_batch(targets);
+    }
+
     pub fn ping_all_nodes(&mut self) {
         let targets: Vec<(String, String)> = self
             .state
@@ -847,44 +953,119 @@ impl TachyonApp {
         if targets.is_empty() {
             return;
         }
+        self.spawn_ping_batch(targets);
+    }
+
+    fn spawn_ping_batch(&self, targets: Vec<(String, String)>) {
         let eq = self.event_queue.clone();
         self.rt.spawn(async move {
             let total = targets.len();
-            let mut reachable = 0usize;
+            let sem = Arc::new(tokio::sync::Semaphore::new(16));
+            let reachable = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut handles = Vec::with_capacity(total);
             for (id, uri) in targets {
-                let badge = detect_protocol_badge(&uri);
-                let ms = if let Some((host, port)) = extract_host_port_from_uri(&uri) {
-                    if matches!(badge, "AWG" | "WG" | "HY2" | "TUIC" | "WDTT") {
-                        // UDP-based protocols: TCP port is typically closed, so try ICMP or fallback TCP
-                        let icmp = icmp_or_tcp_ping_ms(&host, 2000).await;
-                        if icmp > 0 {
-                            icmp
-                        } else {
-                            tcp_connect_ms(&host, port, 1800).await
-                        }
-                    } else {
-                        let tcp = tcp_connect_ms(&host, port, 2200).await;
-                        if tcp > 0 {
-                            tcp
-                        } else {
-                            icmp_or_tcp_ping_ms(&host, 1800).await
-                        }
+                let sem_cl = sem.clone();
+                let eq_cl = eq.clone();
+                let reach_cl = reachable.clone();
+                handles.push(tokio::spawn(async move {
+                    let _permit = sem_cl.acquire().await;
+                    let ms = Self::probe_single_uri_ms(&uri).await;
+                    if ms > 0 {
+                        reach_cl.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                } else {
-                    -1
-                };
-                if ms > 0 {
-                    reachable += 1;
-                }
-                if let Ok(mut g) = eq.lock() {
-                    g.push(format!("pong:{id}:{ms}"));
-                }
+                    if let Ok(mut g) = eq_cl.lock() {
+                        g.push(format!("pong:{id}:{ms}"));
+                    }
+                }));
             }
+            for h in handles {
+                let _ = h.await;
+            }
+            let r = reachable.load(std::sync::atomic::Ordering::Relaxed);
             if let Ok(mut g) = eq.lock() {
-                let done = json!({ "reachable": reachable, "total": total }).to_string();
+                let done = json!({ "reachable": r, "total": total }).to_string();
                 g.push(format!("ping:batch:done:{done}"));
             }
         });
+    }
+
+    pub fn create_custom_balancer_from_nodes(&mut self) {
+        let members: Vec<BalancerMember> = self
+            .state
+            .servers
+            .iter()
+            .filter(|s| {
+                if s.is_balancer {
+                    return false;
+                }
+                if self.hide_ru_by && matches!(s.country.as_str(), "ru" | "by") {
+                    return false;
+                }
+                true
+            })
+            .map(|s| BalancerMember {
+                name: s.name.clone(),
+                vless: s.vless.clone(),
+                country: s.country.clone(),
+            })
+            .collect();
+
+        if members.len() < 2 {
+            let msg = self.tr(
+                "Нужно минимум 2 узла для создания балансировщика",
+                "At least 2 nodes are required to create a balancer",
+            );
+            self.show_toast(msg.to_string());
+            return;
+        }
+
+        let mode = self.state.vpn_prefs.balancer_mode.clone();
+        let name = if self.is_en() {
+            format!("Smart Balancer ({mode}, {} nodes)", members.len())
+        } else {
+            format!("Балансировщик ({mode}, {} узлов)", members.len())
+        };
+        let payload = BalancerPayload {
+            name: name.clone(),
+            mode: mode.clone(),
+            url: "https://www.gstatic.com/generate_204".to_string(),
+            interval: self.state.vpn_prefs.balancer_interval.clone(),
+            tolerance: self.state.vpn_prefs.balancer_tolerance,
+            pool: self.state.vpn_prefs.balancer_pool as u32,
+            pool_tolerance: (self.state.vpn_prefs.balancer_tolerance + 30).min(500),
+            sticky_hash: vec![
+                "domain".to_string(),
+                "dest_ip".to_string(),
+                "process".to_string(),
+            ],
+            quota_mib: self.state.vpn_prefs.balancer_quota_mib,
+            members: members.clone(),
+        };
+        let uri = encode_balancer_uri(&payload);
+        let id = format!("bal-custom-{}", self.state.servers.len() + 1);
+        self.state.servers.insert(
+            0,
+            ServerNode {
+                id: id.clone(),
+                name: name.clone(),
+                vless: uri,
+                country: "xx".to_string(),
+                sub_id: None,
+                is_balancer: true,
+                balancer_mode: Some(mode),
+                member_count: Some(members.len()),
+                ping_ms: None,
+                alive: Some(true),
+            },
+        );
+        self.state.active_id = id;
+        self.reconnect_if_active();
+        let msg = if self.is_en() {
+            format!("Created & selected: {name}")
+        } else {
+            format!("Создан и выбран: {name}")
+        };
+        self.show_toast(msg);
     }
 
     pub fn select_fastest_node(&mut self) {
@@ -1364,7 +1545,10 @@ impl TachyonApp {
                                 div()
                                     .text_size(px(10.0))
                                     .text_color(t.text_mute)
-                                    .child("Маршрутизация и туннелирование"),
+                                    .child(self.tr(
+                                        "Маршрутизация и туннелирование",
+                                        "Routing & Tunneling Engine",
+                                    )),
                             ),
                     ),
             )
@@ -1374,6 +1558,34 @@ impl TachyonApp {
                     .items_center()
                     .gap(px(4.0))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .id("btn-lang-toggle")
+                            .h(px(26.0))
+                            .px(px(7.0))
+                            .rounded(px(6.0))
+                            .bg(t.bg_elev)
+                            .border_1()
+                            .border_color(t.border)
+                            .hover(|s| s.bg(t.bg_hover))
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(10.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(t.accent)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.state.language = if this.is_en() {
+                                    "ru".to_string()
+                                } else {
+                                    "en".to_string()
+                                };
+                                this.state.save();
+                                cx.notify();
+                            }))
+                            .child(if self.is_en() { "EN" } else { "RU" }),
+                    )
                     .child(
                         div()
                             .id("btn-theme-toggle")
@@ -1476,12 +1688,37 @@ impl TachyonApp {
         let nodes_cnt = self.state.servers.len();
 
         let tabs: [(Tab, &'static str, &'static str, Option<usize>); 6] = [
-            (Tab::Tunnel, "icons/power.svg", "Туннель", None),
+            (
+                Tab::Tunnel,
+                "icons/power.svg",
+                self.tr("Туннель", "Tunnel"),
+                None,
+            ),
             (Tab::Desync, "icons/bolt.svg", "Desync", None),
-            (Tab::Routes, "icons/route.svg", "Маршруты", Some(rules_cnt)),
-            (Tab::Nodes, "icons/server.svg", "Узлы", Some(nodes_cnt)),
-            (Tab::Traffic, "icons/activity.svg", "Трафик", None),
-            (Tab::Options, "icons/sliders.svg", "Опции", None),
+            (
+                Tab::Routes,
+                "icons/route.svg",
+                self.tr("Маршруты", "Routes"),
+                Some(rules_cnt),
+            ),
+            (
+                Tab::Nodes,
+                "icons/server.svg",
+                self.tr("Узлы", "Nodes"),
+                Some(nodes_cnt),
+            ),
+            (
+                Tab::Traffic,
+                "icons/activity.svg",
+                self.tr("Трафик", "Traffic"),
+                None,
+            ),
+            (
+                Tab::Options,
+                "icons/sliders.svg",
+                self.tr("Опции", "Settings"),
+                None,
+            ),
         ];
 
         div()
@@ -1611,18 +1848,30 @@ impl TachyonApp {
                                 t.text_mute
                             }),
                     )
-                    .child(format!("Ядро tachyon-core {core_ver}  ·  DNS: {dns_label}")),
+                    .child(if self.is_en() {
+                        format!("Core tachyon-core {core_ver}  ·  DNS: {dns_label}")
+                    } else {
+                        format!("Ядро tachyon-core {core_ver}  ·  DNS: {dns_label}")
+                    }),
             )
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(10.0))
-                    .child(format!(
-                        "Узлов: {}  ·  Правил: {}",
-                        self.state.servers.len(),
-                        self.state.active_rules_count()
-                    ))
+                    .child(if self.is_en() {
+                        format!(
+                            "Nodes: {}  ·  Rules: {}",
+                            self.state.servers.len(),
+                            self.state.active_rules_count()
+                        )
+                    } else {
+                        format!(
+                            "Узлов: {}  ·  Правил: {}",
+                            self.state.servers.len(),
+                            self.state.active_rules_count()
+                        )
+                    })
                     .child(
                         div()
                             .id("btn-open-log-modal")
@@ -1634,7 +1883,7 @@ impl TachyonApp {
                                 this.modal = ModalKind::KernelLog;
                                 cx.notify();
                             }))
-                            .child("Лог ядра"),
+                            .child(self.tr("Лог ядра", "Core Log")),
                     ),
             )
     }
@@ -1645,11 +1894,11 @@ impl TachyonApp {
         let active_srv = self.state.active_server().cloned();
 
         let status_label = if is_connected {
-            "Защищено"
+            self.tr("Защищено", "Protected")
         } else if is_connecting {
-            "Подключение..."
+            self.tr("Подключение...", "Connecting...")
         } else {
-            "Отключено"
+            self.tr("Отключено", "Disconnected")
         };
 
         let stack_badge = if self.state.vpn_prefs.mode == "tun" {
@@ -1664,7 +1913,7 @@ impl TachyonApp {
         let mut filtered_total = 0usize;
         for srv in &self.state.servers {
             if !query.is_empty() {
-                let ctitle = country_title_ru(&srv.country).to_lowercase();
+                let ctitle = self.country_title(&srv.country).to_lowercase();
                 if !srv.name.to_lowercase().contains(&query) && !ctitle.contains(&query) {
                     continue;
                 }
@@ -1860,11 +2109,12 @@ impl TachyonApp {
                                                     })
                                                     .child(if is_connected {
                                                         format!(
-                                                            "↓ {} МБ/с",
-                                                            format_mb_per_sec(self.rx_bps)
+                                                            "↓ {} {}",
+                                                            format_mb_per_sec(self.rx_bps),
+                                                            self.tr("МБ/с", "MB/s")
                                                         )
                                                     } else {
-                                                        "ВКЛЮЧИТЬ".to_string()
+                                                        self.tr("ВКЛЮЧИТЬ", "CONNECT").to_string()
                                                     }),
                                             ),
                                     ),
@@ -1878,11 +2128,16 @@ impl TachyonApp {
                                         t.text_dim
                                     })
                                     .child(if is_connected {
-                                        "Активно · Нажмите для отключения".to_string()
+                                        self.tr(
+                                            "Активно · Нажмите для отключения",
+                                            "Active · Click to disconnect",
+                                        )
+                                        .to_string()
                                     } else if !self.last_error.is_empty() {
                                         truncate_str(&self.last_error, 46)
                                     } else {
-                                        "Готов к запуску туннеля".to_string()
+                                        self.tr("Готов к запуску туннеля", "Ready to connect")
+                                            .to_string()
                                     }),
                             )
                             .when_some(self.live_balancer.as_ref().filter(|_| is_connected), |el, lb| {
@@ -1890,7 +2145,7 @@ impl TachyonApp {
                                     .get("selected")
                                     .and_then(Value::as_str)
                                     .filter(|s| !s.is_empty())
-                                    .unwrap_or("автовыбор");
+                                    .unwrap_or(self.tr("автовыбор", "auto"));
                                 let mode = lb
                                     .get("mode")
                                     .and_then(Value::as_str)
@@ -1905,7 +2160,11 @@ impl TachyonApp {
                                         .border_color(t.accent_border)
                                         .text_size(px(10.0))
                                         .text_color(t.accent)
-                                        .child(format!("Балансировщик ({mode}) · Узел: {cur}")),
+                                        .child(if self.is_en() {
+                                            format!("Balancer ({mode}) · Node: {cur}")
+                                        } else {
+                                            format!("Балансировщик ({mode}) · Узел: {cur}")
+                                        }),
                                 )
                             }),
                     )
@@ -1963,8 +2222,11 @@ impl TachyonApp {
                                                                         truncate_str(&s.name, 20)
                                                                     })
                                                                     .unwrap_or_else(|| {
-                                                                        "Прямой Desync (без узла)"
-                                                                            .to_string()
+                                                                        self.tr(
+                                                                            "Прямой Desync (без узла)",
+                                                                            "Direct Desync (no proxy)",
+                                                                        )
+                                                                        .to_string()
                                                                     }),
                                                             ),
                                                     )
@@ -1978,7 +2240,7 @@ impl TachyonApp {
                                                                     .map(|s| {
                                                                         format!(
                                                                             "{} · {}",
-                                                                            country_title_ru(
+                                                                            self.country_title(
                                                                                 &s.country
                                                                             ),
                                                                             detect_protocol_badge(
@@ -1987,10 +2249,17 @@ impl TachyonApp {
                                                                         )
                                                                     })
                                                                     .unwrap_or_else(|| {
-                                                                        format!(
-                                                                            "Пресет: {} · Нажмите для добавления узлов",
-                                                                            self.state.desync_prefs.preset
-                                                                        )
+                                                                        if self.is_en() {
+                                                                            format!(
+                                                                                "Preset: {} · Click to add nodes",
+                                                                                self.state.desync_prefs.preset
+                                                                            )
+                                                                        } else {
+                                                                            format!(
+                                                                                "Пресет: {} · Нажмите для добавления узлов",
+                                                                                self.state.desync_prefs.preset
+                                                                            )
+                                                                        }
                                                                     }),
                                                             ),
                                                     ),
@@ -2012,7 +2281,7 @@ impl TachyonApp {
                                                         t.text_dim
                                                     })
                                                     .child(if ms > 0 {
-                                                        format!("{ms} мс")
+                                                        format!("{ms} {}", self.tr("мс", "ms"))
                                                     } else {
                                                         "—".to_string()
                                                     }),
@@ -2083,7 +2352,7 @@ impl TachyonApp {
                                                 div()
                                                     .text_size(px(11.0))
                                                     .text_color(t.text_dim)
-                                                    .child("• Выходной узел"),
+                                                    .child(self.tr("• Выходной узел", "• Exit Node")),
                                             )
                                             .child(
                                                 div()
@@ -2113,7 +2382,7 @@ impl TachyonApp {
                                                         div()
                                                             .text_size(px(10.0))
                                                             .text_color(t.text_soft)
-                                                            .child("Проверить"),
+                                                            .child(self.tr("Проверить", "Check")),
                                                     ),
                                             ),
                                     )
@@ -2123,11 +2392,11 @@ impl TachyonApp {
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(t.text)
                                             .child(if self.exit_info.loading {
-                                                "Проверка...".to_string()
+                                                self.tr("Проверка...", "Checking...").to_string()
                                             } else if self.exit_info.ok {
                                                 self.exit_info.ip.clone()
                                             } else {
-                                                "Нет ответа".to_string()
+                                                self.tr("Нет ответа", "No response").to_string()
                                             }),
                                     )
                                     .child(
@@ -2136,16 +2405,21 @@ impl TachyonApp {
                                             .text_color(t.text_dim)
                                             .child(if self.exit_info.ok {
                                                 format!(
-                                                    "{} {} · {} ({} мс)",
+                                                    "{} {} · {} ({} {})",
                                                     self.exit_info.country,
                                                     self.exit_info.city,
                                                     self.exit_info.isp,
-                                                    self.exit_info.latency_ms
+                                                    self.exit_info.latency_ms,
+                                                    self.tr("мс", "ms")
                                                 )
                                             } else if !self.exit_info.error.is_empty() {
                                                 self.exit_info.error.clone()
                                             } else {
-                                                "Проверьте подключение".to_string()
+                                                self.tr(
+                                                    "Проверьте подключение",
+                                                    "Verify connection",
+                                                )
+                                                .to_string()
                                             }),
                                     ),
                             )
@@ -2169,7 +2443,7 @@ impl TachyonApp {
                                                 div()
                                                     .text_size(px(11.0))
                                                     .text_color(t.accent)
-                                                    .child("• Приём"),
+                                                    .child(self.tr("• Приём", "• Download")),
                                             )
                                             .child(
                                                 div()
@@ -2177,8 +2451,9 @@ impl TachyonApp {
                                                     .font_weight(FontWeight::BOLD)
                                                     .text_color(t.text)
                                                     .child(format!(
-                                                        "{} МБ/с",
-                                                        format_mb_per_sec(self.rx_bps)
+                                                        "{} {}",
+                                                        format_mb_per_sec(self.rx_bps),
+                                                        self.tr("МБ/с", "MB/s")
                                                     )),
                                             )
                                             .child(
@@ -2186,7 +2461,8 @@ impl TachyonApp {
                                                     .text_size(px(10.0))
                                                     .text_color(t.text_dim)
                                                     .child(format!(
-                                                        "Всего: {}",
+                                                        "{}: {}",
+                                                        self.tr("Всего", "Total"),
                                                         format_bytes_human(self.rx_total)
                                                     )),
                                             ),
@@ -2200,7 +2476,7 @@ impl TachyonApp {
                                                 div()
                                                     .text_size(px(11.0))
                                                     .text_color(t.green)
-                                                    .child("• Отдача"),
+                                                    .child(self.tr("• Отдача", "• Upload")),
                                             )
                                             .child(
                                                 div()
@@ -2208,8 +2484,9 @@ impl TachyonApp {
                                                     .font_weight(FontWeight::BOLD)
                                                     .text_color(t.text)
                                                     .child(format!(
-                                                        "{} МБ/с",
-                                                        format_mb_per_sec(self.tx_bps)
+                                                        "{} {}",
+                                                        format_mb_per_sec(self.tx_bps),
+                                                        self.tr("МБ/с", "MB/s")
                                                     )),
                                             )
                                             .child(
@@ -2217,7 +2494,8 @@ impl TachyonApp {
                                                     .text_size(px(10.0))
                                                     .text_color(t.text_dim)
                                                     .child(format!(
-                                                        "Всего: {}",
+                                                        "{}: {}",
+                                                        self.tr("Всего", "Total"),
                                                         format_bytes_human(self.tx_total)
                                                     )),
                                             ),
@@ -2247,7 +2525,7 @@ impl TachyonApp {
                                             .text_size(px(11.0))
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(t.text_soft)
-                                            .child("Режим маршрутизации"),
+                                            .child(self.tr("Режим маршрутизации", "Routing Mode")),
                                     )
                                     .child(
                                         div()
@@ -2259,7 +2537,7 @@ impl TachyonApp {
                                                 this.tab = Tab::Routes;
                                                 cx.notify();
                                             }))
-                                            .child("Списки и Desync ↗"),
+                                            .child(self.tr("Списки и Desync ↗", "Lists & Desync ↗")),
                                     ),
                             )
                             .child(
@@ -2272,10 +2550,10 @@ impl TachyonApp {
                                     .gap(px(3.0))
                                     .children(
                                         [
-                                            ("all", "Весь ПК"),
-                                            ("selective", "Точечно"),
-                                            ("desync", "Только Desync"),
-                                            ("apps", "Приложения"),
+                                            ("all", self.tr("Весь ПК", "Full PC")),
+                                            ("selective", self.tr("Точечно", "Selective")),
+                                            ("desync", self.tr("Только Desync", "Desync Only")),
+                                            ("apps", self.tr("Приложения", "Apps")),
                                         ]
                                         .into_iter()
                                         .map(|(code, title)| {
@@ -2369,7 +2647,7 @@ impl TachyonApp {
                                                     .text_size(px(11.0))
                                                     .font_weight(FontWeight::SEMIBOLD)
                                                     .text_color(t.text)
-                                                    .child("Пакетный Desync"),
+                                                    .child(self.tr("Пакетный Desync", "Packet Desync")),
                                             )
                                             .child(
                                                 div()
@@ -2380,9 +2658,9 @@ impl TachyonApp {
                                                         t.text_dim
                                                     })
                                                     .child(if self.state.desync_prefs.enabled {
-                                                        "Активен · Adaptive"
+                                                        self.tr("Активен · Adaptive", "Active · Adaptive")
                                                     } else {
-                                                        "Выключен"
+                                                        self.tr("Выключен", "Disabled")
                                                     }),
                                             ),
                                     ),
@@ -2429,7 +2707,7 @@ impl TachyonApp {
                                                     .text_size(px(11.0))
                                                     .font_weight(FontWeight::SEMIBOLD)
                                                     .text_color(t.text)
-                                                    .child("Сетевой стек"),
+                                                    .child(self.tr("Сетевой стек", "Network Stack")),
                                             )
                                             .child(
                                                 div()
@@ -2438,7 +2716,7 @@ impl TachyonApp {
                                                     .child(if self.state.vpn_prefs.mode == "tun" {
                                                         "TUN · Wintun"
                                                     } else {
-                                                        "Системный прокси"
+                                                        self.tr("Системный прокси", "System Proxy")
                                                     }),
                                             ),
                                     ),
@@ -2497,9 +2775,9 @@ impl TachyonApp {
                                                         t.text_dim
                                                     })
                                                     .child(if self.state.vpn_prefs.kill_switch {
-                                                        "Активен"
+                                                        self.tr("Активен", "Active")
                                                     } else {
-                                                        "Выключен"
+                                                        self.tr("Выключен", "Disabled")
                                                     }),
                                             ),
                                     ),
@@ -2536,7 +2814,10 @@ impl TachyonApp {
                                                     .text_size(px(11.0))
                                                     .font_weight(FontWeight::SEMIBOLD)
                                                     .text_color(t.text_soft)
-                                                    .child("• Серверы и локации"),
+                                                    .child(self.tr(
+                                                        "• Серверы и локации",
+                                                        "• Servers & Locations",
+                                                    )),
                                             )
                                             .child(
                                                 div()
@@ -2557,7 +2838,7 @@ impl TachyonApp {
                                             .child(
                                                 div()
                                                     .id("input-srv-search")
-                                                    .w(px(190.0))
+                                                    .w(px(176.0))
                                                     .h(px(26.0))
                                                     .px(px(8.0))
                                                     .rounded(px(6.0))
@@ -2598,11 +2879,45 @@ impl TachyonApp {
                                                                 },
                                                             )
                                                             .child(if self.server_search.is_empty() {
-                                                                "Поиск страны или узла..."
-                                                                    .to_string()
+                                                                self.tr(
+                                                                    "Поиск страны или узла...",
+                                                                    "Search country or node...",
+                                                                )
+                                                                .to_string()
                                                             } else {
                                                                 self.server_search.clone()
                                                             }),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("btn-tunnel-import-conf")
+                                                    .h(px(26.0))
+                                                    .px(px(8.0))
+                                                    .rounded(px(6.0))
+                                                    .bg(t.bg_elev)
+                                                    .border_1()
+                                                    .border_color(t.border)
+                                                    .cursor_pointer()
+                                                    .hover(|s| s.bg(t.bg_hover))
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(4.0))
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.import_conf_file_dialog();
+                                                        cx.notify();
+                                                    }))
+                                                    .child(
+                                                        svg()
+                                                            .path("icons/folder.svg")
+                                                            .size(px(11.0))
+                                                            .text_color(t.accent),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(11.0))
+                                                            .text_color(t.text_soft)
+                                                            .child("+ .conf"),
                                                     ),
                                             )
                                             .child(
@@ -2633,7 +2948,7 @@ impl TachyonApp {
                                                         div()
                                                             .text_size(px(11.0))
                                                             .text_color(t.text_soft)
-                                                            .child("Пинг"),
+                                                            .child(self.tr("Пинг", "Ping")),
                                                     ),
                                             )
                                             .child(
@@ -2664,7 +2979,10 @@ impl TachyonApp {
                                                         div()
                                                             .text_size(px(11.0))
                                                             .text_color(t.text_soft)
-                                                            .child("Подписки"),
+                                                            .child(self.tr(
+                                                                "Подписки",
+                                                                "Subscriptions",
+                                                            )),
                                                     ),
                                             ),
                                     ),
@@ -2681,6 +2999,7 @@ impl TachyonApp {
                                     .children(by_country.into_iter().map(|(cc, list)| {
                                         let collapsed = self.collapsed_countries.contains(&cc);
                                         let cc_toggle = cc.clone();
+                                        let cc_ping = cc.clone();
                                         let best_ms = list
                                             .iter()
                                             .filter_map(|s| s.ping_ms)
@@ -2729,7 +3048,7 @@ impl TachyonApp {
                                                                         FontWeight::SEMIBOLD,
                                                                     )
                                                                     .text_color(t.text)
-                                                                    .child(country_title_ru(&cc)),
+                                                                    .child(self.country_title(&cc)),
                                                             )
                                                             .child(
                                                                 div()
@@ -2746,14 +3065,75 @@ impl TachyonApp {
                                                             .flex()
                                                             .items_center()
                                                             .gap(px(6.0))
-                                                            .when_some(best_ms, |el, ms| {
-                                                                el.child(
-                                                                    div()
-                                                                        .text_size(px(10.5))
-                                                                        .text_color(t.green)
-                                                                        .child(format!("{ms} мс")),
-                                                                )
-                                                            })
+                                                            .child(
+                                                                div()
+                                                                    .id(SharedString::from(format!(
+                                                                        "country-ping-btn-{cc}"
+                                                                    )))
+                                                                    .px(px(6.0))
+                                                                    .py(px(2.0))
+                                                                    .rounded(px(4.0))
+                                                                    .bg(t.bg_card)
+                                                                    .hover(|s| s.bg(t.bg_hover))
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .gap(px(4.0))
+                                                                    .on_click(cx.listener(
+                                                                        move |this, _, _, cx| {
+                                                                            this.ping_country_nodes(
+                                                                                cc_ping.clone(),
+                                                                            );
+                                                                            cx.notify();
+                                                                        },
+                                                                    ))
+                                                                    .child(
+                                                                        svg()
+                                                                            .path("icons/bolt.svg")
+                                                                            .size(px(9.5))
+                                                                            .text_color(
+                                                                                if best_ms.is_some()
+                                                                                {
+                                                                                    t.green
+                                                                                } else {
+                                                                                    t.text_dim
+                                                                                },
+                                                                            ),
+                                                                    )
+                                                                    .child(
+                                                                        div()
+                                                                            .text_size(px(10.0))
+                                                                            .text_color(
+                                                                                if best_ms.is_some()
+                                                                                {
+                                                                                    t.green
+                                                                                } else {
+                                                                                    t.text_dim
+                                                                                },
+                                                                            )
+                                                                            .child(
+                                                                                if let Some(ms) =
+                                                                                    best_ms
+                                                                                {
+                                                                                    if self.is_en()
+                                                                                    {
+                                                                                        format!(
+                                                                                            "{ms} ms"
+                                                                                        )
+                                                                                    } else {
+                                                                                        format!(
+                                                                                            "{ms} мс"
+                                                                                        )
+                                                                                    }
+                                                                                } else {
+                                                                                    self.tr(
+                                                                                        "Пинг",
+                                                                                        "Ping",
+                                                                                    )
+                                                                                    .to_string()
+                                                                                },
+                                                                            ),
+                                                                    ),
+                                                            )
                                                             .child(
                                                                 svg()
                                                                     .path(if collapsed {
@@ -2777,6 +3157,7 @@ impl TachyonApp {
                                                             let is_sel =
                                                                 srv.id == self.state.active_id;
                                                             let sid = srv.id.clone();
+                                                            let sid_ping = srv.id.clone();
                                                             let proto =
                                                                 detect_protocol_badge(&srv.vless);
                                                             div()
@@ -2798,24 +3179,31 @@ impl TachyonApp {
                                                                 } else {
                                                                     t.border
                                                                 })
-                                                                .cursor_pointer()
-                                                                .hover(|s| s.bg(t.bg_hover))
                                                                 .flex()
                                                                 .items_center()
                                                                 .justify_between()
-                                                                .on_click(cx.listener(
-                                                                    move |this, _, _, cx| {
-                                                                        this.state.active_id =
-                                                                            sid.clone();
-                                                                        this.reconnect_if_active();
-                                                                        cx.notify();
-                                                                    },
-                                                                ))
                                                                 .child(
                                                                     div()
+                                                                        .id(SharedString::from(
+                                                                            format!(
+                                                                                "srv-sel-{}",
+                                                                                srv.id
+                                                                            ),
+                                                                        ))
+                                                                        .flex_1()
+                                                                        .cursor_pointer()
                                                                         .flex()
                                                                         .items_center()
                                                                         .gap(px(7.0))
+                                                                        .on_click(cx.listener(
+                                                                            move |this, _, _, cx| {
+                                                                                this.state
+                                                                                    .active_id =
+                                                                                    sid.clone();
+                                                                                this.reconnect_if_active();
+                                                                                cx.notify();
+                                                                            },
+                                                                        ))
                                                                         .child(render_flag_badge(
                                                                             &srv.country,
                                                                             18.0,
@@ -2831,7 +3219,7 @@ impl TachyonApp {
                                                                                 .child(
                                                                                     truncate_str(
                                                                                         &srv.name,
-                                                                                        17,
+                                                                                        16,
                                                                                     ),
                                                                                 ),
                                                                         ),
@@ -2840,7 +3228,7 @@ impl TachyonApp {
                                                                     div()
                                                                         .flex()
                                                                         .items_center()
-                                                                        .gap(px(5.0))
+                                                                        .gap(px(4.0))
                                                                         .child(
                                                                             div()
                                                                                 .px(px(4.0))
@@ -2854,37 +3242,71 @@ impl TachyonApp {
                                                                                 .text_color(t.green)
                                                                                 .child(proto),
                                                                         )
-                                                                        .when_some(
-                                                                            srv.ping_ms,
-                                                                            |el, ms| {
-                                                                                el.child(
-                                                                                    div()
-                                                                                        .text_size(
-                                                                                            px(10.0),
-                                                                                        )
+                                                                        .child(
+                                                                            div()
+                                                                                .id(SharedString::from(
+                                                                                    format!(
+                                                                                        "srv-ping-{}",
+                                                                                        srv.id
+                                                                                    ),
+                                                                                ))
+                                                                                .px(px(4.0))
+                                                                                .py(px(1.0))
+                                                                                .rounded(px(4.0))
+                                                                                .bg(t.bg_card)
+                                                                                .cursor_pointer()
+                                                                                .hover(|s| {
+                                                                                    s.bg(t.bg_hover)
+                                                                                })
+                                                                                .flex()
+                                                                                .items_center()
+                                                                                .gap(px(3.0))
+                                                                                .on_click(cx.listener(
+                                                                                    move |this, _, _, cx| {
+                                                                                        this.ping_single_node(
+                                                                                            sid_ping.clone(),
+                                                                                        );
+                                                                                        cx.notify();
+                                                                                    },
+                                                                                ))
+                                                                                .child(
+                                                                                    svg()
+                                                                                        .path("icons/bolt.svg")
+                                                                                        .size(px(9.0))
                                                                                         .text_color(
-                                                                                            if ms
-                                                                                                > 0
-                                                                                            {
-                                                                                                t.green
-                                                                                            } else {
-                                                                                                t.text_mute
-                                                                                            },
-                                                                                        )
-                                                                                        .child(
-                                                                                            if ms
-                                                                                                > 0
-                                                                                            {
-                                                                                                format!(
-                                                                                                    "{ms} мс"
-                                                                                                )
-                                                                                            } else {
-                                                                                                "—"
-                                                                                                    .to_string()
+                                                                                            match srv.ping_ms {
+                                                                                                Some(ms) if ms > 0 => t.green,
+                                                                                                Some(_) => t.red,
+                                                                                                None => t.text_dim,
                                                                                             },
                                                                                         ),
                                                                                 )
-                                                                            },
+                                                                                .child(
+                                                                                    div()
+                                                                                        .text_size(
+                                                                                            px(9.5),
+                                                                                        )
+                                                                                        .text_color(
+                                                                                            match srv.ping_ms {
+                                                                                                Some(ms) if ms > 0 => t.green,
+                                                                                                Some(_) => t.red,
+                                                                                                None => t.text_mute,
+                                                                                            },
+                                                                                        )
+                                                                                        .child(
+                                                                                            match srv.ping_ms {
+                                                                                                Some(ms) if ms > 0 => {
+                                                                                                    if self.is_en() {
+                                                                                                        format!("{ms}ms")
+                                                                                                    } else {
+                                                                                                        format!("{ms}мс")
+                                                                                                    }
+                                                                                                }
+                                                                                                Some(_) => "×".to_string(),
+                                                                                                None => "⚡".to_string(),
+                                                                                            },
+                                                                                        ),
+                                                                                ),
                                                                         ),
                                                                 )
                                                         })),
@@ -2958,13 +3380,19 @@ impl TachyonApp {
                                             .text_size(px(14.0))
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(t.text)
-                                            .child("Пакетная десинхронизация (Desync)"),
+                                            .child(self.tr(
+                                                "Пакетная десинхронизация (Desync)",
+                                                "Packet Desynchronization (Desync)",
+                                            )),
                                     )
                                     .child(
                                         div()
                                             .text_size(px(11.0))
                                             .text_color(t.text_dim)
-                                            .child("Фрагментация TLS ClientHello, OOB-маркеры и инъекция QUIC Initial для прямого соединения"),
+                                            .child(self.tr(
+                                                "Фрагментация TLS ClientHello, OOB-маркеры и инъекция QUIC Initial для прямого соединения (работает без VPN-подписок)",
+                                                "TLS ClientHello fragmentation, OOB markers and QUIC Initial injection for direct connectivity (works without VPN subscriptions)",
+                                            )),
                                     ),
                             ),
                     )
@@ -2986,7 +3414,11 @@ impl TachyonApp {
                                 this.reconnect_if_active();
                                 cx.notify();
                             }))
-                            .child(if d.enabled { "Активен" } else { "Включить" }),
+                            .child(if d.enabled {
+                                self.tr("Активен", "Active")
+                            } else {
+                                self.tr("Включить", "Enable")
+                            }),
                     ),
             )
             .child(
@@ -2997,11 +3429,46 @@ impl TachyonApp {
                     .gap(px(8.0))
                     .children(
                         [
-                            ("auto", "Авто (Adaptive)", "Multi-Disorder + QUIC Fake 6x + Автоподбор"),
-                            ("youtube_discord", "YouTube + Discord", "Multi-Disorder + TLSRec + QUIC 8x"),
-                            ("multi_disorder", "Multi-Disorder", "Каскадная нарезка SNI с обратным порядком"),
-                            ("fake_split", "Fake + Split", "Мягкое разбиение TLS без инверсии сегментов"),
-                            ("tlsrec", "Чистый TLS Record", "Нарезка записи TLS без фейковых пакетов"),
+                            (
+                                "auto",
+                                self.tr("Авто (Adaptive)", "Auto (Adaptive)"),
+                                self.tr(
+                                    "Multi-Disorder + QUIC Fake 6x + Автоподбор",
+                                    "Multi-Disorder + QUIC Fake 6x + Auto-tune",
+                                ),
+                            ),
+                            (
+                                "youtube_discord",
+                                "YouTube + Discord",
+                                self.tr(
+                                    "Multi-Disorder + TLSRec + QUIC 8x",
+                                    "Multi-Disorder + TLSRec + QUIC 8x",
+                                ),
+                            ),
+                            (
+                                "multi_disorder",
+                                "Multi-Disorder",
+                                self.tr(
+                                    "Каскадная нарезка SNI с обратным порядком",
+                                    "Cascading SNI slicing with reverse order",
+                                ),
+                            ),
+                            (
+                                "fake_split",
+                                "Fake + Split",
+                                self.tr(
+                                    "Мягкое разбиение TLS без инверсии сегментов",
+                                    "Soft TLS splitting without segment inversion",
+                                ),
+                            ),
+                            (
+                                "tlsrec",
+                                self.tr("Чистый TLS Record", "Pure TLS Record"),
+                                self.tr(
+                                    "Нарезка записи TLS без фейковых пакетов",
+                                    "TLS record slicing without fake packets",
+                                ),
+                            ),
                         ]
                         .into_iter()
                         .map(|(pid, title, desc)| {
@@ -3104,11 +3571,58 @@ impl TachyonApp {
                     .flex_col()
                     .gap(px(8.0))
                     .child(
+                        // Mode + Repeats + Delay row
                         div()
                             .w_full()
                             .flex()
                             .items_center()
                             .justify_between()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(5.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(t.text_soft)
+                                            .child(self.tr("Режим:", "Mode:")),
+                                    )
+                                    .children(
+                                        [
+                                            ("multidisorder", "MultiDisorder"),
+                                            ("multisplit", "MultiSplit"),
+                                            ("fake_disorder", "Fake+Disorder"),
+                                            ("fake_split", "Fake+Split"),
+                                            ("disorder", "Disorder"),
+                                            ("split", "Split"),
+                                            ("tlsrec", "TLSRec"),
+                                            ("oob", "OOB"),
+                                            ("disoob", "DisOOB"),
+                                        ]
+                                        .into_iter()
+                                        .map(|(mc, ml)| {
+                                            let act = d.mode == mc;
+                                            div()
+                                                .id(SharedString::from(format!("ds-mode-{mc}")))
+                                                .px(px(6.0))
+                                                .py(px(3.0))
+                                                .rounded(px(5.0))
+                                                .cursor_pointer()
+                                                .bg(if act { t.accent_bg } else { t.bg_elev })
+                                                .text_size(px(10.0))
+                                                .text_color(if act { t.accent } else { t.text_dim })
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.state.desync_prefs.mode = mc.to_string();
+                                                    this.state.desync_prefs.preset = "custom".to_string();
+                                                    this.reconnect_if_active();
+                                                    cx.notify();
+                                                }))
+                                                .child(ml)
+                                        }),
+                                    ),
+                            )
                             .child(
                                 div()
                                     .flex()
@@ -3119,27 +3633,70 @@ impl TachyonApp {
                                             .text_size(px(11.0))
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(t.text_soft)
-                                            .child("Метод Fooling:"),
+                                            .child(self.tr("Повторы:", "Repeats:")),
+                                    )
+                                    .children([2u32, 4, 6, 8, 12].into_iter().map(|rep| {
+                                        let act = d.repeats == rep;
+                                        div()
+                                            .id(SharedString::from(format!("ds-rep-{rep}")))
+                                            .px(px(6.0))
+                                            .py(px(3.0))
+                                            .rounded(px(5.0))
+                                            .cursor_pointer()
+                                            .bg(if act { t.amber_bg } else { t.bg_elev })
+                                            .text_size(px(10.0))
+                                            .text_color(if act { t.amber } else { t.text_dim })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.state.desync_prefs.repeats = rep;
+                                                this.state.desync_prefs.preset = "custom".to_string();
+                                                this.reconnect_if_active();
+                                                cx.notify();
+                                            }))
+                                            .child(format!("{rep}x"))
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(5.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(t.text_soft)
+                                            .child("Fooling:"),
                                     )
                                     .children(
                                         [
-                                            ("md5sig+badsum", "MD5Sig + BadSum"),
-                                            ("md5sig", "TCP MD5Sig"),
-                                            ("badsum", "Bad Checksum"),
-                                            ("badseq", "Bad Seq"),
-                                            ("ts", "TCP Timestamp"),
+                                            ("md5sig+badsum", "MD5Sig+BadSum"),
+                                            ("md5sig", "MD5Sig"),
+                                            ("badsum", "BadSum"),
+                                            ("badseq", "BadSeq"),
+                                            ("ts", "TCP TS"),
+                                            ("ttl", "AutoTTL"),
+                                            ("datanoack", "DataNoAck"),
+                                            ("hopbyhop", "HopByHop"),
+                                            ("fad", "FAD"),
                                         ]
                                         .into_iter()
                                         .map(|(fc, fl)| {
                                             let act = d.fooling == fc;
                                             div()
                                                 .id(SharedString::from(format!("ds-fool-{fc}")))
-                                                .px(px(8.0))
+                                                .px(px(7.0))
                                                 .py(px(3.0))
                                                 .rounded(px(5.0))
                                                 .cursor_pointer()
                                                 .bg(if act { t.accent_bg } else { t.bg_elev })
-                                                .text_size(px(10.5))
+                                                .text_size(px(10.0))
                                                 .text_color(if act { t.accent } else { t.text_dim })
                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                     this.state.desync_prefs.fooling = fc.to_string();
@@ -3200,20 +3757,23 @@ impl TachyonApp {
                                             .text_size(px(11.0))
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(t.text_soft)
-                                            .child("Точки разреза SNI:"),
+                                            .child(self.tr("Точки разреза SNI:", "SNI Split Pos:")),
                                     )
                                     .children(
                                         [
-                                            ("1,sniext+1,host+1,midsld", "Каскад (4 точки)"),
+                                            (
+                                                "1,sniext+1,host+1,midsld",
+                                                self.tr("Каскад (4 точки)", "Cascade (4 pts)"),
+                                            ),
                                             ("1,sniext+1,midsld", "SNI + MidSLD"),
-                                            ("sniext+1", "Начало SNI"),
-                                            ("midsld", "Середина домена"),
+                                            ("sniext+1", self.tr("Начало SNI", "SNI Start")),
+                                            ("midsld", self.tr("Середина домена", "Mid Domain")),
                                         ]
                                         .into_iter()
                                         .map(|(sp, sl)| {
                                             let act = d.split_pos == sp;
                                             div()
-                                                .id(SharedString::from(format!("ds-sp-{sl}")))
+                                                .id(SharedString::from(format!("ds-sp-{sp}")))
                                                 .px(px(8.0))
                                                 .py(px(3.0))
                                                 .rounded(px(5.0))
@@ -3296,12 +3856,18 @@ impl TachyonApp {
                                     .text_size(px(12.0))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(t.text)
-                                    .child("Параметры TCP и TLS"),
+                                    .child(self.tr("Параметры TCP и TLS", "TCP & TLS Parameters")),
                             )
                             .child(self.render_toggle_row(
                                 "toggle-tlsrec-first",
-                                "Дробление записи TLS (TLSRec First)",
-                                "Разбиение TLS Record до отправки TCP-сегментов",
+                                self.tr(
+                                    "Дробление записи TLS (TLSRec First)",
+                                    "TLS Record Slicing (TLSRec First)",
+                                ),
+                                self.tr(
+                                    "Разбиение TLS Record до отправки TCP-сегментов",
+                                    "Split TLS Record before sending TCP segments",
+                                ),
                                 d.tlsrec_first,
                                 t,
                                 cx.listener(|this, _, _, cx| {
@@ -3313,8 +3879,14 @@ impl TachyonApp {
                             ))
                             .child(self.render_toggle_row(
                                 "toggle-tls-frag",
-                                "Фрагментация записей TLS на прокси",
-                                "Разбиение TLS ClientHello для прокси-узлов",
+                                self.tr(
+                                    "Фрагментация записей TLS на прокси",
+                                    "Proxy TLS Record Fragmentation",
+                                ),
+                                self.tr(
+                                    "Разбиение TLS ClientHello для прокси-узлов",
+                                    "Fragment TLS ClientHello on proxy outbounds",
+                                ),
                                 self.state.vpn_prefs.tls_fragment,
                                 t,
                                 cx.listener(|this, _, _, cx| {
@@ -3326,8 +3898,14 @@ impl TachyonApp {
                             ))
                             .child(self.render_toggle_row(
                                 "toggle-auto-direct",
-                                "Прямой Desync для YouTube и Discord",
-                                "Отправлять YouTube и Discord напрямую через Desync мимо VPN",
+                                self.tr(
+                                    "Прямой Desync для YouTube и Discord",
+                                    "Direct Desync for YouTube & Discord",
+                                ),
+                                self.tr(
+                                    "Отправлять YouTube и Discord напрямую через Desync мимо VPN",
+                                    "Route YouTube and Discord directly via Desync bypassing VPN",
+                                ),
                                 d.auto_direct,
                                 t,
                                 cx.listener(|this, _, _, cx| {
@@ -3339,8 +3917,14 @@ impl TachyonApp {
                             ))
                             .child(self.render_toggle_row(
                                 "toggle-auto-tune",
-                                "Адаптивный автоподбор при RST/Timeout",
-                                "Автоматическая ротация стратегии для проблемных доменов",
+                                self.tr(
+                                    "Адаптивный автоподбор при RST/Timeout",
+                                    "Adaptive Auto-Tune on RST/Timeout",
+                                ),
+                                self.tr(
+                                    "Автоматическая ротация стратегии для проблемных доменов",
+                                    "Automatic strategy rotation for degraded domains",
+                                ),
                                 d.auto_tune,
                                 t,
                                 cx.listener(|this, _, _, cx| {
@@ -3349,10 +3933,31 @@ impl TachyonApp {
                                     this.reconnect_if_active();
                                     cx.notify();
                                 }),
+                            ))
+                            .child(self.render_toggle_row(
+                                "toggle-seqovl-syndata",
+                                self.tr(
+                                    "Перекрытие TCP Seq (SeqOvl) и SynData",
+                                    "TCP Seq Overlap (SeqOvl) & SynData",
+                                ),
+                                self.tr(
+                                    "Смещение последовательности TCP-сегментов на уровне ядра",
+                                    "Kernel-level TCP sequence overlap and SYN payload",
+                                ),
+                                d.seqovl > 0 || d.syndata,
+                                t,
+                                cx.listener(|this, _, _, cx| {
+                                    let next = !(this.state.desync_prefs.seqovl > 0
+                                        || this.state.desync_prefs.syndata);
+                                    this.state.desync_prefs.seqovl = if next { 1 } else { 0 };
+                                    this.state.desync_prefs.syndata = next;
+                                    this.reconnect_if_active();
+                                    cx.notify();
+                                }),
                             )),
                     )
                     .child(
-                        // UDP / QUIC column
+                        // UDP / QUIC / Anti-cheat column
                         div()
                             .flex_1()
                             .p(px(14.0))
@@ -3368,12 +3973,40 @@ impl TachyonApp {
                                     .text_size(px(12.0))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(t.text)
-                                    .child("Параметры UDP, QUIC и Голоса"),
+                                    .child(self.tr(
+                                        "UDP, QUIC, Голос и защита Античитов",
+                                        "UDP, QUIC, Voice & Anti-Cheat Protection",
+                                    )),
                             )
                             .child(self.render_toggle_row(
+                                "toggle-anticheat-bypass",
+                                self.tr(
+                                    "Совместимость с античитами и играми (RICOCHET / EAC / Vanguard)",
+                                    "Anti-Cheat & Game Bypass (RICOCHET / EAC / BattlEye / Vanguard)",
+                                ),
+                                self.tr(
+                                    "Прямой обход игровых процессов и UDP-портов без инъекций и без OpenProcess",
+                                    "Direct bypass for game processes & UDP ports without packet injection or OpenProcess",
+                                ),
+                                d.anticheat_bypass,
+                                t,
+                                cx.listener(|this, _, _, cx| {
+                                    this.state.desync_prefs.anticheat_bypass =
+                                        !this.state.desync_prefs.anticheat_bypass;
+                                    this.reconnect_if_active();
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(self.render_toggle_row(
                                 "toggle-quic-fake",
-                                "Десинхронизация QUIC Initial / UDP",
-                                "Предварительная отправка фейковых UDP-датаграмм (443, 50000–65535)",
+                                self.tr(
+                                    "Десинхронизация QUIC Initial / UDP",
+                                    "QUIC Initial / UDP Desynchronization",
+                                ),
+                                self.tr(
+                                    "Предварительная отправка фейковых UDP-датаграмм (443, 50000–50100)",
+                                    "Send preliminary fake UDP datagrams (443, 50000–50100)",
+                                ),
                                 d.quic_fake && d.udp_fake,
                                 t,
                                 cx.listener(|this, _, _, cx| {
@@ -3387,8 +4020,14 @@ impl TachyonApp {
                             ))
                             .child(self.render_toggle_row(
                                 "toggle-block-quic",
-                                "Принудительный перевод браузера с QUIC на TCP",
-                                "Блокировать исходящий UDP:443 для гарантированного TLS Desync",
+                                self.tr(
+                                    "Принудительный перевод браузера с QUIC на TCP",
+                                    "Force Browser Fallback from QUIC to TCP",
+                                ),
+                                self.tr(
+                                    "Блокировать исходящий UDP:443 для гарантированного TLS Desync",
+                                    "Block outbound UDP:443 to enforce TLS Desync over TCP",
+                                ),
                                 d.block_quic,
                                 t,
                                 cx.listener(|this, _, _, cx| {
@@ -3400,8 +4039,14 @@ impl TachyonApp {
                             ))
                             .child(self.render_toggle_row(
                                 "toggle-discord-udp",
-                                "Голосовые шлюзы Discord UDP / STUN",
-                                "Инициализация IP Discovery и WebRTC на голосовых портах",
+                                self.tr(
+                                    "Голосовые шлюзы Discord UDP / STUN",
+                                    "Discord Voice Gateways UDP / STUN",
+                                ),
+                                self.tr(
+                                    "Инициализация IP Discovery и WebRTC на голосовых портах",
+                                    "Initialize IP Discovery and WebRTC on voice ports",
+                                ),
                                 d.discord_udp_fake,
                                 t,
                                 cx.listener(|this, _, _, cx| {
@@ -3414,8 +4059,14 @@ impl TachyonApp {
                             ))
                             .child(self.render_toggle_row(
                                 "toggle-ipfrag",
-                                "IPv4/IPv6 фрагментация (IPFrag2)",
-                                "Разбиение пакетов на сетевом уровне L3",
+                                self.tr(
+                                    "IPv4/IPv6 фрагментация (IPFrag2)",
+                                    "IPv4/IPv6 Fragmentation (IPFrag2)",
+                                ),
+                                self.tr(
+                                    "Разбиение пакетов на сетевом уровне L3",
+                                    "Fragment packets at L3 network layer",
+                                ),
                                 d.ipfrag,
                                 t,
                                 cx.listener(|this, _, _, cx| {
@@ -3455,9 +4106,15 @@ impl TachyonApp {
                             .gap(px(4.0))
                             .children(
                                 [
-                                    (RouteSubTab::Catalog, "Каталог сервисов"),
-                                    (RouteSubTab::Custom, "Свои правила"),
-                                    (RouteSubTab::Apps, "Приложения ПК"),
+                                    (
+                                        RouteSubTab::Catalog,
+                                        self.tr("Каталог сервисов", "Service Catalog"),
+                                    ),
+                                    (
+                                        RouteSubTab::Custom,
+                                        self.tr("Свои правила", "Custom Rules"),
+                                    ),
+                                    (RouteSubTab::Apps, self.tr("Приложения ПК", "PC Apps")),
                                 ]
                                 .into_iter()
                                 .map(|(st, label)| {
@@ -3512,7 +4169,12 @@ impl TachyonApp {
                                 this.rt.spawn(async move {
                                     v.refresh_rulesets(None).await;
                                 });
-                                this.show_toast("Обновление баз маршрутов...");
+                                this.show_toast(
+                                    this.tr(
+                                        "Обновление баз маршрутов...",
+                                        "Updating route databases...",
+                                    ),
+                                );
                                 cx.notify();
                             }))
                             .child(
@@ -3525,7 +4187,7 @@ impl TachyonApp {
                                 div()
                                     .text_size(px(11.0))
                                     .text_color(t.text_soft)
-                                    .child("Обновить базы .srs"),
+                                    .child(self.tr("Обновить базы .srs", "Update .srs DBs")),
                             ),
                     ),
             )
@@ -3571,11 +4233,23 @@ impl TachyonApp {
                             .gap(px(6.0))
                             .children(
                                 [
-                                    ("ru_desync", "РФ напрямую + YT/Discord Desync"),
-                                    ("desync_only", "Только Desync (без VPN)"),
-                                    ("selective_vpn", "Точечный туннель"),
-                                    ("adblock_on", "+ Блок рекламы"),
-                                    ("reset_all", "Сбросить"),
+                                    (
+                                        "ru_desync",
+                                        self.tr(
+                                            "РФ напрямую + YT/Discord Desync",
+                                            "RU Direct + YT/Discord Desync",
+                                        ),
+                                    ),
+                                    (
+                                        "desync_only",
+                                        self.tr("Только Desync (без VPN)", "Desync Only (No VPN)"),
+                                    ),
+                                    (
+                                        "selective_vpn",
+                                        self.tr("Точечный туннель", "Selective Tunnel"),
+                                    ),
+                                    ("adblock_on", self.tr("+ Блок рекламы", "+ AdBlock")),
+                                    ("reset_all", self.tr("Сбросить", "Reset")),
                                 ]
                                 .into_iter()
                                 .map(|(sc_id, sc_label)| {
@@ -3605,33 +4279,48 @@ impl TachyonApp {
                                                     this.state.list_modes.insert("ru_only_inside".to_string(), "direct".to_string());
                                                     this.state.list_modes.insert("youtube".to_string(), "desync".to_string());
                                                     this.state.list_modes.insert("discord".to_string(), "desync".to_string());
-                                                    this.show_toast("Применён сценарий: РФ напрямую + YT/Discord Desync");
+                                                    this.show_toast(this.tr(
+                                                        "Применён сценарий: РФ напрямую + YT/Discord Desync",
+                                                        "Scenario applied: RU Direct + YT/Discord Desync",
+                                                    ));
                                                 }
                                                 "desync_only" => {
                                                     this.state.vpn_prefs.route = "desync".to_string();
                                                     this.state.desync_prefs.enabled = true;
                                                     this.state.list_modes.insert("youtube".to_string(), "desync".to_string());
                                                     this.state.list_modes.insert("discord".to_string(), "desync".to_string());
-                                                    this.show_toast("Применён сценарий: Только Desync (без VPN)");
+                                                    this.show_toast(this.tr(
+                                                        "Применён сценарий: Только Desync (без VPN)",
+                                                        "Scenario applied: Desync Only (No VPN)",
+                                                    ));
                                                 }
                                                 "selective_vpn" => {
                                                     this.state.vpn_prefs.route = "selective".to_string();
                                                     for k in ["ru_blocked", "youtube", "discord", "meta", "twitter", "ai_all", "openai", "claude", "gemini"] {
                                                         this.state.list_modes.insert(k.to_string(), "vpn".to_string());
                                                     }
-                                                    this.show_toast("Применён сценарий: Точечный туннель");
+                                                    this.show_toast(this.tr(
+                                                        "Применён сценарий: Точечный туннель",
+                                                        "Scenario applied: Selective Tunnel",
+                                                    ));
                                                 }
                                                 "adblock_on" => {
                                                     for k in ["ads_all", "adguard", "win_telemetry"] {
                                                         this.state.list_modes.insert(k.to_string(), "block".to_string());
                                                     }
-                                                    this.show_toast("Включена блокировка рекламы и телеметрии");
+                                                    this.show_toast(this.tr(
+                                                        "Включена блокировка рекламы и телеметрии",
+                                                        "Ad & telemetry blocking enabled",
+                                                    ));
                                                 }
                                                 "reset_all" => {
                                                     for v in this.state.list_modes.values_mut() {
                                                         *v = "off".to_string();
                                                     }
-                                                    this.show_toast("Все списки каталога сброшены в Выкл");
+                                                    this.show_toast(this.tr(
+                                                        "Все списки каталога сброшены в Выкл",
+                                                        "All catalog lists reset to Off",
+                                                    ));
                                                 }
                                                 _ => {}
                                             }
@@ -3679,7 +4368,11 @@ impl TachyonApp {
                                         t.text
                                     })
                                     .child(if self.route_search.is_empty() {
-                                        "Поиск из 55 сервисов...".to_string()
+                                        self.tr(
+                                            "Поиск из 55 сервисов...",
+                                            "Search 55 services...",
+                                        )
+                                        .to_string()
                                     } else {
                                         self.route_search.clone()
                                     }),
@@ -3756,11 +4449,11 @@ impl TachyonApp {
                                     .gap(px(2.0))
                                     .children(
                                         [
-                                            ("off", "Выкл"),
-                                            ("vpn", "Туннель"),
+                                            ("off", self.tr("Выкл", "Off")),
+                                            ("vpn", self.tr("Туннель", "Tunnel")),
                                             ("desync", "Desync"),
-                                            ("direct", "Прямой"),
-                                            ("block", "Блок"),
+                                            ("direct", self.tr("Прямой", "Direct")),
+                                            ("block", self.tr("Блок", "Block")),
                                         ]
                                         .into_iter()
                                         .map(|(mcode, mlabel)| {
@@ -3840,9 +4533,9 @@ impl TachyonApp {
                     .gap(px(8.0))
                     .children(
                         [
-                            ("domain", "Домен"),
+                            ("domain", self.tr("Домен", "Domain")),
                             ("cidr", "IP / CIDR"),
-                            ("process", "Процесс"),
+                            ("process", self.tr("Процесс", "Process")),
                         ]
                         .into_iter()
                         .map(|(rt, rlabel)| {
@@ -3893,7 +4586,11 @@ impl TachyonApp {
                                         t.text
                                     })
                                     .child(if self.custom_rule_value.is_empty() {
-                                        "example.com, 1.2.3.0/24 или game.exe...".to_string()
+                                        self.tr(
+                                            "example.com, 1.2.3.0/24 или game.exe...",
+                                            "example.com, 1.2.3.0/24 or game.exe...",
+                                        )
+                                        .to_string()
                                     } else {
                                         self.custom_rule_value.clone()
                                     }),
@@ -3901,10 +4598,10 @@ impl TachyonApp {
                     )
                     .children(
                         [
-                            ("vpn", "В туннель"),
+                            ("vpn", self.tr("В туннель", "Tunnel")),
                             ("desync", "Desync"),
-                            ("direct", "Напрямую"),
-                            ("block", "Блок"),
+                            ("direct", self.tr("Напрямую", "Direct")),
+                            ("block", self.tr("Блок", "Block")),
                         ]
                         .into_iter()
                         .map(|(act, alabel)| {
@@ -3945,7 +4642,7 @@ impl TachyonApp {
                                 this.submit_custom_rule();
                                 cx.notify();
                             }))
-                            .child("Добавить"),
+                            .child(self.tr("Добавить", "Add")),
                     ),
             )
             .child(
@@ -4058,10 +4755,17 @@ impl TachyonApp {
                                 div()
                                     .text_size(px(11.5))
                                     .text_color(t.text_soft)
-                                    .child(format!(
-                                        "Выбрано приложений для туннелирования: {}",
-                                        self.state.routed_apps.len()
-                                    )),
+                                    .child(if self.is_en() {
+                                        format!(
+                                            "Selected apps for tunneling: {}",
+                                            self.state.routed_apps.len()
+                                        )
+                                    } else {
+                                        format!(
+                                            "Выбрано приложений для туннелирования: {}",
+                                            self.state.routed_apps.len()
+                                        )
+                                    }),
                             )
                             .when(!self.state.routed_apps.is_empty(), |el| {
                                 el.child(
@@ -4081,7 +4785,7 @@ impl TachyonApp {
                                             this.reconnect_if_active();
                                             cx.notify();
                                         }))
-                                        .child("Очистить выбор"),
+                                        .child(self.tr("Очистить выбор", "Clear Selection")),
                                 )
                             }),
                     )
@@ -4101,10 +4805,14 @@ impl TachyonApp {
                             .gap(px(6.0))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.running_apps = enumerate_apps();
-                                this.show_toast(format!(
-                                    "Найдено активных процессов: {}",
-                                    this.running_apps.len()
-                                ));
+                                this.show_toast(if this.is_en() {
+                                    format!("Found active processes: {}", this.running_apps.len())
+                                } else {
+                                    format!(
+                                        "Найдено активных процессов: {}",
+                                        this.running_apps.len()
+                                    )
+                                });
                                 cx.notify();
                             }))
                             .child(
@@ -4117,7 +4825,10 @@ impl TachyonApp {
                                 div()
                                     .text_size(px(11.0))
                                     .text_color(t.text_soft)
-                                    .child("Обновить список процессов"),
+                                    .child(self.tr(
+                                        "Обновить список процессов",
+                                        "Refresh Process List",
+                                    )),
                             ),
                     ),
             )
@@ -4195,7 +4906,11 @@ impl TachyonApp {
                                     } else {
                                         t.text_dim
                                     })
-                                    .child(if selected { "Туннель" } else { "Прямой" }),
+                                    .child(if selected {
+                                        self.tr("Туннель", "Tunnel")
+                                    } else {
+                                        self.tr("Прямой", "Direct")
+                                    }),
                             )
                     })),
             )
@@ -4234,7 +4949,10 @@ impl TachyonApp {
                                     .text_size(px(12.0))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(t.text)
-                                    .child("Импорт узлов, ссылок (vless://, awg://, vpn://, hy2://) и .conf файлов"),
+                                    .child(self.tr(
+                                        "Импорт узлов (VLESS, AWG 2/3/3.1, HY2, TUIC, WDTT, Tewfai, Mieru, VMess, Trojan, SS) и .conf",
+                                        "Import Nodes (VLESS, AWG 2/3/3.1, HY2, TUIC, WDTT, Tewfai, Mieru, VMess, Trojan, SS) & .conf",
+                                    )),
                             )
                             .child(
                                 div()
@@ -4269,7 +4987,10 @@ impl TachyonApp {
                                                 div()
                                                     .text_size(px(11.0))
                                                     .text_color(t.text_soft)
-                                                    .child("Файл .conf / .json"),
+                                                    .child(self.tr(
+                                                        "Файл .conf / AWG 2-3.1",
+                                                        ".conf / AWG 2-3.1 File",
+                                                    )),
                                             ),
                                     )
                                     .child(
@@ -4304,7 +5025,10 @@ impl TachyonApp {
                                                 div()
                                                     .text_size(px(11.0))
                                                     .text_color(t.text_soft)
-                                                    .child("Вставить из буфера"),
+                                                    .child(self.tr(
+                                                        "Вставить из буфера",
+                                                        "Paste Clipboard",
+                                                    )),
                                             ),
                                     )
                                     .child(
@@ -4323,9 +5047,10 @@ impl TachyonApp {
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 let v = this.vpn.clone();
                                                 let eq = this.event_queue.clone();
-                                                this.show_toast(
+                                                this.show_toast(this.tr(
                                                     "Генерация профиля Cloudflare WARP (AWG)...",
-                                                );
+                                                    "Generating Cloudflare WARP (AWG) profile...",
+                                                ));
                                                 this.rt.spawn(async move {
                                                     let res = v.provision_warp_awg().await;
                                                     if let Ok(mut g) = eq.lock() {
@@ -4389,8 +5114,11 @@ impl TachyonApp {
                                                 t.text
                                             })
                                             .child(if self.node_uri_input.is_empty() {
-                                                "Вставьте vless://, awg://, vpn://, ссылку подписки или текст [Interface] .conf..."
-                                                    .to_string()
+                                                self.tr(
+                                                    "Вставьте vless://, awg://, vpn://, hy2://, wdtt://, tewfai://, подписку или [Interface] .conf...",
+                                                    "Paste vless://, awg://, vpn://, hy2://, wdtt://, tewfai://, subscription or [Interface] .conf...",
+                                                )
+                                                .to_string()
                                             } else {
                                                 truncate_str(
                                                     &self.node_uri_input.replace('\n', " ↵ "),
@@ -4431,7 +5159,8 @@ impl TachyonApp {
                                                 t.text
                                             })
                                             .child(if self.node_name_input.is_empty() {
-                                                "Название (необяз.)".to_string()
+                                                self.tr("Название (необяз.)", "Name (optional)")
+                                                    .to_string()
                                             } else {
                                                 self.node_name_input.clone()
                                             }),
@@ -4464,12 +5193,12 @@ impl TachyonApp {
                                         }
                                         cx.notify();
                                     }))
-                                    .child("Добавить"),
+                                    .child(self.tr("Добавить", "Add")),
                             ),
                     ),
             )
             .child(
-                // Balancer & Cascade Settings Card
+                // Balancer & Cascade Settings Card (all 12 engine strategies + parameters)
                 div()
                     .w_full()
                     .p(px(10.0))
@@ -4478,69 +5207,248 @@ impl TachyonApp {
                     .border_1()
                     .border_color(t.border)
                     .flex()
-                    .items_center()
-                    .justify_between()
+                    .flex_col()
+                    .gap(px(6.0))
                     .child(
                         div()
+                            .w_full()
                             .flex()
                             .items_center()
-                            .gap(px(8.0))
+                            .justify_between()
                             .child(
                                 div()
-                                    .text_size(px(11.5))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(t.text_soft)
-                                    .child("Алгоритм автобалансировщика:"),
+                                    .flex()
+                                    .items_center()
+                                    .flex_wrap()
+                                    .gap(px(5.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(t.text_soft)
+                                            .child(self.tr("Балансировщик:", "Balancer:")),
+                                    )
+                                    .children(
+                                        [
+                                            ("stability", "Stability (EMA)"),
+                                            ("least_test", "Min RTT"),
+                                            ("least_load", "Least Load"),
+                                            ("hedged", "Hedged"),
+                                            ("failover", "Failover"),
+                                            ("sticky", "Sticky"),
+                                            ("weighted", "Weighted"),
+                                            ("passive", "Passive"),
+                                            ("priority", "Priority"),
+                                            ("throughput", "Throughput"),
+                                            ("quota", "Quota"),
+                                            ("round_robin", "Round Robin"),
+                                        ]
+                                        .into_iter()
+                                        .map(|(bm, blabel)| {
+                                            let active = self.state.vpn_prefs.balancer_mode == bm;
+                                            div()
+                                                .id(SharedString::from(format!("bm-mode-{bm}")))
+                                                .px(px(6.0))
+                                                .py(px(3.0))
+                                                .rounded(px(5.0))
+                                                .cursor_pointer()
+                                                .bg(if active { t.accent_bg } else { t.bg_elev })
+                                                .text_size(px(10.0))
+                                                .text_color(if active {
+                                                    t.accent
+                                                } else {
+                                                    t.text_dim
+                                                })
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.state.vpn_prefs.balancer_mode =
+                                                        bm.to_string();
+                                                    this.reconnect_if_active();
+                                                    cx.notify();
+                                                }))
+                                                .child(blabel)
+                                        }),
+                                    ),
                             )
-                            .children(
-                                [
-                                    ("stability", "Stability (EMA)"),
-                                    ("least_test", "Min RTT"),
-                                    ("least_load", "Least Load"),
-                                    ("hedged", "Hedged"),
-                                    ("failover", "Failover"),
-                                ]
-                                .into_iter()
-                                .map(|(bm, blabel)| {
-                                    let active = self.state.vpn_prefs.balancer_mode == bm;
-                                    div()
-                                        .id(SharedString::from(format!("bm-mode-{bm}")))
-                                        .px(px(8.0))
-                                        .py(px(4.0))
-                                        .rounded(px(6.0))
-                                        .cursor_pointer()
-                                        .bg(if active { t.accent_bg } else { t.bg_elev })
-                                        .text_size(px(10.5))
-                                        .text_color(if active { t.accent } else { t.text_dim })
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.state.vpn_prefs.balancer_mode = bm.to_string();
-                                            this.reconnect_if_active();
-                                            cx.notify();
-                                        }))
-                                        .child(blabel)
-                                }),
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .child(
+                                        div()
+                                            .id("btn-create-custom-balancer")
+                                            .px(px(8.0))
+                                            .py(px(3.0))
+                                            .rounded(px(5.0))
+                                            .bg(t.accent_bg)
+                                            .border_1()
+                                            .border_color(t.accent_border)
+                                            .cursor_pointer()
+                                            .text_size(px(10.5))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(t.accent)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.create_custom_balancer_from_nodes();
+                                                cx.notify();
+                                            }))
+                                            .child(self.tr(
+                                                "+ Собрать балансировщик",
+                                                "+ Create Balancer",
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("btn-open-subs-from-nodes")
+                                            .px(px(8.0))
+                                            .py(px(3.0))
+                                            .rounded(px(5.0))
+                                            .bg(t.bg_elev)
+                                            .border_1()
+                                            .border_color(t.border)
+                                            .cursor_pointer()
+                                            .text_size(px(10.5))
+                                            .text_color(t.text_soft)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.modal = ModalKind::Subscriptions;
+                                                cx.notify();
+                                            }))
+                                            .child(if self.is_en() {
+                                                format!(
+                                                    "Subscriptions ({})",
+                                                    self.state.subscriptions.len()
+                                                )
+                                            } else {
+                                                format!(
+                                                    "Подписки ({})",
+                                                    self.state.subscriptions.len()
+                                                )
+                                            }),
+                                    ),
                             ),
                     )
                     .child(
                         div()
-                            .id("btn-open-subs-from-nodes")
-                            .px(px(10.0))
-                            .py(px(4.0))
-                            .rounded(px(6.0))
-                            .bg(t.bg_elev)
-                            .border_1()
-                            .border_color(t.border)
-                            .cursor_pointer()
-                            .text_size(px(11.0))
-                            .text_color(t.accent)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.modal = ModalKind::Subscriptions;
-                                cx.notify();
-                            }))
-                            .child(format!(
-                                "Подписки ({})",
-                                self.state.subscriptions.len()
-                            )),
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(5.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(10.5))
+                                            .text_color(t.text_dim)
+                                            .child(self.tr("Пул узлов:", "Pool Size:")),
+                                    )
+                                    .children([4usize, 8, 12, 16, 24].into_iter().map(|pl| {
+                                        let act = self.state.vpn_prefs.balancer_pool == pl;
+                                        div()
+                                            .id(SharedString::from(format!("bm-pool-{pl}")))
+                                            .px(px(6.0))
+                                            .py(px(2.0))
+                                            .rounded(px(4.0))
+                                            .cursor_pointer()
+                                            .bg(if act { t.accent_bg } else { t.bg_elev })
+                                            .text_size(px(10.0))
+                                            .text_color(if act { t.accent } else { t.text_dim })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.state.vpn_prefs.balancer_pool = pl;
+                                                this.reconnect_if_active();
+                                                cx.notify();
+                                            }))
+                                            .child(pl.to_string())
+                                    }))
+                                    .child(
+                                        div()
+                                            .pl(px(8.0))
+                                            .text_size(px(10.5))
+                                            .text_color(t.text_dim)
+                                            .child(self.tr("Допуск RTT:", "Tolerance:")),
+                                    )
+                                    .children([20u32, 40, 80, 150].into_iter().map(|tol| {
+                                        let act = self.state.vpn_prefs.balancer_tolerance == tol;
+                                        div()
+                                            .id(SharedString::from(format!("bm-tol-{tol}")))
+                                            .px(px(6.0))
+                                            .py(px(2.0))
+                                            .rounded(px(4.0))
+                                            .cursor_pointer()
+                                            .bg(if act { t.amber_bg } else { t.bg_elev })
+                                            .text_size(px(10.0))
+                                            .text_color(if act { t.amber } else { t.text_dim })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.state.vpn_prefs.balancer_tolerance = tol;
+                                                this.reconnect_if_active();
+                                                cx.notify();
+                                            }))
+                                            .child(format!("{tol}ms"))
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(5.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(10.5))
+                                            .text_color(t.text_dim)
+                                            .child(self.tr("Интервал проверки:", "Probe Interval:")),
+                                    )
+                                    .children(["30s", "1m", "3m", "5m"].into_iter().map(|iv| {
+                                        let act = self.state.vpn_prefs.balancer_interval == iv;
+                                        div()
+                                            .id(SharedString::from(format!("bm-iv-{iv}")))
+                                            .px(px(6.0))
+                                            .py(px(2.0))
+                                            .rounded(px(4.0))
+                                            .cursor_pointer()
+                                            .bg(if act { t.accent_bg } else { t.bg_elev })
+                                            .text_size(px(10.0))
+                                            .text_color(if act { t.accent } else { t.text_dim })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.state.vpn_prefs.balancer_interval =
+                                                    iv.to_string();
+                                                this.reconnect_if_active();
+                                                cx.notify();
+                                            }))
+                                            .child(iv)
+                                    }))
+                                    .child(
+                                        div()
+                                            .pl(px(8.0))
+                                            .text_size(px(10.5))
+                                            .text_color(t.text_dim)
+                                            .child(self.tr("Квота ротации:", "Quota:")),
+                                    )
+                                    .children([0u32, 512, 2048, 10240].into_iter().map(|q_mib| {
+                                        let act = self.state.vpn_prefs.balancer_quota_mib == q_mib;
+                                        let qlabel = match q_mib {
+                                            0 => self.tr("Выкл", "Off").to_string(),
+                                            512 => "512 MB".to_string(),
+                                            2048 => "2 GB".to_string(),
+                                            _ => "10 GB".to_string(),
+                                        };
+                                        div()
+                                            .id(SharedString::from(format!("bm-q-{q_mib}")))
+                                            .px(px(6.0))
+                                            .py(px(2.0))
+                                            .rounded(px(4.0))
+                                            .cursor_pointer()
+                                            .bg(if act { t.green_bg } else { t.bg_elev })
+                                            .text_size(px(10.0))
+                                            .text_color(if act { t.green } else { t.text_dim })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.state.vpn_prefs.balancer_quota_mib = q_mib;
+                                                this.reconnect_if_active();
+                                                cx.notify();
+                                            }))
+                                            .child(qlabel)
+                                    })),
+                            ),
                     ),
             )
             .child(
@@ -4554,29 +5462,32 @@ impl TachyonApp {
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(6.0))
+                            .gap(px(5.0))
                             .children(
                                 [
-                                    ("all", "Все"),
-                                    ("alive", "Доступные"),
-                                    ("AWG", "AmneziaWG / WG"),
-                                    ("REALITY", "VLESS Reality"),
-                                    ("XHTTP", "XHTTP / WS"),
-                                    ("HY2", "Hysteria2 / TUIC"),
+                                    ("all", self.tr("Все", "All")),
+                                    ("alive", self.tr("Доступные", "Alive")),
+                                    ("AWG", "AWG / WG"),
+                                    ("REALITY", "Reality / VLESS"),
+                                    ("XHTTP", "XHTTP / WS / gRPC"),
+                                    ("HY2", "HY2 / TUIC / WDTT"),
+                                    ("TEWFAI", "Tewfai / Mieru"),
+                                    ("VMESS", "VMess / Trojan / SS"),
+                                    ("BALANCER", "Balancer"),
                                 ]
                                 .into_iter()
                                 .map(|(fid, flabel)| {
                                     let active = self.node_filter == fid;
                                     div()
                                         .id(SharedString::from(format!("nf-chip-{fid}")))
-                                        .px(px(8.0))
+                                        .px(px(7.0))
                                         .py(px(4.0))
                                         .rounded(px(6.0))
                                         .cursor_pointer()
                                         .bg(if active { t.accent_bg } else { t.bg_card })
                                         .border_1()
                                         .border_color(if active { t.accent_border } else { t.border })
-                                        .text_size(px(10.5))
+                                        .text_size(px(10.0))
                                         .text_color(if active { t.accent } else { t.text_dim })
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.node_filter = fid.to_string();
@@ -4588,7 +5499,7 @@ impl TachyonApp {
                             .child(
                                 div()
                                     .id("btn-filter-hide-ru-by")
-                                    .px(px(8.0))
+                                    .px(px(7.0))
                                     .py(px(4.0))
                                     .rounded(px(6.0))
                                     .cursor_pointer()
@@ -4599,13 +5510,13 @@ impl TachyonApp {
                                     } else {
                                         t.border
                                     })
-                                    .text_size(px(10.5))
+                                    .text_size(px(10.0))
                                     .text_color(if self.hide_ru_by { t.amber } else { t.text_dim })
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.hide_ru_by = !this.hide_ru_by;
                                         cx.notify();
                                     }))
-                                    .child("Без РФ/РБ"),
+                                    .child(self.tr("Без РФ/РБ", "Hide RU/BY")),
                             ),
                     )
                     .child(
@@ -4630,7 +5541,7 @@ impl TachyonApp {
                                         this.ping_all_nodes();
                                         cx.notify();
                                     }))
-                                    .child("Замерить все"),
+                                    .child(self.tr("Замерить все", "Ping All")),
                             )
                             .child(
                                 div()
@@ -4665,12 +5576,14 @@ impl TachyonApp {
                                                 .unwrap_or_default();
                                         }
                                         this.state.save();
-                                        this.show_toast(format!(
-                                            "Удалено недоступных узлов: {removed}"
-                                        ));
+                                        this.show_toast(if this.is_en() {
+                                            format!("Removed unreachable nodes: {removed}")
+                                        } else {
+                                            format!("Удалено недоступных узлов: {removed}")
+                                        });
                                         cx.notify();
                                     }))
-                                    .child("Очистить недоступные"),
+                                    .child(self.tr("Очистить недоступные", "Prune Dead")),
                             ),
                     ),
             )
@@ -4699,192 +5612,261 @@ impl TachyonApp {
                                     "alive" => srv.is_balancer || srv.ping_ms.unwrap_or(-1) > 0,
                                     "AWG" => matches!(p, "AWG" | "WG"),
                                     "REALITY" => matches!(p, "REALITY" | "VLESS"),
-                                    "XHTTP" => matches!(p, "XHTTP" | "WS" | "GRPC"),
-                                    "HY2" => matches!(p, "HY2" | "TUIC" | "WDTT"),
+                                    "XHTTP" => matches!(p, "XHTTP" | "WS" | "GRPC" | "HTTPUP"),
+                                    "HY2" => matches!(p, "HY2" | "TUIC" | "WDTT" | "QUIC"),
+                                    "TEWFAI" => matches!(p, "TEWFAI" | "MIERU" | "TRUST" | "JUICITY"),
+                                    "VMESS" => matches!(
+                                        p,
+                                        "VMESS"
+                                            | "TROJAN"
+                                            | "SS"
+                                            | "ANYTLS"
+                                            | "SHADOWTLS"
+                                            | "NAIVE"
+                                            | "FPTN"
+                                            | "TOR"
+                                            | "SSH"
+                                            | "SOCKS"
+                                            | "HTTP"
+                                    ),
+                                    "BALANCER" => srv.is_balancer || p == "BALANCER",
                                     _ => true,
                                 }
                             })
                             .map(|srv| {
                                 let is_sel = srv.id == self.state.active_id;
-                        let is_relay = srv.id == self.state.vpn_prefs.relay_id;
-                        let sid = srv.id.clone();
-                        let sid_del = srv.id.clone();
-                        let sid_relay = srv.id.clone();
-                        let srv_uri = srv.vless.clone();
-                        let proto = detect_protocol_badge(&srv.vless);
+                                let is_relay = srv.id == self.state.vpn_prefs.relay_id;
+                                let sid = srv.id.clone();
+                                let sid_ping = srv.id.clone();
+                                let sid_del = srv.id.clone();
+                                let sid_relay = srv.id.clone();
+                                let srv_uri = srv.vless.clone();
+                                let proto = detect_protocol_badge(&srv.vless);
 
-                        div()
-                            .id(SharedString::from(format!("node-row-{}", srv.id)))
-                            .w_full()
-                            .p(px(10.0))
-                            .rounded(px(10.0))
-                            .bg(if is_sel { t.accent_bg } else { t.bg_card })
-                            .border_1()
-                            .border_color(if is_sel { t.accent_border } else { t.border })
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
                                 div()
-                                    .id(SharedString::from(format!("node-sel-{}", srv.id)))
-                                    .flex_1()
-                                    .cursor_pointer()
+                                    .id(SharedString::from(format!("node-row-{}", srv.id)))
+                                    .w_full()
+                                    .p(px(10.0))
+                                    .rounded(px(10.0))
+                                    .bg(if is_sel { t.accent_bg } else { t.bg_card })
+                                    .border_1()
+                                    .border_color(if is_sel { t.accent_border } else { t.border })
                                     .flex()
                                     .items_center()
-                                    .gap(px(10.0))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.state.active_id = sid.clone();
-                                        this.reconnect_if_active();
-                                        cx.notify();
-                                    }))
-                                    .child(render_flag_badge(&srv.country, 22.0, t))
+                                    .justify_between()
                                     .child(
                                         div()
-                                            .flex()
-                                            .flex_col()
-                                            .child(
-                                                div()
-                                                    .text_size(px(12.0))
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(t.text)
-                                                    .child(srv.name.clone()),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(px(10.0))
-                                                    .text_color(t.text_dim)
-                                                    .child(format!(
-                                                        "{} · {}",
-                                                        country_title_ru(&srv.country),
-                                                        proto
-                                                    )),
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(6.0))
-                                    .when_some(srv.ping_ms, |el, ms| {
-                                        el.child(
-                                            div()
-                                                .px(px(6.0))
-                                                .py(px(2.0))
-                                                .rounded(px(4.0))
-                                                .bg(t.bg_elev)
-                                                .text_size(px(10.5))
-                                                .text_color(if ms > 0 {
-                                                    t.green
-                                                } else {
-                                                    t.text_mute
-                                                })
-                                                .child(if ms > 0 {
-                                                    format!("{ms} мс")
-                                                } else {
-                                                    "Недоступен".to_string()
-                                                }),
-                                        )
-                                    })
-                                    .child(
-                                        div()
-                                            .id(SharedString::from(format!(
-                                                "btn-relay-{}",
-                                                srv.id
-                                            )))
-                                            .px(px(7.0))
-                                            .py(px(3.0))
-                                            .rounded(px(5.0))
+                                            .id(SharedString::from(format!("node-sel-{}", srv.id)))
+                                            .flex_1()
                                             .cursor_pointer()
-                                            .bg(if is_relay { t.amber_bg } else { t.bg_elev })
-                                            .border_1()
-                                            .border_color(if is_relay {
-                                                t.amber_border
-                                            } else {
-                                                t.border
-                                            })
-                                            .text_size(px(10.0))
-                                            .text_color(if is_relay {
-                                                t.amber
-                                            } else {
-                                                t.text_dim
-                                            })
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(10.0))
                                             .on_click(cx.listener(move |this, _, _, cx| {
-                                                if this.state.vpn_prefs.relay_id == sid_relay {
-                                                    this.state.vpn_prefs.relay_id.clear();
-                                                } else {
-                                                    this.state.vpn_prefs.relay_id =
-                                                        sid_relay.clone();
-                                                }
+                                                this.state.active_id = sid.clone();
                                                 this.reconnect_if_active();
                                                 cx.notify();
                                             }))
-                                            .child(if is_relay {
-                                                "Каскад (Вход)"
-                                            } else {
-                                                "В каскад"
-                                            }),
-                                    )
-                                    .child(
-                                        div()
-                                            .id(SharedString::from(format!("btn-copy-{}", srv.id)))
-                                            .w(px(26.0))
-                                            .h(px(26.0))
-                                            .rounded(px(6.0))
-                                            .bg(t.bg_elev)
-                                            .cursor_pointer()
-                                            .hover(|s| s.bg(t.bg_hover))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                                    srv_uri.clone(),
-                                                ));
-                                                this.show_toast("Ссылка скопирована в буфер обмена");
-                                                cx.notify();
-                                            }))
+                                            .child(render_flag_badge(&srv.country, 22.0, t))
                                             .child(
-                                                svg()
-                                                    .path("icons/copy.svg")
-                                                    .size(px(12.0))
-                                                    .text_color(t.text_soft),
+                                                div()
+                                                    .flex()
+                                                    .flex_col()
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(12.0))
+                                                            .font_weight(FontWeight::SEMIBOLD)
+                                                            .text_color(t.text)
+                                                            .child(srv.name.clone()),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(10.0))
+                                                            .text_color(t.text_dim)
+                                                            .child(format!(
+                                                                "{} · {}",
+                                                                self.country_title(&srv.country),
+                                                                proto
+                                                            )),
+                                                    ),
                                             ),
                                     )
                                     .child(
                                         div()
-                                            .id(SharedString::from(format!("btn-del-{}", srv.id)))
-                                            .w(px(26.0))
-                                            .h(px(26.0))
-                                            .rounded(px(6.0))
-                                            .bg(t.bg_elev)
-                                            .cursor_pointer()
-                                            .hover(|s| s.bg(t.red_bg))
                                             .flex()
                                             .items_center()
-                                            .justify_center()
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.state.servers.retain(|s| s.id != sid_del);
-                                                if this.state.active_id == sid_del {
-                                                    this.state.active_id = this
-                                                        .state
-                                                        .servers
-                                                        .first()
-                                                        .map(|s| s.id.clone())
-                                                        .unwrap_or_default();
-                                                }
-                                                this.state.save();
-                                                cx.notify();
-                                            }))
+                                            .gap(px(6.0))
                                             .child(
-                                                svg()
-                                                    .path("icons/trash.svg")
-                                                    .size(px(12.0))
-                                                    .text_color(t.red),
+                                                div()
+                                                    .id(SharedString::from(format!(
+                                                        "btn-node-ping-{}",
+                                                        srv.id
+                                                    )))
+                                                    .px(px(7.0))
+                                                    .py(px(3.0))
+                                                    .rounded(px(5.0))
+                                                    .bg(t.bg_elev)
+                                                    .border_1()
+                                                    .border_color(t.border)
+                                                    .cursor_pointer()
+                                                    .hover(|s| s.bg(t.bg_hover))
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(4.0))
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.ping_single_node(sid_ping.clone());
+                                                        cx.notify();
+                                                    }))
+                                                    .child(
+                                                        svg()
+                                                            .path("icons/bolt.svg")
+                                                            .size(px(10.0))
+                                                            .text_color(match srv.ping_ms {
+                                                                Some(ms) if ms > 0 => t.green,
+                                                                Some(_) => t.red,
+                                                                None => t.text_dim,
+                                                            }),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(10.5))
+                                                            .text_color(match srv.ping_ms {
+                                                                Some(ms) if ms > 0 => t.green,
+                                                                Some(_) => t.red,
+                                                                None => t.text_soft,
+                                                            })
+                                                            .child(match srv.ping_ms {
+                                                                Some(ms) if ms > 0 => {
+                                                                    if self.is_en() {
+                                                                        format!("{ms} ms")
+                                                                    } else {
+                                                                        format!("{ms} мс")
+                                                                    }
+                                                                }
+                                                                Some(_) => self
+                                                                    .tr("Недоступен", "Dead")
+                                                                    .to_string(),
+                                                                None => self
+                                                                    .tr("Пинг", "Ping")
+                                                                    .to_string(),
+                                                            }),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id(SharedString::from(format!(
+                                                        "btn-relay-{}",
+                                                        srv.id
+                                                    )))
+                                                    .px(px(7.0))
+                                                    .py(px(3.0))
+                                                    .rounded(px(5.0))
+                                                    .cursor_pointer()
+                                                    .bg(if is_relay { t.amber_bg } else { t.bg_elev })
+                                                    .border_1()
+                                                    .border_color(if is_relay {
+                                                        t.amber_border
+                                                    } else {
+                                                        t.border
+                                                    })
+                                                    .text_size(px(10.0))
+                                                    .text_color(if is_relay {
+                                                        t.amber
+                                                    } else {
+                                                        t.text_dim
+                                                    })
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        if this.state.vpn_prefs.relay_id
+                                                            == sid_relay
+                                                        {
+                                                            this.state.vpn_prefs.relay_id.clear();
+                                                        } else {
+                                                            this.state.vpn_prefs.relay_id =
+                                                                sid_relay.clone();
+                                                        }
+                                                        this.reconnect_if_active();
+                                                        cx.notify();
+                                                    }))
+                                                    .child(if is_relay {
+                                                        self.tr("Каскад (Вход)", "Relay (Entry)")
+                                                    } else {
+                                                        self.tr("В каскад", "Set Relay")
+                                                    }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id(SharedString::from(format!(
+                                                        "btn-copy-{}",
+                                                        srv.id
+                                                    )))
+                                                    .w(px(26.0))
+                                                    .h(px(26.0))
+                                                    .rounded(px(6.0))
+                                                    .bg(t.bg_elev)
+                                                    .cursor_pointer()
+                                                    .hover(|s| s.bg(t.bg_hover))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        cx.write_to_clipboard(
+                                                            ClipboardItem::new_string(
+                                                                srv_uri.clone(),
+                                                            ),
+                                                        );
+                                                        this.show_toast(this.tr(
+                                                            "Ссылка скопирована в буфер обмена",
+                                                            "Link copied to clipboard",
+                                                        ));
+                                                        cx.notify();
+                                                    }))
+                                                    .child(
+                                                        svg()
+                                                            .path("icons/copy.svg")
+                                                            .size(px(12.0))
+                                                            .text_color(t.text_soft),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id(SharedString::from(format!(
+                                                        "btn-del-{}",
+                                                        srv.id
+                                                    )))
+                                                    .w(px(26.0))
+                                                    .h(px(26.0))
+                                                    .rounded(px(6.0))
+                                                    .bg(t.bg_elev)
+                                                    .cursor_pointer()
+                                                    .hover(|s| s.bg(t.red_bg))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.state
+                                                            .servers
+                                                            .retain(|s| s.id != sid_del);
+                                                        if this.state.active_id == sid_del {
+                                                            this.state.active_id = this
+                                                                .state
+                                                                .servers
+                                                                .first()
+                                                                .map(|s| s.id.clone())
+                                                                .unwrap_or_default();
+                                                        }
+                                                        this.state.save();
+                                                        cx.notify();
+                                                    }))
+                                                    .child(
+                                                        svg()
+                                                            .path("icons/trash.svg")
+                                                            .size(px(12.0))
+                                                            .text_color(t.red),
+                                                    ),
                                             ),
-                                    ),
-                            )
-                    })),
+                                    )
+                            }),
+                    ),
             )
     }
 
@@ -4927,7 +5909,10 @@ impl TachyonApp {
                                             .text_size(px(12.0))
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(t.text)
-                                            .child("Тест пропускной способности"),
+                                            .child(self.tr(
+                                                "Тест пропускной способности",
+                                                "Throughput Speedtest",
+                                            )),
                                     )
                                     .child(
                                         div()
@@ -4953,7 +5938,11 @@ impl TachyonApp {
                                                         this.speedtest_size_mb = sz;
                                                         cx.notify();
                                                     }))
-                                                    .child(format!("{sz} МБ"))
+                                                    .child(if self.is_en() {
+                                                        format!("{sz} MB")
+                                                    } else {
+                                                        format!("{sz} МБ")
+                                                    })
                                             }))
                                             .child(
                                                 div()
@@ -5004,9 +5993,9 @@ impl TachyonApp {
                                                         cx.notify();
                                                     }))
                                                     .child(if self.speedtest.running {
-                                                        "Остановить"
+                                                        self.tr("Остановить", "Stop")
                                                     } else {
-                                                        "Запустить"
+                                                        self.tr("Запустить", "Start")
                                                     }),
                                             ),
                                     ),
@@ -5022,19 +6011,33 @@ impl TachyonApp {
                                             .text_size(px(20.0))
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(t.text)
-                                            .child(format!(
-                                                "{:.1} Мбит/с  ({:.1} МБ/с)",
-                                                self.speedtest.mbps, self.speedtest.mbs
-                                            )),
+                                            .child(if self.is_en() {
+                                                format!(
+                                                    "{:.1} Mbps  ({:.1} MB/s)",
+                                                    self.speedtest.mbps, self.speedtest.mbs
+                                                )
+                                            } else {
+                                                format!(
+                                                    "{:.1} Мбит/с  ({:.1} МБ/с)",
+                                                    self.speedtest.mbps, self.speedtest.mbs
+                                                )
+                                            }),
                                     )
                                     .child(
                                         div()
                                             .text_size(px(11.0))
                                             .text_color(t.text_dim)
-                                            .child(format!(
-                                                "Пик: {:.1} Мбит/с · TTFB: {} мс",
-                                                self.speedtest.peak_mbps, self.speedtest.ttfb_ms
-                                            )),
+                                            .child(if self.is_en() {
+                                                format!(
+                                                    "Peak: {:.1} Mbps · TTFB: {} ms",
+                                                    self.speedtest.peak_mbps, self.speedtest.ttfb_ms
+                                                )
+                                            } else {
+                                                format!(
+                                                    "Пик: {:.1} Мбит/с · TTFB: {} мс",
+                                                    self.speedtest.peak_mbps, self.speedtest.ttfb_ms
+                                                )
+                                            }),
                                     ),
                             ),
                     )
@@ -5061,7 +6064,10 @@ impl TachyonApp {
                                             .text_size(px(12.0))
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(t.text)
-                                            .child("Матрица связности и самодиагностика"),
+                                            .child(self.tr(
+                                                "Матрица связности и самодиагностика",
+                                                "Connectivity Matrix & Self-Check",
+                                            )),
                                     )
                                     .child(
                                         div()
@@ -5087,7 +6093,10 @@ impl TachyonApp {
                                                         });
                                                         cx.notify();
                                                     }))
-                                                    .child("Самодиагностика"),
+                                                    .child(self.tr(
+                                                        "Самодиагностика",
+                                                        "Self-Check",
+                                                    )),
                                             )
                                             .child(
                                                 div()
@@ -5114,9 +6123,9 @@ impl TachyonApp {
                                                         cx.notify();
                                                     }))
                                                     .child(if self.diag_running {
-                                                        "Проверка..."
+                                                        self.tr("Проверка...", "Checking...")
                                                     } else {
-                                                        "Маршруты"
+                                                        self.tr("Маршруты", "Routes")
                                                     }),
                                             ),
                                     ),
@@ -5136,8 +6145,11 @@ impl TachyonApp {
                                             .text_size(px(10.5))
                                             .text_color(if item.ok { t.green } else { t.red })
                                             .child(format!(
-                                                "{}: {} ({} мс)",
-                                                item.title, item.status, item.ms
+                                                "{}: {} ({} {})",
+                                                item.title,
+                                                item.status,
+                                                item.ms,
+                                                self.tr("мс", "ms")
                                             ))
                                     }))
                                     .children(self.self_check_items.iter().map(|sc| {
@@ -5147,7 +6159,7 @@ impl TachyonApp {
                                             .get("label")
                                             .or_else(|| sc.get("title"))
                                             .and_then(Value::as_str)
-                                            .unwrap_or("Проверка");
+                                            .unwrap_or(self.tr("Проверка", "Check"));
                                         let detail = sc
                                             .get("detail")
                                             .and_then(Value::as_str)
@@ -5193,17 +6205,24 @@ impl TachyonApp {
                                             .text_size(px(12.0))
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(t.text)
-                                            .child(format!(
-                                                "Активные сессии ({})",
-                                                self.connections.len()
-                                            )),
+                                            .child(if self.is_en() {
+                                                format!(
+                                                    "Active Sessions ({})",
+                                                    self.connections.len()
+                                                )
+                                            } else {
+                                                format!(
+                                                    "Активные сессии ({})",
+                                                    self.connections.len()
+                                                )
+                                            }),
                                     )
                                     .children(
                                         [
-                                            ("all", "Все"),
-                                            ("PROXY", "Туннель"),
+                                            ("all", self.tr("Все", "All")),
+                                            ("PROXY", self.tr("Туннель", "Tunnel")),
                                             ("DESYNC", "Desync"),
-                                            ("DIRECT", "Прямые"),
+                                            ("DIRECT", self.tr("Прямые", "Direct")),
                                         ]
                                         .into_iter()
                                         .map(|(cf, clabel)| {
@@ -5249,7 +6268,7 @@ impl TachyonApp {
                                                     }
                                                 });
                                             }))
-                                            .child("Обновить"),
+                                            .child(self.tr("Обновить", "Refresh")),
                                     )
                                     .child(
                                         div()
@@ -5272,7 +6291,7 @@ impl TachyonApp {
                                                     }
                                                 });
                                             }))
-                                            .child("Сбросить все"),
+                                            .child(self.tr("Сбросить все", "Close All")),
                                     ),
                             ),
                     )
@@ -5309,6 +6328,8 @@ impl TachyonApp {
                                             .next()
                                             .unwrap_or(&c.host)
                                             .to_string();
+                                        let show_ip_sub = !c.ip_port.is_empty()
+                                            && c.ip_port != c.host;
                                         div()
                                             .w_full()
                                             .px(px(8.0))
@@ -5335,14 +6356,27 @@ impl TachyonApp {
                                                     )
                                                     .child(
                                                         div()
-                                                            .font_weight(FontWeight::MEDIUM)
+                                                            .font_weight(FontWeight::SEMIBOLD)
                                                             .text_color(t.text)
-                                                            .child(truncate_str(&c.host, 34)),
+                                                            .child(truncate_str(&c.host, 42)),
                                                     )
+                                                    .when(show_ip_sub, |el| {
+                                                        el.child(
+                                                            div()
+                                                                .text_size(px(10.0))
+                                                                .text_color(t.text_dim)
+                                                                .child(c.ip_port.clone()),
+                                                        )
+                                                    })
                                                     .child(
                                                         div()
+                                                            .px(px(5.0))
+                                                            .py(px(1.0))
+                                                            .rounded(px(4.0))
+                                                            .bg(t.bg_card)
+                                                            .text_size(px(9.5))
                                                             .text_color(t.text_mute)
-                                                            .child(format!("({})", c.process)),
+                                                            .child(c.process.clone()),
                                                     ),
                                             )
                                             .child(
@@ -5397,15 +6431,23 @@ impl TachyonApp {
                                                                                 action: "vpn"
                                                                                     .to_string(),
                                                                             });
-                                                                        this.show_toast(format!(
-                                                                            "{host_for_rule} добавлен в Туннель"
-                                                                        ));
+                                                                        this.show_toast(
+                                                                            if this.is_en() {
+                                                                                format!(
+                                                                                    "{host_for_rule} added to Tunnel"
+                                                                                )
+                                                                            } else {
+                                                                                format!(
+                                                                                    "{host_for_rule} добавлен в Туннель"
+                                                                                )
+                                                                            },
+                                                                        );
                                                                         this.reconnect_if_active();
                                                                         cx.notify();
                                                                     }
                                                                 },
                                                             ))
-                                                            .child("+ Туннель"),
+                                                            .child(self.tr("+ Туннель", "+ Tunnel")),
                                                     ),
                                             )
                                     }),
@@ -5436,7 +6478,7 @@ impl TachyonApp {
                     .border_color(t.border)
                     .flex()
                     .flex_col()
-                    .gap(px(10.0))
+                    .gap(px(8.0))
                     .child(
                         div()
                             .w_full()
@@ -5448,7 +6490,10 @@ impl TachyonApp {
                                     .text_size(px(13.0))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(t.text)
-                                    .child("Сеть, DNS и интерфейс TUN"),
+                                    .child(self.tr(
+                                        "Сеть, DNS и стек ядра TUN",
+                                        "Network, DNS & Kernel TUN Stack",
+                                    )),
                             )
                             .child(
                                 div()
@@ -5476,9 +6521,9 @@ impl TachyonApp {
                                         cx.notify();
                                     }))
                                     .child(if self.dns_running {
-                                        "Замер DNS..."
+                                        self.tr("Замер DNS...", "Testing DNS...")
                                     } else {
-                                        "Замерить DNS"
+                                        self.tr("Замерить DNS", "Benchmark DNS")
                                     }),
                             ),
                     )
@@ -5486,12 +6531,15 @@ impl TachyonApp {
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(6.0))
+                            .gap(px(5.0))
                             .child(
                                 div()
                                     .text_size(px(11.0))
                                     .text_color(t.text_dim)
-                                    .child("Резолвер DNS (DoH / Защищённый DNS)"),
+                                    .child(self.tr(
+                                        "Резолвер DNS (DoH / Защищённый DNS)",
+                                        "DNS Resolver (DoH / Secure DNS)",
+                                    )),
                             )
                             .child(
                                 div()
@@ -5504,15 +6552,15 @@ impl TachyonApp {
                                             ("8.8.8.8", "Google 8.8.8.8"),
                                             ("9.9.9.9", "Quad9 9.9.9.9"),
                                             ("94.140.14.14", "AdGuard DNS"),
-                                            ("77.88.8.8", "Яндекс 77.88.8.8"),
+                                            ("77.88.8.8", "Yandex 77.88.8.8"),
                                         ]
                                         .into_iter()
                                         .map(|(dval, dlabel)| {
                                             let active = p.dns == dval;
                                             div()
                                                 .id(SharedString::from(format!("dns-opt-{dval}")))
-                                                .px(px(10.0))
-                                                .py(px(5.0))
+                                                .px(px(9.0))
+                                                .py(px(4.0))
                                                 .rounded(px(6.0))
                                                 .cursor_pointer()
                                                 .bg(if active { t.accent_bg } else { t.bg_elev })
@@ -5522,7 +6570,7 @@ impl TachyonApp {
                                                 } else {
                                                     t.border
                                                 })
-                                                .text_size(px(11.0))
+                                                .text_size(px(10.5))
                                                 .text_color(if active {
                                                     t.accent
                                                 } else {
@@ -5552,7 +6600,12 @@ impl TachyonApp {
                                                 .bg(if b.ms > 0 { t.green_bg } else { t.red_bg })
                                                 .text_size(px(10.0))
                                                 .text_color(if b.ms > 0 { t.green } else { t.red })
-                                                .child(format!("{}: {} мс", b.name, b.ms))
+                                                .child(format!(
+                                                    "{}: {} {}",
+                                                    b.name,
+                                                    b.ms,
+                                                    self.tr("мс", "ms")
+                                                ))
                                         })),
                                 )
                             }),
@@ -5568,25 +6621,25 @@ impl TachyonApp {
                                 div()
                                     .flex()
                                     .items_center()
-                                    .gap(px(6.0))
+                                    .gap(px(5.0))
                                     .child(
                                         div()
-                                            .text_size(px(11.0))
+                                            .text_size(px(10.5))
                                             .text_color(t.text_dim)
-                                            .child("Маршрут DNS:"),
+                                            .child(self.tr("Маршрут DNS:", "DNS Route:")),
                                     )
                                     .children(
                                         [
-                                            ("split_ru", "Split (.ru напрямую)"),
-                                            ("proxy", "Через туннель"),
-                                            ("direct", "Напрямую"),
+                                            ("split_ru", self.tr("Split (.ru напрямую)", "Split (.ru direct)")),
+                                            ("proxy", self.tr("Туннель", "Tunnel")),
+                                            ("direct", self.tr("Напрямую", "Direct")),
                                         ]
                                         .into_iter()
                                         .map(|(drm, drl)| {
                                             let act = p.dns_route_mode == drm;
                                             div()
                                                 .id(SharedString::from(format!("opt-drm-{drm}")))
-                                                .px(px(7.0))
+                                                .px(px(6.0))
                                                 .py(px(3.0))
                                                 .rounded(px(5.0))
                                                 .cursor_pointer()
@@ -5610,7 +6663,7 @@ impl TachyonApp {
                                     .gap(px(4.0))
                                     .child(
                                         div()
-                                            .text_size(px(11.0))
+                                            .text_size(px(10.5))
                                             .text_color(t.text_dim)
                                             .child("MTU:"),
                                     )
@@ -5636,10 +6689,102 @@ impl TachyonApp {
                                     )),
                             ),
                     )
+                    .child(
+                        // DNS Strategy + TUN Stack row
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(5.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(10.5))
+                                            .text_color(t.text_dim)
+                                            .child(self.tr("Стратегия IP:", "IP Strategy:")),
+                                    )
+                                    .children(
+                                        [
+                                            ("prefer_ipv4", "Prefer IPv4"),
+                                            ("ipv4_only", "IPv4 Only"),
+                                            ("prefer_ipv6", "Prefer IPv6"),
+                                        ]
+                                        .into_iter()
+                                        .map(|(st, sl)| {
+                                            let act = p.dns_strategy == st;
+                                            div()
+                                                .id(SharedString::from(format!("opt-dns-st-{st}")))
+                                                .px(px(6.0))
+                                                .py(px(3.0))
+                                                .rounded(px(5.0))
+                                                .cursor_pointer()
+                                                .bg(if act { t.accent_bg } else { t.bg_elev })
+                                                .text_size(px(10.0))
+                                                .text_color(if act { t.accent } else { t.text_dim })
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.state.vpn_prefs.dns_strategy =
+                                                        st.to_string();
+                                                    this.reconnect_if_active();
+                                                    cx.notify();
+                                                }))
+                                                .child(sl)
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(10.5))
+                                            .text_color(t.text_dim)
+                                            .child(self.tr("Стек TUN:", "TUN Stack:")),
+                                    )
+                                    .children(
+                                        [
+                                            ("mixed", "Mixed"),
+                                            ("system", "System"),
+                                            ("gvisor", "gVisor"),
+                                        ]
+                                        .into_iter()
+                                        .map(|(stk, sl)| {
+                                            let act = p.tun_stack == stk;
+                                            div()
+                                                .id(SharedString::from(format!("opt-stk-{stk}")))
+                                                .px(px(6.0))
+                                                .py(px(3.0))
+                                                .rounded(px(5.0))
+                                                .cursor_pointer()
+                                                .bg(if act { t.amber_bg } else { t.bg_elev })
+                                                .text_size(px(10.0))
+                                                .text_color(if act { t.amber } else { t.text_dim })
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.state.vpn_prefs.tun_stack =
+                                                        stk.to_string();
+                                                    this.reconnect_if_active();
+                                                    cx.notify();
+                                                }))
+                                                .child(sl)
+                                        }),
+                                    ),
+                            ),
+                    )
                     .child(self.render_toggle_row(
                         "opt-fake-ip",
-                        "Виртуальный пул FakeIP (198.18.0.0/15)",
-                        "Мгновенный DNS-ответ и маршрутизация по доменным именам без задержки",
+                        self.tr(
+                            "Виртуальный пул FakeIP (198.18.0.0/15)",
+                            "Virtual FakeIP Pool (198.18.0.0/15)",
+                        ),
+                        self.tr(
+                            "Мгновенный DNS-ответ и маршрутизация по доменным именам без задержки",
+                            "Instant DNS response and zero-latency domain routing",
+                        ),
                         p.fake_ip,
                         t,
                         cx.listener(|this, _, _, cx| {
@@ -5649,9 +6794,34 @@ impl TachyonApp {
                         }),
                     ))
                     .child(self.render_toggle_row(
+                        "opt-dns-revmap",
+                        self.tr(
+                            "Обратный кэш доменов DNS (Reverse Mapping)",
+                            "DNS Reverse Domain Mapping",
+                        ),
+                        self.tr(
+                            "Отображение реальных доменных имён в списке активных сессий",
+                            "Display resolved domain names in active session monitor",
+                        ),
+                        p.dns_reverse_mapping,
+                        t,
+                        cx.listener(|this, _, _, cx| {
+                            this.state.vpn_prefs.dns_reverse_mapping =
+                                !this.state.vpn_prefs.dns_reverse_mapping;
+                            this.reconnect_if_active();
+                            cx.notify();
+                        }),
+                    ))
+                    .child(self.render_toggle_row(
                         "opt-ru-bypass",
-                        "Прямой маршрут для РФ (.ru / .рф / GeoIP RU)",
-                        "Сайты, банки и госсервисы РФ работают напрямую без задержки",
+                        self.tr(
+                            "Прямой маршрут для РФ (.ru / .рф / GeoIP RU)",
+                            "Direct Route for RU (.ru / .рф / GeoIP RU)",
+                        ),
+                        self.tr(
+                            "Сайты, банки и госсервисы РФ работают напрямую без задержки",
+                            "Local sites, banking and domestic services connect directly",
+                        ),
                         p.ru_bypass,
                         t,
                         cx.listener(|this, _, _, cx| {
@@ -5662,8 +6832,14 @@ impl TachyonApp {
                     ))
                     .child(self.render_toggle_row(
                         "opt-sniff",
-                        "Инспекция протоколов (TLS SNI / HTTP Sniffing)",
-                        "Точное определение доменов из заголовков пакетов",
+                        self.tr(
+                            "Инспекция протоколов (TLS SNI / HTTP Sniffing)",
+                            "Protocol Sniffing (TLS SNI / HTTP Host)",
+                        ),
+                        self.tr(
+                            "Точное определение доменов из первых пакетов соединения",
+                            "Accurate domain extraction from initial connection packets",
+                        ),
                         p.sniff,
                         t,
                         cx.listener(|this, _, _, cx| {
@@ -5674,8 +6850,14 @@ impl TachyonApp {
                     ))
                     .child(self.render_toggle_row(
                         "opt-strict-route",
-                        "Строгая маршрутизация TUN (Strict Route)",
-                        "Защита от утечек DNS и WebRTC мимо виртуального адаптера",
+                        self.tr(
+                            "Строгая маршрутизация TUN (Strict Route)",
+                            "Strict TUN Routing (Strict Route)",
+                        ),
+                        self.tr(
+                            "Защита от утечек DNS и WebRTC мимо виртуального адаптера",
+                            "Prevent DNS and WebRTC leaks outside virtual adapter",
+                        ),
                         p.strict_route,
                         t,
                         cx.listener(|this, _, _, cx| {
@@ -5686,7 +6868,7 @@ impl TachyonApp {
                     )),
             )
             .child(
-                // Right column: System & Updates
+                // Right column: Engine, Language, System & Updates
                 div()
                     .flex_1()
                     .p(px(14.0))
@@ -5696,7 +6878,7 @@ impl TachyonApp {
                     .border_color(t.border)
                     .flex()
                     .flex_col()
-                    .gap(px(10.0))
+                    .gap(px(8.0))
                     .child(
                         div()
                             .w_full()
@@ -5708,52 +6890,172 @@ impl TachyonApp {
                                     .text_size(px(13.0))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(t.text)
-                                    .child("Система, автозапуск и обновления"),
+                                    .child(self.tr(
+                                        "Движок, язык и система",
+                                        "Engine, Language & System",
+                                    )),
                             )
                             .child(
                                 div()
                                     .flex()
                                     .items_center()
-                                    .gap(px(4.0))
+                                    .gap(px(6.0))
+                                    .child(
+                                        // Language selector in options
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(3.0))
+                                            .children(
+                                                [("ru", "Русский"), ("en", "English")]
+                                                    .into_iter()
+                                                    .map(|(lc, ltitle)| {
+                                                        let act = if lc == "en" {
+                                                            self.is_en()
+                                                        } else {
+                                                            !self.is_en()
+                                                        };
+                                                        div()
+                                                            .id(SharedString::from(format!(
+                                                                "opt-lang-{lc}"
+                                                            )))
+                                                            .px(px(7.0))
+                                                            .py(px(2.0))
+                                                            .rounded(px(4.0))
+                                                            .cursor_pointer()
+                                                            .bg(if act {
+                                                                t.accent_bg
+                                                            } else {
+                                                                t.bg_elev
+                                                            })
+                                                            .text_size(px(10.0))
+                                                            .font_weight(FontWeight::SEMIBOLD)
+                                                            .text_color(if act {
+                                                                t.accent
+                                                            } else {
+                                                                t.text_dim
+                                                            })
+                                                            .on_click(cx.listener(
+                                                                move |this, _, _, cx| {
+                                                                    this.state.language =
+                                                                        lc.to_string();
+                                                                    this.state.save();
+                                                                    cx.notify();
+                                                                },
+                                                            ))
+                                                            .child(ltitle)
+                                                    }),
+                                            ),
+                                    )
                                     .child(
                                         div()
-                                            .text_size(px(10.5))
-                                            .text_color(t.text_dim)
-                                            .child("Лог:"),
-                                    )
-                                    .children(
-                                        ["warn", "info", "debug", "error"]
-                                            .into_iter()
-                                            .map(|lvl| {
-                                                let act = p.log_level == lvl;
-                                                div()
-                                                    .id(SharedString::from(format!("opt-log-{lvl}")))
-                                                    .px(px(6.0))
-                                                    .py(px(2.0))
-                                                    .rounded(px(4.0))
-                                                    .cursor_pointer()
-                                                    .bg(if act { t.accent_bg } else { t.bg_elev })
-                                                    .text_size(px(10.0))
-                                                    .text_color(if act {
-                                                        t.accent
-                                                    } else {
-                                                        t.text_dim
-                                                    })
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        this.state.vpn_prefs.log_level =
-                                                            lvl.to_string();
-                                                        this.reconnect_if_active();
-                                                        cx.notify();
-                                                    }))
-                                                    .child(lvl.to_uppercase())
-                                            }),
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(3.0))
+                                            .children(
+                                                ["warn", "info", "debug", "error"]
+                                                    .into_iter()
+                                                    .map(|lvl| {
+                                                        let act = p.log_level == lvl;
+                                                        div()
+                                                            .id(SharedString::from(format!(
+                                                                "opt-log-{lvl}"
+                                                            )))
+                                                            .px(px(6.0))
+                                                            .py(px(2.0))
+                                                            .rounded(px(4.0))
+                                                            .cursor_pointer()
+                                                            .bg(if act {
+                                                                t.accent_bg
+                                                            } else {
+                                                                t.bg_elev
+                                                            })
+                                                            .text_size(px(10.0))
+                                                            .text_color(if act {
+                                                                t.accent
+                                                            } else {
+                                                                t.text_dim
+                                                            })
+                                                            .on_click(cx.listener(
+                                                                move |this, _, _, cx| {
+                                                                    this.state
+                                                                        .vpn_prefs
+                                                                        .log_level =
+                                                                        lvl.to_string();
+                                                                    this.reconnect_if_active();
+                                                                    cx.notify();
+                                                                },
+                                                            ))
+                                                            .child(lvl.to_uppercase())
+                                                    }),
+                                            ),
                                     ),
                             ),
                     )
                     .child(self.render_toggle_row(
+                        "opt-find-process",
+                        self.tr(
+                            "Определение процессов (Safe Snapshot без OpenProcess)",
+                            "Process Matching (Safe Snapshot without OpenProcess)",
+                        ),
+                        self.tr(
+                            "Маршрутизация по приложениям без срабатывания античитов",
+                            "Per-application routing safe for kernel anti-cheats",
+                        ),
+                        p.route_find_process,
+                        t,
+                        cx.listener(|this, _, _, cx| {
+                            this.state.vpn_prefs.route_find_process =
+                                !this.state.vpn_prefs.route_find_process;
+                            this.reconnect_if_active();
+                            cx.notify();
+                        }),
+                    ))
+                    .child(self.render_toggle_row(
+                        "opt-fullcone-nat",
+                        self.tr(
+                            "FullCone NAT для игр и голосовых вызовов",
+                            "FullCone NAT for Gaming & Voice Calls",
+                        ),
+                        self.tr(
+                            "Открытый тип NAT для UDP-сессий, WebRTC и мультиплеера",
+                            "Open NAT mapping for UDP gaming, WebRTC and voice",
+                        ),
+                        p.route_fullcone_nat,
+                        t,
+                        cx.listener(|this, _, _, cx| {
+                            this.state.vpn_prefs.route_fullcone_nat =
+                                !this.state.vpn_prefs.route_fullcone_nat;
+                            this.reconnect_if_active();
+                            cx.notify();
+                        }),
+                    ))
+                    .child(self.render_toggle_row(
+                        "opt-smart-queue",
+                        self.tr(
+                            "Умная очередь пакетов (Smart Queue / Pacing)",
+                            "Smart Packet Queue & Pacing",
+                        ),
+                        self.tr(
+                            "Снижение джиттера и задержек при высокой загрузке канала",
+                            "Reduce bufferbloat and jitter under heavy load",
+                        ),
+                        p.route_smart_queue,
+                        t,
+                        cx.listener(|this, _, _, cx| {
+                            this.state.vpn_prefs.route_smart_queue =
+                                !this.state.vpn_prefs.route_smart_queue;
+                            this.reconnect_if_active();
+                            cx.notify();
+                        }),
+                    ))
+                    .child(self.render_toggle_row(
                         "opt-autostart",
-                        "Запускать вместе с ОС",
-                        "Автоматический старт Tachyon при входе в систему",
+                        self.tr("Запускать вместе с ОС", "Launch at OS Startup"),
+                        self.tr(
+                            "Автоматический старт Tachyon при входе в систему",
+                            "Automatically start Tachyon when logging in",
+                        ),
                         p.autostart,
                         t,
                         cx.listener(|this, _, _, cx| {
@@ -5766,8 +7068,11 @@ impl TachyonApp {
                     ))
                     .child(self.render_toggle_row(
                         "opt-autoconnect",
-                        "Автоподключение при старте",
-                        "Сразу поднимать активный туннель при открытии клиента",
+                        self.tr("Автоподключение при старте", "Auto-Connect on Launch"),
+                        self.tr(
+                            "Сразу поднимать активный туннель при открытии клиента",
+                            "Immediately connect active tunnel when app starts",
+                        ),
                         p.auto_connect,
                         t,
                         cx.listener(|this, _, _, cx| {
@@ -5778,8 +7083,14 @@ impl TachyonApp {
                     ))
                     .child(self.render_toggle_row(
                         "opt-allow-lan",
-                        "Доступ из локальной сети (Allow LAN)",
-                        "Разрешить подключение других устройств домашней сети к прокси-порту",
+                        self.tr(
+                            "Доступ из локальной сети (Allow LAN)",
+                            "Allow LAN Connections",
+                        ),
+                        self.tr(
+                            "Разрешить подключение других устройств домашней сети к прокси-порту",
+                            "Allow other devices on local network to use proxy port",
+                        ),
                         p.allow_lan,
                         t,
                         cx.listener(|this, _, _, cx| {
@@ -5790,8 +7101,14 @@ impl TachyonApp {
                     ))
                     .child(self.render_toggle_row(
                         "opt-adblock",
-                        "Блокировка рекламы и телеметрии",
-                        "Фильтрация рекламных сетей на уровне маршрутизатора",
+                        self.tr(
+                            "Блокировка рекламы и телеметрии",
+                            "Block Ads & Telemetry",
+                        ),
+                        self.tr(
+                            "Фильтрация рекламных сетей на уровне маршрутизатора",
+                            "Router-level filtering of ad and tracking domains",
+                        ),
                         p.adblock,
                         t,
                         cx.listener(|this, _, _, cx| {
@@ -5803,7 +7120,7 @@ impl TachyonApp {
                     .child(
                         div()
                             .w_full()
-                            .pt(px(4.0))
+                            .pt(px(2.0))
                             .flex()
                             .items_center()
                             .justify_between()
@@ -5825,10 +7142,13 @@ impl TachyonApp {
                                         this.rt.spawn(async move {
                                             v.check_github_update(false).await;
                                         });
-                                        this.show_toast("Проверка обновлений на GitHub...");
+                                        this.show_toast(this.tr(
+                                            "Проверка обновлений на GitHub...",
+                                            "Checking GitHub for updates...",
+                                        ));
                                         cx.notify();
                                     }))
-                                    .child("Проверить обновления"),
+                                    .child(self.tr("Проверить обновления", "Check for Updates")),
                             )
                             .when(self.update_banner.available, |el| {
                                 el.child(
@@ -5848,7 +7168,11 @@ impl TachyonApp {
                                                 v.install_github_update().await;
                                             });
                                         }))
-                                        .child(format!("Установить {}", self.update_banner.tag)),
+                                        .child(if self.is_en() {
+                                            format!("Install {}", self.update_banner.tag)
+                                        } else {
+                                            format!("Установить {}", self.update_banner.tag)
+                                        }),
                                 )
                             }),
                     ),
@@ -5958,7 +7282,10 @@ impl TachyonApp {
                                             .text_size(px(14.0))
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(t.text)
-                                            .child("Управление подписками и контейнерами"),
+                                            .child(self.tr(
+                                                "Управление подписками и контейнерами",
+                                                "Manage Subscriptions & Containers",
+                                            )),
                                     )
                                     .child(
                                         div()
@@ -6020,7 +7347,7 @@ impl TachyonApp {
                                                         t.text
                                                     })
                                                     .child(if self.sub_url_input.is_empty() {
-                                                        "https://... или happ://... или vpn://..."
+                                                        "https://... / happ://... / vpn://..."
                                                             .to_string()
                                                     } else {
                                                         truncate_str(&self.sub_url_input, 56)
@@ -6049,7 +7376,7 @@ impl TachyonApp {
                                                 }
                                                 cx.notify();
                                             }))
-                                            .child("Подключить"),
+                                            .child(self.tr("Подключить", "Add")),
                                     ),
                             )
                             .child(
@@ -6091,7 +7418,8 @@ impl TachyonApp {
                                                             .text_size(px(10.5))
                                                             .text_color(t.text_dim)
                                                             .child(format!(
-                                                                "Узлов: {} · {}",
+                                                                "{}: {} · {}",
+                                                                self.tr("Узлов", "Nodes"),
                                                                 sub.count,
                                                                 truncate_str(&sub.url, 44)
                                                             )),
@@ -6122,7 +7450,7 @@ impl TachyonApp {
                                                                     cx.notify();
                                                                 },
                                                             ))
-                                                            .child("Обновить"),
+                                                            .child(self.tr("Обновить", "Update")),
                                                     )
                                                     .child(
                                                         div()
@@ -6153,7 +7481,7 @@ impl TachyonApp {
                                                                     cx.notify();
                                                                 },
                                                             ))
-                                                            .child("Удалить"),
+                                                            .child(self.tr("Удалить", "Delete")),
                                                     ),
                                             )
                                     })),
@@ -6195,7 +7523,10 @@ impl TachyonApp {
                                             .text_size(px(14.0))
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(t.text)
-                                            .child("Журнал ядра tachyon-core"),
+                                            .child(self.tr(
+                                                "Журнал ядра tachyon-core",
+                                                "tachyon-core Kernel Log",
+                                            )),
                                     )
                                     .child(
                                         div()
@@ -6215,7 +7546,7 @@ impl TachyonApp {
                                                         this.log_tail = this.vpn.get_log_tail(140);
                                                         cx.notify();
                                                     }))
-                                                    .child("Обновить"),
+                                                    .child(self.tr("Обновить", "Refresh")),
                                             )
                                             .child(
                                                 div()
@@ -6233,10 +7564,13 @@ impl TachyonApp {
                                                                 this.log_tail.clone(),
                                                             ),
                                                         );
-                                                        this.show_toast("Лог скопирован");
+                                                        this.show_toast(this.tr(
+                                                            "Лог скопирован",
+                                                            "Log copied",
+                                                        ));
                                                         cx.notify();
                                                     }))
-                                                    .child("Копировать"),
+                                                    .child(self.tr("Копировать", "Copy")),
                                             )
                                             .child(
                                                 div()
@@ -6276,7 +7610,7 @@ impl TachyonApp {
                                     .text_size(px(10.5))
                                     .text_color(t.text_soft)
                                     .child(if self.log_tail.trim().is_empty() {
-                                        "Журнал пуст.".to_string()
+                                        self.tr("Журнал пуст.", "Log is empty.").to_string()
                                     } else {
                                         self.log_tail.clone()
                                     }),

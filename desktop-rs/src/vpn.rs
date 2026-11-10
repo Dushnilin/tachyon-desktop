@@ -62,6 +62,7 @@ pub struct DesyncOptions {
     pub udp_fake_ttl: u32,
     pub auto_tune: bool,
     pub block_quic: bool,
+    pub anticheat_bypass: bool,
 }
 
 impl Default for DesyncOptions {
@@ -88,6 +89,7 @@ impl Default for DesyncOptions {
             udp_fake_ttl: 6,
             auto_tune: true,
             block_quic: true,
+            anticheat_bypass: true,
         }
     }
 }
@@ -353,6 +355,14 @@ pub struct ConnectOptions {
     pub balancer: BalancerOptions,
     pub community_lists: Vec<CommunityListRule>,
     pub custom_rules: Vec<CustomRouteRule>,
+    pub dns_strategy: String,
+    pub dns_reverse_mapping: bool,
+    pub route_find_process: bool,
+    pub route_fullcone_nat: bool,
+    pub route_smart_queue: bool,
+    pub tun_stack: String,
+    pub strict_route: bool,
+    pub sniff: bool,
 }
 
 impl ConnectOptions {
@@ -383,6 +393,14 @@ impl ConnectOptions {
                 balancer: BalancerOptions::default(),
                 community_lists: Vec::new(),
                 custom_rules: Vec::new(),
+                dns_strategy: "prefer_ipv4".to_string(),
+                dns_reverse_mapping: true,
+                route_find_process: true,
+                route_fullcone_nat: true,
+                route_smart_queue: false,
+                tun_stack: "mixed".to_string(),
+                strict_route: true,
+                sniff: true,
             });
         }
 
@@ -576,6 +594,9 @@ impl ConnectOptions {
             if let Some(v) = d.get("blockQuic").and_then(Value::as_bool) {
                 desync.block_quic = v;
             }
+            if let Some(v) = d.get("anticheatBypass").and_then(Value::as_bool) {
+                desync.anticheat_bypass = v;
+            }
         }
 
         let mut balancer = BalancerOptions::default();
@@ -697,6 +718,45 @@ impl ConnectOptions {
             }
         }
 
+        let dns_strategy = root
+            .get("dnsStrategy")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| matches!(*s, "prefer_ipv4" | "prefer_ipv6" | "ipv4_only" | "ipv6_only"))
+            .unwrap_or("prefer_ipv4")
+            .to_string();
+        let dns_reverse_mapping = root
+            .get("dnsReverseMapping")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let route_find_process = root
+            .get("routeFindProcess")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let route_fullcone_nat = root
+            .get("routeFullconeNat")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let route_smart_queue = root
+            .get("routeSmartQueue")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let tun_stack = root
+            .get("tunStack")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| matches!(*s, "mixed" | "system" | "gvisor"))
+            .unwrap_or("mixed")
+            .to_string();
+        let strict_route = root
+            .get("strictRoute")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let sniff = root
+            .get("sniff")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+
         let allow_without_node =
             block_only || route == RouteMode::DesyncOnly || desync.enabled;
         if !allow_without_node && vless.is_empty() {
@@ -723,6 +783,14 @@ impl ConnectOptions {
             balancer,
             community_lists,
             custom_rules,
+            dns_strategy,
+            dns_reverse_mapping,
+            route_find_process,
+            route_fullcone_nat,
+            route_smart_queue,
+            tun_stack,
+            strict_route,
+            sniff,
         })
     }
 }
@@ -1586,7 +1654,8 @@ impl VpnManager {
             "servers": dns_servers,
             "rules": dns_rules,
             "final": final_dns_tag,
-            "strategy": "prefer_ipv4"
+            "strategy": opts.dns_strategy,
+            "reverse_mapping": opts.dns_reverse_mapping
         });
 
         let mut inbounds = Vec::new();
@@ -1598,8 +1667,8 @@ impl VpnManager {
                 "address": ["172.19.0.1/30"],
                 "mtu": opts.mtu.clamp(1280, 9000),
                 "auto_route": true,
-                "strict_route": true,
-                "stack": "mixed",
+                "strict_route": opts.strict_route,
+                "stack": opts.tun_stack,
                 "route_exclude_address": [
                     "172.19.0.0/30",
                     "224.0.0.0/4",
@@ -1754,6 +1823,75 @@ impl VpnManager {
             "outbound": "direct"
         }));
 
+        if opts.desync.anticheat_bypass {
+            rules.push(json!({
+                "process_name": [
+                    "cod.exe",
+                    "cod22-cod.exe",
+                    "cod23-cod.exe",
+                    "cod24-cod.exe",
+                    "sp22-cod.exe",
+                    "sp23-cod.exe",
+                    "sp24-cod.exe",
+                    "randgrid.exe",
+                    "battle.net.exe",
+                    "agent.exe",
+                    "easyanticheat.exe",
+                    "easyanticheat_eos.exe",
+                    "start_protected_game.exe",
+                    "beservice.exe",
+                    "beclient_x64.exe",
+                    "eaanticheat.gameservice.exe",
+                    "eaanticheat.gameservice.dll",
+                    "faceitclient.exe",
+                    "faceitservice.exe",
+                    "vgc.exe",
+                    "vgtray.exe",
+                    "valorant.exe",
+                    "valorant-win64-shipping.exe",
+                    "riotclientservices.exe",
+                    "cs2.exe",
+                    "dota2.exe",
+                    "r5apex.exe",
+                    "fortniteclient-win64-shipping.exe",
+                    "tslgame.exe",
+                    "rainbowsix.exe",
+                    "rainbowsix_be.exe",
+                    "escapefromtarkov.exe",
+                    "escapefromtarkov_be.exe",
+                    "rustclient.exe",
+                    "dayz_x64.exe",
+                    "deadbydaylight-win64-shipping.exe",
+                    "overwatch.exe",
+                    "destiny2.exe",
+                    "helldivers2.exe",
+                    "thefinals.exe",
+                    "bf2042.exe",
+                    "fc24.exe",
+                    "fc25.exe",
+                    "genshinimpact.exe",
+                    "starrail.exe"
+                ],
+                "outbound": "direct"
+            }));
+            rules.push(json!({
+                "domain_suffix": [
+                    "demonware.net",
+                    "callofduty.com",
+                    "activision.com",
+                    "battle.net",
+                    "blizzard.com",
+                    "bnet.com",
+                    "easyanticheat.net",
+                    "eac-cdn.com",
+                    "battleye.com",
+                    "faceit.com",
+                    "pvp.net"
+                ],
+                "outbound": "direct"
+            }));
+        }
+
         let vpn_target_tag = if main_parsed.is_some() {
             "GLOBAL"
         } else {
@@ -1820,12 +1958,19 @@ impl VpnManager {
             }));
             if opts.desync.block_quic {
                 rules.push(json!({ "network": "udp", "port": 443, "action": "reject" }));
+            } else {
+                rules.push(json!({ "network": "udp", "port": 443, "outbound": "DESYNC" }));
             }
+            rules.push(json!({ "network": "udp", "port_range": ["50000:50100"], "outbound": "DESYNC" }));
+            rules.push(json!({ "network": "udp", "outbound": "direct" }));
         }
 
         let mut route_obj = json!({
             "default_domain_resolver": "dns_direct",
             "auto_detect_interface": true,
+            "find_process": opts.route_find_process,
+            "fullcone": opts.route_fullcone_nat,
+            "smart_queue": opts.route_smart_queue,
             "final": final_outbound,
             "rules": rules
         });
@@ -2601,10 +2746,12 @@ impl VpnManager {
                 return;
             }
             if let Some(val) = decode_inline_node_uri(resolved) {
-                let tag = custom_handle_opt
+                let raw_tag = custom_handle_opt
                     .as_deref()
                     .or_else(|| val.get("tag").and_then(Value::as_str).filter(|s| !s.is_empty()))
                     .unwrap_or("Сервер");
+                let country = detect_country_code(raw_tag);
+                let tag = crate::state::clean_node_display_name(raw_tag);
                 let payload = json!({
                     "handle": tag,
                     "url": input,
@@ -2613,7 +2760,7 @@ impl VpnManager {
                         "id": "custom-1",
                         "name": tag,
                         "vless": resolved,
-                        "country": detect_country_code(tag)
+                        "country": country
                     }]
                 });
                 self.emit(format!("sub:{payload}"));
@@ -2655,7 +2802,7 @@ impl VpnManager {
                     }
                 } else if real_nodes.len() == 1 {
                     let node = &real_nodes[0];
-                    let tag = custom_handle_opt
+                    let raw_tag = custom_handle_opt
                         .as_deref()
                         .or_else(|| {
                             node.get("tag")
@@ -2663,6 +2810,8 @@ impl VpnManager {
                                 .filter(|s| !s.is_empty())
                         })
                         .unwrap_or("Сервер");
+                    let country = detect_country_code(raw_tag);
+                    let tag = crate::state::clean_node_display_name(raw_tag);
                     let uri = node_to_share_link(node).unwrap_or_else(|| resolved.to_string());
                     let payload = json!({
                         "handle": tag,
@@ -2672,7 +2821,7 @@ impl VpnManager {
                             "id": "custom-1",
                             "name": tag,
                             "vless": uri,
-                            "country": detect_country_code(tag)
+                            "country": country
                         }]
                     });
                     self.emit(format!("sub:{payload}"));
@@ -2681,10 +2830,12 @@ impl VpnManager {
             }
             match parse_share_uri(resolved) {
                 Ok(val) => {
-                    let tag = custom_handle_opt
+                    let raw_tag = custom_handle_opt
                         .as_deref()
                         .or_else(|| val.get("tag").and_then(Value::as_str).filter(|s| !s.is_empty()))
                         .unwrap_or("Сервер");
+                    let country = detect_country_code(raw_tag);
+                    let tag = crate::state::clean_node_display_name(raw_tag);
                     let payload = json!({
                         "handle": tag,
                         "url": input,
@@ -2693,7 +2844,7 @@ impl VpnManager {
                             "id": "custom-1",
                             "name": tag,
                             "vless": resolved,
-                            "country": detect_country_code(tag)
+                            "country": country
                         }]
                     });
                     self.emit(format!("sub:{payload}"));
@@ -4322,13 +4473,7 @@ pub fn apply_kill_switch(_enable: bool) {
 }
 
 fn detect_country_code(name: &str) -> String {
-    let re = Regex::new(r"(?i)\b([A-Z]{2})\b").unwrap();
-    if let Some(caps) = re.captures(name) {
-        if let Some(m) = caps.get(1) {
-            return m.as_str().to_ascii_lowercase();
-        }
-    }
-    "auto".to_string()
+    crate::state::detect_country_code(name)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -4496,13 +4641,14 @@ pub fn build_subscription_servers_list(nodes: &[Value], handle: &str) -> Vec<Val
         let Some(share_link) = node_to_share_link(node) else {
             continue;
         };
-        let name = node
+        let raw_name = node
             .get("tag")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| format!("Узел #{}", idx + 1));
-        let country = detect_country_code(&name);
+        let country = detect_country_code(&raw_name);
+        let name = crate::state::clean_node_display_name(&raw_name);
         let is_hidden = node
             .get("__tachyon_hidden")
             .and_then(Value::as_bool)
@@ -4513,6 +4659,14 @@ pub fn build_subscription_servers_list(nodes: &[Value], handle: &str) -> Vec<Val
             .unwrap_or("")
             .to_string();
 
+        leaf_by_tag.insert(
+            raw_name.clone(),
+            BalancerMember {
+                name: name.clone(),
+                vless: share_link.clone(),
+                country: country.clone(),
+            },
+        );
         leaf_by_tag.insert(
             name.clone(),
             BalancerMember {
