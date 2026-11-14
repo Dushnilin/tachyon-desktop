@@ -114,7 +114,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
 dependencies = [
  "cfg-if",
- "cipher 0.4.4",
+ "cipher",
  "cpufeatures 0.2.17",
  "zeroize",
 ]
@@ -127,7 +127,7 @@ checksum = "831010a0f742e1209b3bcea8fab6a8e149051ba6099432c8cb2cc117dec3ead1"
 dependencies = [
  "aead",
  "aes",
- "cipher 0.4.4",
+ "cipher",
  "ctr",
  "ghash",
  "subtle",
@@ -262,15 +262,6 @@ dependencies = [
  "blake2",
  "cpufeatures 0.2.17",
  "password-hash",
-]
-
-[[package]]
-name = "aria"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9bec52899928da457033f0a6ea707bd11a16f5642ef91ddfcd809cd30f824536"
-dependencies = [
- "cipher 0.5.2",
 ]
 
 [[package]]
@@ -739,16 +730,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "blowfish"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62ce3946557b35e71d1bbe07ec385073ce9eda05043f95de134eb578fcf1a298"
-dependencies = [
- "byteorder",
- "cipher 0.5.2",
-]
-
-[[package]]
 name = "brotli"
 version = "9.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -855,30 +836,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "camellia"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3ed33f9863ee76491bbe0d7e16a225c694d8525287e320dc7fbe71ee212254c"
-dependencies = [
- "cipher 0.5.2",
-]
-
-[[package]]
-name = "cast5"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ed80521f830bbce4d3a4857d6f2b91a8339bf0b65711fe189ab6f8d7a2f629e"
-dependencies = [
- "cipher 0.5.2",
-]
-
-[[package]]
 name = "cbc"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "26b52a9543ae338f279b96b0b9fed9c8093744685043739079ce85cd58f289a6"
 dependencies = [
- "cipher 0.4.4",
+ "cipher",
 ]
 
 [[package]]
@@ -917,7 +880,7 @@ version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "738b8d467867f80a71351933f70461f5b56f24d5c93e0cf216e59229c968d330"
 dependencies = [
- "cipher 0.4.4",
+ "cipher",
 ]
 
 [[package]]
@@ -939,7 +902,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3613f74bd2eac03dad61bd53dbe620703d4371614fe0bc3b9f04dd36fe4e818"
 dependencies = [
  "cfg-if",
- "cipher 0.4.4",
+ "cipher",
  "cpufeatures 0.2.17",
 ]
 
@@ -962,7 +925,7 @@ checksum = "10cd79432192d1c0f4e1a0fef9527696cc039165d729fb41b3f4f4f354c2dc35"
 dependencies = [
  "aead",
  "chacha20 0.9.1",
- "cipher 0.4.4",
+ "cipher",
  "poly1305",
  "zeroize",
 ]
@@ -988,18 +951,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
 dependencies = [
  "crypto-common 0.1.7",
- "inout 0.1.4",
+ "inout",
  "zeroize",
-]
-
-[[package]]
-name = "cipher"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8cf2a2c93cd704877c0858356ed03480ff301ee950b43f1cbe4573b088bfa6c"
-dependencies = [
- "crypto-common 0.2.2",
- "inout 0.2.5",
 ]
 
 [[package]]
@@ -1121,12 +1074,14 @@ dependencies = [
 
 [[package]]
 name = "core-config"
-version = "0.5.0"
+version = "0.5.3"
 dependencies = [
  "aes",
+ "aes-gcm",
  "base64 0.22.1",
  "brotli",
  "flate2",
+ "hmac",
  "regex",
  "serde",
  "serde_json",
@@ -1135,7 +1090,7 @@ dependencies = [
 
 [[package]]
 name = "core-crypto"
-version = "0.5.0"
+version = "0.5.3"
 dependencies = [
  "aead",
  "aes-gcm",
@@ -1166,7 +1121,7 @@ dependencies = [
 
 [[package]]
 name = "core-experimental"
-version = "0.5.0"
+version = "0.5.3"
 
 [[package]]
 name = "core-foundation"
@@ -1257,31 +1212,25 @@ dependencies = [
 
 [[package]]
 name = "core-runtime"
-version = "0.5.0"
+version = "0.5.3"
 dependencies = [
  "aes",
  "aes-gcm",
  "aho-corasick",
  "anyhow",
  "argon2",
- "aria",
  "base64 0.22.1",
  "blake2",
- "blowfish",
  "bytes",
- "camellia",
- "cast5",
  "cfb-mode",
  "chacha20 0.9.1",
  "chacha20poly1305",
- "cipher 0.4.4",
- "cipher 0.5.2",
+ "cipher",
  "core-config",
  "core-crypto",
  "core-experimental",
  "core-tls",
  "ctr",
- "des",
  "flate2",
  "getrandom 0.3.4",
  "h2",
@@ -1292,7 +1241,6 @@ dependencies = [
  "hmac",
  "http",
  "if-addrs",
- "kisaseed",
  "libc",
  "log",
  "lru",
@@ -1305,14 +1253,12 @@ dependencies = [
  "quinn-proto",
  "rand_core 0.6.4",
  "regex",
- "ripemd",
  "rustls-pemfile",
  "serde",
  "serde_json",
  "sha1",
  "sha2 0.10.9",
  "sha3",
- "sm4",
  "smoltcp",
  "socket2",
  "subtle",
@@ -1336,7 +1282,7 @@ dependencies = [
 
 [[package]]
 name = "core-tls"
-version = "0.5.0"
+version = "0.5.3"
 dependencies = [
  "aes-gcm",
  "brotli",
@@ -1355,7 +1301,7 @@ dependencies = [
  "ruzstd",
  "sha2 0.10.9",
  "tokio",
- "webpki-roots 0.26.11",
+ "webpki-roots",
  "x25519-dalek",
 ]
 
@@ -1510,7 +1456,7 @@ version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0369ee1ad671834580515889b80f2ea915f23b8be8d0daa4bbaf2ac5c7590835"
 dependencies = [
- "cipher 0.4.4",
+ "cipher",
 ]
 
 [[package]]
@@ -1620,15 +1566,6 @@ dependencies = [
  "quote",
  "rustc_version",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "des"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "916a94e407b54f9034d71dd748234cd1e516ced6284009906ae246f177eafe5a"
-dependencies = [
- "cipher 0.5.2",
 ]
 
 [[package]]
@@ -2110,12 +2047,6 @@ name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
-
-[[package]]
-name = "foldhash"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
 name = "foldhash"
@@ -3163,8 +3094,6 @@ dependencies = [
 [[package]]
 name = "h3"
 version = "0.0.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10872b55cfb02a821b69dc7cf8dc6a71d6af25eb9a79662bec4a9d016056b3be"
 dependencies = [
  "bytes",
  "fastrand",
@@ -3230,24 +3159,13 @@ checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
 
 [[package]]
 name = "hashbrown"
-version = "0.15.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
-dependencies = [
- "allocator-api2",
- "equivalent",
- "foldhash 0.1.5",
-]
-
-[[package]]
-name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 dependencies = [
  "allocator-api2",
  "equivalent",
- "foldhash 0.2.0",
+ "foldhash",
 ]
 
 [[package]]
@@ -3256,7 +3174,7 @@ version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
- "foldhash 0.2.0",
+ "foldhash",
 ]
 
 [[package]]
@@ -3753,15 +3671,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "inout"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b5cf4372d022092674a83b8febf5865f7a573cc0c5baec5e49c879b6a20978f"
-dependencies = [
- "hybrid-array 0.4.15",
-]
-
-[[package]]
 name = "instant"
 version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3967,15 +3876,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
-name = "kisaseed"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "951b9bdd8facb4f4ae6614b855d7bdb3964b34d6e1d1fdce1796efacedd44cdf"
-dependencies = [
- "cipher 0.4.4",
-]
-
-[[package]]
 name = "kqueue"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4142,9 +4042,6 @@ name = "lru"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "234cf4f4a04dc1f57e24b96cc0cd600cf2af460d4161ac5ecdd0af8e1f3b2a38"
-dependencies = [
- "hashbrown 0.15.5",
-]
 
 [[package]]
 name = "lru-slab"
@@ -5109,7 +5006,7 @@ dependencies = [
  "async-lock",
  "blocking",
  "cbc",
- "cipher 0.4.4",
+ "cipher",
  "digest 0.10.7",
  "endi",
  "futures-lite",
@@ -6091,15 +5988,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ripemd"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd124222d17ad93a644ed9d011a40f4fb64aa54275c08cc216524a9ea82fb09f"
-dependencies = [
- "digest 0.10.7",
-]
-
-[[package]]
 name = "ropey"
 version = "2.0.0-beta.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6217,7 +6105,7 @@ checksum = "e806c2a9701cbd6043992cd935c30cb1fdb128fa15e7b506f3b46f97045737c0"
 dependencies = [
  "arc-swap",
  "base62",
- "foldhash 0.2.0",
+ "foldhash",
  "globwalk",
  "itertools 0.11.0",
  "normpath",
@@ -6576,7 +6464,7 @@ version = "1.0.154"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
 dependencies = [
- "foldhash 0.2.0",
+ "foldhash",
  "indexmap",
  "itoa",
  "memchr",
@@ -6799,15 +6687,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bdd58c3c93c3d278ca835519292445cb4b0d4dc59ccfdf7ceadaab3f8aeb4038"
 dependencies = [
  "version_check",
-]
-
-[[package]]
-name = "sm4"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff2d621883cdeeaee6759d39f4bc8cd314b29db72b6ac3d6714b31422512ee11"
-dependencies = [
- "cipher 0.5.2",
 ]
 
 [[package]]
@@ -7105,7 +6984,7 @@ dependencies = [
 
 [[package]]
 name = "tachyon-desktop"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -8050,15 +7929,6 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "webpki-roots"
-version = "0.26.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
-dependencies = [
- "webpki-roots 1.0.11",
 ]
 
 [[package]]

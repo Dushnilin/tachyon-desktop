@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ROOT_DIR="$(cd "${PROJECT_DIR}/.." && pwd)"
 
-VERSION="${1:-0.3.7}"
+VERSION="${1:-0.3.8}"
 ARCH_RAW="$(uname -m)"
 case "${ARCH_RAW}" in
   x86_64|amd64) DEB_ARCH="amd64" ;;

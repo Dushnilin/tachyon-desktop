@@ -74,7 +74,10 @@ fn main() {
         std::process::exit(run_core_worker_mode(&args[2]));
     }
     if args.len() >= 2 && (args[1] == "--version" || args[1] == "version" || args[1] == "-v") {
-        println!("tachyon-core {}", env!("CARGO_PKG_VERSION"));
+        println!(
+            "tachyon-core {}",
+            option_env!("TACHYON_CORE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+        );
         return;
     }
 

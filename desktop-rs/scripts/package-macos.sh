@@ -6,7 +6,7 @@ PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ROOT_DIR="$(cd "${PROJECT_DIR}/.." && pwd)"
 
 UNIVERSAL=0
-VERSION="0.3.7"
+VERSION="0.3.8"
 for arg in "$@"; do
   if [[ "${arg}" == "--universal" ]]; then
     UNIVERSAL=1

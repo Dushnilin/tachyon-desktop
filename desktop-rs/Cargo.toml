@@ -1,6 +1,6 @@
 [package]
 name = "tachyon-desktop"
-version = "0.3.7"
+version = "0.3.8"
 edition = "2024"
 description = "Tachyon Cross-Platform Desktop Client (Linux, macOS, Windows) with embedded tachyon-core"
 license = "LicenseRef-Proprietary"
@@ -41,6 +41,7 @@ windows-sys = { version = "0.59", features = [
 
 [patch.crates-io]
 h2 = { path = "../../tachyon-core/vendor/h2" }
+h3 = { path = "../../tachyon-core/vendor/h3" }
 quinn = { path = "../../tachyon-core/vendor/quinn" }
 quinn-proto = { path = "../../tachyon-core/vendor/quinn-proto" }
 smoltcp = { path = "../../tachyon-core/vendor/smoltcp" }
@@ -58,3 +59,69 @@ codegen-units = 1
 panic = "abort"
 strip = "symbols"
 overflow-checks = false
+
+# Критичные по скорости крипто- и транспортные крейты собираем с opt-level = 3
+[profile.release.package.core-crypto]
+opt-level = 3
+[profile.release.package.aes]
+opt-level = 3
+[profile.release.package.aes-gcm]
+opt-level = 3
+[profile.release.package.ghash]
+opt-level = 3
+[profile.release.package.polyval]
+opt-level = 3
+[profile.release.package.chacha20]
+opt-level = 3
+[profile.release.package.chacha20poly1305]
+opt-level = 3
+[profile.release.package.poly1305]
+opt-level = 3
+[profile.release.package.ctr]
+opt-level = 3
+[profile.release.package.cipher]
+opt-level = 3
+[profile.release.package.universal-hash]
+opt-level = 3
+[profile.release.package.sha2]
+opt-level = 3
+[profile.release.package.hmac]
+opt-level = 3
+[profile.release.package.memchr]
+opt-level = 3
+[profile.release.package.curve25519-dalek]
+opt-level = 3
+[profile.release.package.x25519-dalek]
+opt-level = 3
+[profile.release.package.lz4_flex]
+opt-level = 3
+[profile.release.package.ml-kem]
+opt-level = 3
+[profile.release.package.blake2]
+opt-level = 3
+[profile.release.package.hashbrown]
+opt-level = 3
+[profile.release.package.core-tls]
+opt-level = 3
+[profile.release.package.rustls]
+opt-level = 3
+[profile.release.package.tokio-rustls]
+opt-level = 3
+[profile.release.package.quinn-proto]
+opt-level = 3
+[profile.release.package.quinn]
+opt-level = 3
+[profile.release.package.quinn-udp]
+opt-level = 3
+[profile.release.package.h2]
+opt-level = 3
+[profile.release.package.h3]
+opt-level = 3
+[profile.release.package.h3-quinn]
+opt-level = 3
+[profile.release.package.smoltcp]
+opt-level = 3
+[profile.release.package.tokio]
+opt-level = 3
+[profile.release.package.bytes]
+opt-level = 3

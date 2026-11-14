@@ -261,6 +261,8 @@ pub struct DesyncPrefs {
     #[serde(default)]
     pub wsize: u32,
     #[serde(default)]
+    pub wscale: Option<u8>,
+    #[serde(default)]
     pub ipfrag: bool,
     #[serde(default)]
     pub udplen: u32,
@@ -301,6 +303,8 @@ pub struct DesyncPrefs {
     pub stun_fake: bool,
     #[serde(default = "default_true")]
     pub anticheat_bypass: bool,
+    #[serde(default = "default_true")]
+    pub lists_override_game_bypass: bool,
 }
 
 fn default_desync_preset() -> String {
@@ -347,6 +351,7 @@ impl Default for DesyncPrefs {
             seqovl: 0,
             syndata: false,
             wsize: 0,
+            wscale: None,
             ipfrag: false,
             udplen: 0,
             fake_ttl: default_fake_ttl(),
@@ -367,6 +372,7 @@ impl Default for DesyncPrefs {
             discord_udp_fake: true,
             stun_fake: true,
             anticheat_bypass: true,
+            lists_override_game_bypass: true,
         }
     }
 }
@@ -1097,6 +1103,7 @@ impl PersistedState {
             "seqovl": self.desync_prefs.seqovl,
             "syndata": self.desync_prefs.syndata,
             "wsize": self.desync_prefs.wsize,
+            "wscale": self.desync_prefs.wscale,
             "ipfrag": self.desync_prefs.ipfrag,
             "udplen": self.desync_prefs.udplen,
             "fakeTtl": self.desync_prefs.fake_ttl,
@@ -1104,11 +1111,13 @@ impl PersistedState {
             "repeats": self.desync_prefs.repeats,
             "splitDelayMs": self.desync_prefs.split_delay_ms,
             "udpFake": self.desync_prefs.udp_fake && self.desync_prefs.quic_fake,
+            "discordUdpFake": self.desync_prefs.discord_udp_fake,
             "udpRepeats": self.desync_prefs.quic_repeats.max(self.desync_prefs.udp_repeats),
             "udpFakeTtl": self.desync_prefs.udp_fake_ttl,
             "autoTune": self.desync_prefs.auto_tune,
             "blockQuic": self.desync_prefs.block_quic,
             "anticheatBypass": self.desync_prefs.anticheat_bypass,
+            "listsOverrideGameBypass": self.desync_prefs.lists_override_game_bypass,
         });
 
         let payload = serde_json::json!({

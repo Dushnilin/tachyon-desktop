@@ -3398,27 +3398,58 @@ impl TachyonApp {
                     )
                     .child(
                         div()
-                            .id("btn-desync-master")
-                            .px(px(14.0))
-                            .py(px(6.0))
-                            .rounded(px(8.0))
-                            .cursor_pointer()
-                            .bg(if d.enabled { t.amber_bg } else { t.bg_elev })
-                            .border_1()
-                            .border_color(if d.enabled { t.amber_border } else { t.border })
-                            .text_size(px(12.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(if d.enabled { t.amber } else { t.text_soft })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.state.desync_prefs.enabled = !this.state.desync_prefs.enabled;
-                                this.reconnect_if_active();
-                                cx.notify();
-                            }))
-                            .child(if d.enabled {
-                                self.tr("Активен", "Active")
-                            } else {
-                                self.tr("Включить", "Enable")
-                            }),
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .id("btn-desync-reset-cache")
+                                    .px(px(12.0))
+                                    .py(px(6.0))
+                                    .rounded(px(8.0))
+                                    .cursor_pointer()
+                                    .bg(t.bg_elev)
+                                    .border_1()
+                                    .border_color(t.border)
+                                    .hover(|s| s.bg(t.bg_hover))
+                                    .text_size(px(11.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(t.text_soft)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        core_runtime::outbound::desync::reset_adaptive_state();
+                                        this.show_toast(this.tr(
+                                            "Кэш адаптивного подбора очищен",
+                                            "Adaptive optimization cache cleared",
+                                        ));
+                                        this.reconnect_if_active();
+                                        cx.notify();
+                                    }))
+                                    .child(self.tr("Сбросить кэш", "Reset Cache")),
+                            )
+                            .child(
+                                div()
+                                    .id("btn-desync-master")
+                                    .px(px(14.0))
+                                    .py(px(6.0))
+                                    .rounded(px(8.0))
+                                    .cursor_pointer()
+                                    .bg(if d.enabled { t.amber_bg } else { t.bg_elev })
+                                    .border_1()
+                                    .border_color(if d.enabled { t.amber_border } else { t.border })
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(if d.enabled { t.amber } else { t.text_soft })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.state.desync_prefs.enabled = !this.state.desync_prefs.enabled;
+                                        this.reconnect_if_active();
+                                        cx.notify();
+                                    }))
+                                    .child(if d.enabled {
+                                        self.tr("Активен", "Active")
+                                    } else {
+                                        self.tr("Включить", "Enable")
+                                    }),
+                            ),
                     ),
             )
             .child(
@@ -3954,6 +3985,32 @@ impl TachyonApp {
                                     this.reconnect_if_active();
                                     cx.notify();
                                 }),
+                            ))
+                            .child(self.render_toggle_row(
+                                "toggle-wsize-wscale",
+                                self.tr(
+                                    "Сжатие TCP-окна (wsize=1, scale=1)",
+                                    "TCP Window Clamping (wsize=1, scale=1)",
+                                ),
+                                self.tr(
+                                    "Предконнектное уменьшение окна приёма на этапе SYN для принудительной фрагментации ServerHello",
+                                    "Pre-connect SYN receive window clamping to force ServerHello fragmentation",
+                                ),
+                                d.wsize > 0 || d.wscale.is_some(),
+                                t,
+                                cx.listener(|this, _, _, cx| {
+                                    let next = !(this.state.desync_prefs.wsize > 0
+                                        || this.state.desync_prefs.wscale.is_some());
+                                    if next {
+                                        this.state.desync_prefs.wsize = 1;
+                                        this.state.desync_prefs.wscale = Some(1);
+                                    } else {
+                                        this.state.desync_prefs.wsize = 0;
+                                        this.state.desync_prefs.wscale = None;
+                                    }
+                                    this.reconnect_if_active();
+                                    cx.notify();
+                                }),
                             )),
                     )
                     .child(
@@ -3993,6 +4050,25 @@ impl TachyonApp {
                                 cx.listener(|this, _, _, cx| {
                                     this.state.desync_prefs.anticheat_bypass =
                                         !this.state.desync_prefs.anticheat_bypass;
+                                    this.reconnect_if_active();
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(self.render_toggle_row(
+                                "toggle-lists-override-game",
+                                self.tr(
+                                    "Приоритет доменных списков над байпасом игр",
+                                    "Domain Lists Override Game Bypass",
+                                ),
+                                self.tr(
+                                    "Применять списки маршрутизации (CDN обновлений) к лаунчерам и играм, сохраняя прямой UDP",
+                                    "Apply domain lists (patch CDNs) to game launchers while keeping game UDP direct",
+                                ),
+                                d.lists_override_game_bypass,
+                                t,
+                                cx.listener(|this, _, _, cx| {
+                                    this.state.desync_prefs.lists_override_game_bypass =
+                                        !this.state.desync_prefs.lists_override_game_bypass;
                                     this.reconnect_if_active();
                                     cx.notify();
                                 }),

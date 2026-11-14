@@ -51,6 +51,7 @@ pub struct DesyncOptions {
     pub seqovl: u32,
     pub syndata: bool,
     pub wsize: u32,
+    pub wscale: Option<u8>,
     pub ipfrag: bool,
     pub udplen: u32,
     pub fake_ttl: u32,
@@ -58,11 +59,13 @@ pub struct DesyncOptions {
     pub repeats: u32,
     pub split_delay_ms: u32,
     pub udp_fake: bool,
+    pub discord_udp_fake: bool,
     pub udp_repeats: u32,
     pub udp_fake_ttl: u32,
     pub auto_tune: bool,
     pub block_quic: bool,
     pub anticheat_bypass: bool,
+    pub lists_override_game_bypass: bool,
 }
 
 impl Default for DesyncOptions {
@@ -78,6 +81,7 @@ impl Default for DesyncOptions {
             seqovl: 0,
             syndata: false,
             wsize: 0,
+            wscale: None,
             ipfrag: false,
             udplen: 0,
             fake_ttl: 6,
@@ -85,11 +89,13 @@ impl Default for DesyncOptions {
             repeats: 2,
             split_delay_ms: 1,
             udp_fake: true,
+            discord_udp_fake: true,
             udp_repeats: 6,
             udp_fake_ttl: 6,
             auto_tune: true,
             block_quic: true,
             anticheat_bypass: true,
+            lists_override_game_bypass: true,
         }
     }
 }
@@ -559,6 +565,13 @@ impl ConnectOptions {
             if let Some(v) = d.get("wsize").and_then(Value::as_u64) {
                 desync.wsize = (v as u32).min(65535);
             }
+            if let Some(v) = d
+                .get("wscale")
+                .or_else(|| d.get("scale"))
+                .and_then(Value::as_u64)
+            {
+                desync.wscale = Some((v as u8).min(14));
+            }
             if let Some(v) = d.get("ipfrag").and_then(Value::as_bool) {
                 desync.ipfrag = v;
             }
@@ -582,6 +595,9 @@ impl ConnectOptions {
             if let Some(v) = d.get("udpFake").and_then(Value::as_bool) {
                 desync.udp_fake = v;
             }
+            if let Some(v) = d.get("discordUdpFake").and_then(Value::as_bool) {
+                desync.discord_udp_fake = v;
+            }
             if let Some(v) = d.get("udpRepeats").and_then(Value::as_u64) {
                 desync.udp_repeats = (v as u32).clamp(1, 50);
             }
@@ -596,6 +612,12 @@ impl ConnectOptions {
             }
             if let Some(v) = d.get("anticheatBypass").and_then(Value::as_bool) {
                 desync.anticheat_bypass = v;
+            }
+            if let Some(v) = d
+                .get("listsOverrideGameBypass")
+                .and_then(Value::as_bool)
+            {
+                desync.lists_override_game_bypass = v;
             }
         }
 
@@ -1244,6 +1266,9 @@ impl VpnManager {
         if d.wsize > 0 {
             obj["wsize"] = json!(d.wsize.min(65535));
         }
+        if let Some(ws) = d.wscale {
+            obj["wscale"] = json!(ws.min(14));
+        }
         if d.ipfrag {
             obj["ipfrag"] = json!(true);
         }
@@ -1823,57 +1848,55 @@ impl VpnManager {
             "outbound": "direct"
         }));
 
+        const ANTICHEAT_PROCESSES: &[&str] = &[
+            "cod.exe",
+            "cod22-cod.exe",
+            "cod23-cod.exe",
+            "cod24-cod.exe",
+            "sp22-cod.exe",
+            "sp23-cod.exe",
+            "sp24-cod.exe",
+            "randgrid.exe",
+            "battle.net.exe",
+            "agent.exe",
+            "easyanticheat.exe",
+            "easyanticheat_eos.exe",
+            "start_protected_game.exe",
+            "beservice.exe",
+            "beclient_x64.exe",
+            "eaanticheat.gameservice.exe",
+            "eaanticheat.gameservice.dll",
+            "faceitclient.exe",
+            "faceitservice.exe",
+            "vgc.exe",
+            "vgtray.exe",
+            "valorant.exe",
+            "valorant-win64-shipping.exe",
+            "riotclientservices.exe",
+            "cs2.exe",
+            "dota2.exe",
+            "r5apex.exe",
+            "fortniteclient-win64-shipping.exe",
+            "tslgame.exe",
+            "rainbowsix.exe",
+            "rainbowsix_be.exe",
+            "escapefromtarkov.exe",
+            "escapefromtarkov_be.exe",
+            "rustclient.exe",
+            "dayz_x64.exe",
+            "deadbydaylight-win64-shipping.exe",
+            "overwatch.exe",
+            "destiny2.exe",
+            "helldivers2.exe",
+            "thefinals.exe",
+            "bf2042.exe",
+            "fc24.exe",
+            "fc25.exe",
+            "genshinimpact.exe",
+            "starrail.exe",
+        ];
+
         if opts.desync.anticheat_bypass {
-            rules.push(json!({
-                "process_name": [
-                    "cod.exe",
-                    "cod22-cod.exe",
-                    "cod23-cod.exe",
-                    "cod24-cod.exe",
-                    "sp22-cod.exe",
-                    "sp23-cod.exe",
-                    "sp24-cod.exe",
-                    "randgrid.exe",
-                    "battle.net.exe",
-                    "agent.exe",
-                    "easyanticheat.exe",
-                    "easyanticheat_eos.exe",
-                    "start_protected_game.exe",
-                    "beservice.exe",
-                    "beclient_x64.exe",
-                    "eaanticheat.gameservice.exe",
-                    "eaanticheat.gameservice.dll",
-                    "faceitclient.exe",
-                    "faceitservice.exe",
-                    "vgc.exe",
-                    "vgtray.exe",
-                    "valorant.exe",
-                    "valorant-win64-shipping.exe",
-                    "riotclientservices.exe",
-                    "cs2.exe",
-                    "dota2.exe",
-                    "r5apex.exe",
-                    "fortniteclient-win64-shipping.exe",
-                    "tslgame.exe",
-                    "rainbowsix.exe",
-                    "rainbowsix_be.exe",
-                    "escapefromtarkov.exe",
-                    "escapefromtarkov_be.exe",
-                    "rustclient.exe",
-                    "dayz_x64.exe",
-                    "deadbydaylight-win64-shipping.exe",
-                    "overwatch.exe",
-                    "destiny2.exe",
-                    "helldivers2.exe",
-                    "thefinals.exe",
-                    "bf2042.exe",
-                    "fc24.exe",
-                    "fc25.exe",
-                    "genshinimpact.exe",
-                    "starrail.exe"
-                ],
-                "outbound": "direct"
-            }));
             rules.push(json!({
                 "domain_suffix": [
                     "demonware.net",
@@ -1890,6 +1913,17 @@ impl VpnManager {
                 ],
                 "outbound": "direct"
             }));
+            rules.push(json!({
+                "process_name": ANTICHEAT_PROCESSES,
+                "network": "udp",
+                "outbound": "direct"
+            }));
+            if !opts.desync.lists_override_game_bypass {
+                rules.push(json!({
+                    "process_name": ANTICHEAT_PROCESSES,
+                    "outbound": "direct"
+                }));
+            }
         }
 
         let vpn_target_tag = if main_parsed.is_some() {
@@ -1910,6 +1944,13 @@ impl VpnManager {
             &mut rule_sets,
             &mut registered_rs,
         );
+
+        if opts.desync.anticheat_bypass && opts.desync.lists_override_game_bypass {
+            rules.push(json!({
+                "process_name": ANTICHEAT_PROCESSES,
+                "outbound": "direct"
+            }));
+        }
 
         let mut app_procs = Vec::new();
         for r in &opts.rules {
@@ -1961,7 +2002,11 @@ impl VpnManager {
             } else {
                 rules.push(json!({ "network": "udp", "port": 443, "outbound": "DESYNC" }));
             }
-            rules.push(json!({ "network": "udp", "port_range": ["50000:50100"], "outbound": "DESYNC" }));
+            if opts.desync.discord_udp_fake {
+                rules.push(json!({ "network": "udp", "port_range": ["19294:19344", "50000:50100"], "outbound": "DESYNC" }));
+            } else {
+                rules.push(json!({ "network": "udp", "port_range": ["50000:50100"], "outbound": "DESYNC" }));
+            }
             rules.push(json!({ "network": "udp", "outbound": "direct" }));
         }
 
@@ -3310,7 +3355,7 @@ impl VpnManager {
     }
 
     pub async fn run_self_check(&self) {
-        let ver = env!("CARGO_PKG_VERSION");
+        let ver = option_env!("TACHYON_CORE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
         let step1 = json!({
             "id": "core",
             "name": "Ядро VPN",
@@ -5186,6 +5231,135 @@ mod tests {
                 .iter()
                 .any(|o| o["tag"] == "DESYNC")
         );
+    }
+
+    #[test]
+    fn test_tachyon_core_0_5_3_desync_wscale_anticheat_order_and_csqtt_v2() {
+        let mgr = VpnManager::new(Arc::new(|_| {}));
+
+        // 1. wsize=1, wscale=1 и lists_override_game_bypass=true (по умолчанию)
+        let mut st = crate::state::PersistedState::default();
+        st.desync_prefs.enabled = true;
+        st.desync_prefs.wsize = 1;
+        st.desync_prefs.wscale = Some(1);
+        st.desync_prefs.anticheat_bypass = true;
+        st.desync_prefs.lists_override_game_bypass = true;
+        st.custom_rules.push(crate::state::CustomRule {
+            id: "r-cdn".to_string(),
+            rule_type: "domain".to_string(),
+            value: "cloudfront.net".to_string(),
+            action: "desync".to_string(),
+        });
+
+        let payload_on = st.build_connect_payload(None);
+        let opts_on = ConnectOptions::parse(&payload_on).expect("parse opts lists_override=true");
+        assert_eq!(opts_on.desync.wsize, 1);
+        assert_eq!(opts_on.desync.wscale, Some(1));
+        assert!(opts_on.desync.lists_override_game_bypass);
+
+        let (cfg_on, _) = mgr.build_config(&opts_on).expect("build_config lists_override=true");
+        core_config::check_str(&cfg_on.to_string()).expect("check_str lists_override=true");
+
+        let desync_ob = cfg_on["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["tag"] == "DESYNC")
+            .expect("DESYNC outbound");
+        assert_eq!(desync_ob["wsize"], json!(1));
+        assert_eq!(desync_ob["wscale"], json!(1));
+
+        let rules_on = cfg_on["route"]["rules"].as_array().unwrap();
+        let idx_auth_domain = rules_on
+            .iter()
+            .position(|r| {
+                r.get("domain_suffix")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|a| a.iter().any(|x| x == "demonware.net"))
+            })
+            .expect("anticheat auth domain rule");
+        let idx_ac_udp = rules_on
+            .iter()
+            .position(|r| {
+                r.get("network") == Some(&json!("udp"))
+                    && r.get("process_name").is_some()
+                    && r.get("outbound") == Some(&json!("direct"))
+            })
+            .expect("anticheat UDP rule");
+        let idx_custom_cdn = rules_on
+            .iter()
+            .position(|r| {
+                r.get("outbound") == Some(&json!("DESYNC"))
+                    && r.get("domain_suffix")
+                        .and_then(|v| v.as_array())
+                        .is_some_and(|a| a.iter().any(|x| x == "cloudfront.net"))
+            })
+            .expect("custom cloudfront desync rule");
+        let idx_ac_full = rules_on
+            .iter()
+            .position(|r| {
+                r.get("network").is_none()
+                    && r.get("process_name")
+                        .and_then(|v| v.as_array())
+                        .is_some_and(|a| a.iter().any(|x| x == "cod.exe"))
+            })
+            .expect("full anticheat process rule");
+
+        assert!(idx_auth_domain < idx_custom_cdn);
+        assert!(idx_ac_udp < idx_custom_cdn);
+        assert!(idx_custom_cdn < idx_ac_full);
+
+        // Discord Voice UDP range 19294:19344 включён в DESYNC
+        assert!(rules_on.iter().any(|r| {
+            r.get("network") == Some(&json!("udp"))
+                && r.get("outbound") == Some(&json!("DESYNC"))
+                && r.get("port_range")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|a| a.iter().any(|x| x == "19294:19344"))
+        }));
+
+        // 2. lists_override_game_bypass = false: полное правило античита идёт ДО списков
+        st.desync_prefs.lists_override_game_bypass = false;
+        let payload_off = st.build_connect_payload(None);
+        let opts_off = ConnectOptions::parse(&payload_off).expect("parse opts lists_override=false");
+        let (cfg_off, _) = mgr
+            .build_config(&opts_off)
+            .expect("build_config lists_override=false");
+        core_config::check_str(&cfg_off.to_string()).expect("check_str lists_override=false");
+        let rules_off = cfg_off["route"]["rules"].as_array().unwrap();
+        let idx_ac_full_off = rules_off
+            .iter()
+            .position(|r| {
+                r.get("network").is_none()
+                    && r.get("process_name")
+                        .and_then(|v| v.as_array())
+                        .is_some_and(|a| a.iter().any(|x| x == "cod.exe"))
+            })
+            .expect("full anticheat process rule when override=false");
+        let idx_custom_cdn_off = rules_off
+            .iter()
+            .position(|r| {
+                r.get("outbound") == Some(&json!("DESYNC"))
+                    && r.get("domain_suffix")
+                        .and_then(|v| v.as_array())
+                        .is_some_and(|a| a.iter().any(|x| x == "cloudfront.net"))
+            })
+            .expect("custom cloudfront desync rule when override=false");
+        assert!(idx_ac_full_off < idx_custom_cdn_off);
+
+        // 3. csqtt:// v2 (AES-256-GCM) из tachyon-core 0.5.3
+        let csqtt_v2_uri = "csqtt://GNANVH0fhD6MisDFiWP_P0Bm_FHr-frawgfwur3Zx4ipjJx8gk-M6ZZbnDr_2clwPmzO-QS8AkiHLaMXyYO1RHyPeehXPqTc6jJi_iw72fRQJ9AR918ne5XsBRg#V2Vec";
+        assert_eq!(crate::state::detect_protocol_badge(csqtt_v2_uri), "CSQTT");
+        let parsed_csqtt = parse_node_uri(csqtt_v2_uri).expect("parse csqtt v2");
+        assert_eq!(parsed_csqtt["type"], json!("wdtt"));
+        assert_eq!(parsed_csqtt["mode"], json!("csqtt"));
+        assert_eq!(parsed_csqtt["workers"], json!(36));
+        let reexported = node_to_share_link(&parsed_csqtt).expect("re-export csqtt v2");
+        assert!(reexported.starts_with("csqtt://"));
+        let opts_csqtt = ConnectOptions::parse(&reexported).expect("ConnectOptions csqtt v2");
+        let (cfg_csqtt, has_node) = mgr.build_config(&opts_csqtt).expect("build_config csqtt v2");
+        assert!(has_node);
+        core_config::check_str(&cfg_csqtt.to_string()).expect("check_str csqtt v2");
     }
 }
 
