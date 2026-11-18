@@ -4,6 +4,7 @@ extern crate gpui_kit as gpui;
 
 mod http;
 mod icons;
+mod installer;
 mod state;
 mod theme;
 mod ui;
@@ -81,6 +82,10 @@ fn main() {
         return;
     }
 
+    if let Some(code) = crate::installer::maybe_run_installer_or_uninstaller(&args) {
+        std::process::exit(code);
+    }
+
     if let Ok(exe) = std::env::current_exe() {
         let _ = fs::remove_file(exe.with_extension("exe.old"));
         let _ = fs::remove_file(exe.with_extension("new"));
@@ -117,6 +122,7 @@ fn main() {
                     traffic_light_position: Some(point(px(12.0), px(12.0))),
                 }),
                 window_decorations: Some(WindowDecorations::Client),
+                app_owns_titlebar_drag: true,
                 window_min_size: Some(size(px(860.0), px(620.0))),
                 app_id: Some("io.tachyon.desktop".to_string()),
                 ..Default::default()
@@ -126,18 +132,14 @@ fn main() {
             let rt_win = rt.clone();
             let eq_win = event_queue.clone();
 
-            let _ = gpui_kit::open_window(opts, cx, move |_window, cx| {
-                cx.new(|cx| TachyonApp::new(vpn_win, rt_win, eq_win, cx))
+            let _ = gpui_kit::open_window(opts, cx, move |window, cx| {
+                cx.new(|cx| TachyonApp::new(vpn_win, rt_win, eq_win, window, cx))
             });
             cx.activate(true);
         });
 }
 
-pub fn set_autostart(enable: bool) {
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
-
+pub fn set_autostart_for_exe(exe: &std::path::Path, enable: bool) {
     #[cfg(target_os = "linux")]
     {
         if let Ok(home) = std::env::var("HOME") {
@@ -225,4 +227,11 @@ pub fn set_autostart(enable: bool) {
                 .status();
         }
     }
+}
+
+pub fn set_autostart(enable: bool) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    set_autostart_for_exe(&exe, enable);
 }

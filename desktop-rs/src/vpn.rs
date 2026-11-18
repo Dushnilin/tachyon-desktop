@@ -3780,8 +3780,15 @@ fn score_release_asset_for_current_os(name: &str) -> i32 {
 
     #[cfg(target_os = "windows")]
     {
-        if lower.contains("windows") || lower.contains("win") {
+        if lower.contains("windows")
+            || lower.contains("win")
+            || lower.contains("setup")
+            || lower.contains("install")
+        {
             if lower.ends_with(".exe") {
+                if lower.contains("setup") || lower.contains("install") {
+                    return 70;
+                }
                 return 100;
             }
             if lower.ends_with(".zip") {
@@ -4971,6 +4978,14 @@ mod tests {
             assert_eq!(
                 score_release_asset_for_current_os("Tachyon-windows-x86_64.exe"),
                 100
+            );
+            assert_eq!(
+                score_release_asset_for_current_os("Tachyon-Setup-x86_64.exe"),
+                70
+            );
+            assert!(
+                score_release_asset_for_current_os("Tachyon-windows-x86_64.exe")
+                    > score_release_asset_for_current_os("Tachyon-Setup-x86_64.exe")
             );
             assert_eq!(score_release_asset_for_current_os("SHA256SUMS.txt"), 0);
         }

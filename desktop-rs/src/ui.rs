@@ -5,10 +5,14 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use gpui::component::Sizable as _;
+use gpui::component::input::{Input, InputEvent, InputState};
 use gpui::prelude::*;
+#[cfg(not(target_os = "windows"))]
+use gpui::{MouseButton, MouseDownEvent};
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent,
-    Render, SharedString, Window, div, img, px, svg,
+    AnyElement, App, ClipboardItem, Context, Entity, FontWeight, Render, SharedString,
+    Subscription, Window, WindowControlArea, div, img, px, svg,
 };
 use serde_json::{Value, json};
 
@@ -38,19 +42,6 @@ pub enum RouteSubTab {
     Catalog,
     Custom,
     Apps,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ActiveField {
-    None,
-    ServerSearch,
-    NodeUriInput,
-    NodeNameInput,
-    SubUrlInput,
-    SubHandleInput,
-    RouteSearch,
-    CustomRuleValue,
-    CustomDns,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -130,11 +121,21 @@ pub struct TachyonApp {
     pub state: PersistedState,
     pub tab: Tab,
     pub route_subtab: RouteSubTab,
-    pub active_field: ActiveField,
     pub modal: ModalKind,
     pub vpn: Arc<VpnManager>,
     pub rt: Arc<tokio::runtime::Runtime>,
     pub event_queue: Arc<Mutex<Vec<String>>>,
+
+    // Native input states
+    pub server_search_input: Entity<InputState>,
+    pub route_search_input: Entity<InputState>,
+    pub custom_rule_input: Entity<InputState>,
+    pub node_uri_input_state: Entity<InputState>,
+    pub node_name_input_state: Entity<InputState>,
+    pub sub_url_input_state: Entity<InputState>,
+    pub custom_dns_input_state: Entity<InputState>,
+    pub pasted_multiline_uri: Option<String>,
+    _input_subscriptions: Vec<Subscription>,
 
     // Live runtime telemetry
     pub vpn_status: String, // "disconnected" | "connecting" | "connected" | "error"
@@ -160,7 +161,6 @@ pub struct TachyonApp {
     pub node_uri_input: String,
     pub node_name_input: String,
     pub sub_url_input: String,
-    pub sub_handle_input: String,
     pub route_search: String,
     pub custom_rule_type: String,
     pub custom_rule_value: String,
@@ -198,18 +198,188 @@ impl TachyonApp {
         vpn: Arc<VpnManager>,
         rt: Arc<tokio::runtime::Runtime>,
         event_queue: Arc<Mutex<Vec<String>>>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let state = PersistedState::load();
+        crate::theme::sync_kit_theme(state.light_theme, cx);
+        let is_en = state.language.eq_ignore_ascii_case("en");
+        let custom_dns_init = state.vpn_prefs.custom_dns.clone();
+
+        let server_search_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(if is_en {
+                "Search country or node..."
+            } else {
+                "Поиск страны или узла..."
+            })
+        });
+        let route_search_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(if is_en {
+                "Search 55 services..."
+            } else {
+                "Поиск из 55 сервисов..."
+            })
+        });
+        let custom_rule_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(if is_en {
+                "example.com, 1.2.3.0/24 or game.exe..."
+            } else {
+                "example.com, 1.2.3.0/24 или game.exe..."
+            })
+        });
+        let node_uri_input_state = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(if is_en {
+                "Paste vless://, awg://, vpn://, hy2://, wdtt://, tewfai://, subscription or [Interface] .conf..."
+            } else {
+                "Вставьте vless://, awg://, vpn://, hy2://, wdtt://, tewfai://, подписку или [Interface] .conf..."
+            })
+        });
+        let node_name_input_state = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(if is_en {
+                "Name (optional)"
+            } else {
+                "Название (необяз.)"
+            })
+        });
+        let sub_url_input_state = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("https://... / happ://... / vpn://...")
+        });
+        let custom_dns_input_state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(custom_dns_init.clone())
+                .placeholder(if is_en {
+                    "https://dns.example.com/dns-query or 1.1.1.1"
+                } else {
+                    "https://dns.example.com/dns-query или 1.1.1.1"
+                })
+        });
+
+        let subs = vec![
+            cx.subscribe_in(
+                &server_search_input,
+                window,
+                |this, state, event, _, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        this.server_search = state.read(cx).value().to_string();
+                        cx.notify();
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &route_search_input,
+                window,
+                |this, state, event, _, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        this.route_search = state.read(cx).value().to_string();
+                        cx.notify();
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &custom_rule_input,
+                window,
+                |this, state, event, window, cx| match event {
+                    InputEvent::Change => {
+                        this.custom_rule_value = state.read(cx).value().to_string();
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter { .. } => {
+                        this.submit_custom_rule_ui(window, cx);
+                        cx.notify();
+                    }
+                    _ => {}
+                },
+            ),
+            cx.subscribe_in(
+                &node_uri_input_state,
+                window,
+                |this, state, event, window, cx| match event {
+                    InputEvent::Change => {
+                        let val = state.read(cx).value().to_string();
+                        if let Some(raw) = &this.pasted_multiline_uri {
+                            if val != raw.trim().replace('\n', " ↵ ") {
+                                this.pasted_multiline_uri = None;
+                            }
+                        }
+                        this.node_uri_input = val;
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter { .. } => {
+                        this.submit_node_uri_ui(window, cx);
+                        cx.notify();
+                    }
+                    _ => {}
+                },
+            ),
+            cx.subscribe_in(
+                &node_name_input_state,
+                window,
+                |this, state, event, window, cx| match event {
+                    InputEvent::Change => {
+                        this.node_name_input = state.read(cx).value().to_string();
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter { .. } => {
+                        this.submit_node_uri_ui(window, cx);
+                        cx.notify();
+                    }
+                    _ => {}
+                },
+            ),
+            cx.subscribe_in(
+                &sub_url_input_state,
+                window,
+                |this, state, event, window, cx| match event {
+                    InputEvent::Change => {
+                        this.sub_url_input = state.read(cx).value().to_string();
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter { .. } => {
+                        this.submit_sub_url_ui(window, cx);
+                        cx.notify();
+                    }
+                    _ => {}
+                },
+            ),
+            cx.subscribe_in(
+                &custom_dns_input_state,
+                window,
+                |this, state, event, _, cx| match event {
+                    InputEvent::Change => {
+                        this.state.vpn_prefs.custom_dns = state.read(cx).value().trim().to_string();
+                        this.state.save();
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter { .. } | InputEvent::Blur => {
+                        this.state.vpn_prefs.custom_dns = state.read(cx).value().trim().to_string();
+                        this.state.save();
+                        if this.state.vpn_prefs.dns == "custom" {
+                            this.reconnect_if_active();
+                        }
+                        cx.notify();
+                    }
+                    _ => {}
+                },
+            ),
+        ];
+
         let mut app = Self {
             state,
             tab: Tab::Tunnel,
             route_subtab: RouteSubTab::Catalog,
-            active_field: ActiveField::None,
             modal: ModalKind::None,
             vpn,
             rt,
             event_queue,
+            server_search_input,
+            route_search_input,
+            custom_rule_input,
+            node_uri_input_state,
+            node_name_input_state,
+            sub_url_input_state,
+            custom_dns_input_state,
+            pasted_multiline_uri: None,
+            _input_subscriptions: subs,
             vpn_status: "disconnected".to_string(),
             last_error: String::new(),
             connected_since: None,
@@ -231,7 +401,6 @@ impl TachyonApp {
             node_uri_input: String::new(),
             node_name_input: String::new(),
             sub_url_input: String::new(),
-            sub_handle_input: String::new(),
             route_search: String::new(),
             custom_rule_type: "domain".to_string(),
             custom_rule_value: String::new(),
@@ -1254,158 +1423,243 @@ impl TachyonApp {
         self.show_toast(format!("Добавлено узлов: {imported_count}"));
     }
 
-    pub fn handle_key_down(
-        &mut self,
-        event: &KeyDownEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.active_field == ActiveField::None {
-            return;
-        }
-        let key = event.keystroke.key.as_str();
-        let mods = &event.keystroke.modifiers;
+    pub fn sync_input_placeholders(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let srv_ph = self.tr("Поиск страны или узла...", "Search country or node...");
+        let route_ph = self.tr("Поиск из 55 сервисов...", "Search 55 services...");
+        let rule_ph = self.tr(
+            "example.com, 1.2.3.0/24 или game.exe...",
+            "example.com, 1.2.3.0/24 or game.exe...",
+        );
+        let uri_ph = self.tr(
+            "Вставьте vless://, awg://, vpn://, hy2://, wdtt://, tewfai://, подписку или [Interface] .conf...",
+            "Paste vless://, awg://, vpn://, hy2://, wdtt://, tewfai://, subscription or [Interface] .conf...",
+        );
+        let name_ph = self.tr("Название (необяз.)", "Name (optional)");
+        let dns_ph = self.tr(
+            "https://dns.example.com/dns-query или 1.1.1.1",
+            "https://dns.example.com/dns-query or 1.1.1.1",
+        );
 
-        if key == "escape" {
-            self.active_field = ActiveField::None;
-            cx.notify();
-            return;
-        }
+        self.server_search_input
+            .update(cx, |s, cx| s.set_placeholder(srv_ph, window, cx));
+        self.route_search_input
+            .update(cx, |s, cx| s.set_placeholder(route_ph, window, cx));
+        self.custom_rule_input
+            .update(cx, |s, cx| s.set_placeholder(rule_ph, window, cx));
+        self.node_uri_input_state
+            .update(cx, |s, cx| s.set_placeholder(uri_ph, window, cx));
+        self.node_name_input_state
+            .update(cx, |s, cx| s.set_placeholder(name_ph, window, cx));
+        self.custom_dns_input_state
+            .update(cx, |s, cx| s.set_placeholder(dns_ph, window, cx));
+    }
 
-        if (mods.control || mods.platform) && key.eq_ignore_ascii_case("v") {
-            if let Some(clip) = cx.read_from_clipboard() {
-                if let Some(text) = clip.text() {
-                    self.append_to_active_field(&text);
-                    cx.notify();
-                }
-            }
-            return;
-        }
-
-        if key == "backspace" {
-            self.pop_from_active_field();
-            cx.notify();
-            return;
-        }
-
-        if key == "enter" {
-            match self.active_field {
-                ActiveField::NodeUriInput | ActiveField::NodeNameInput => {
-                    let uri = self.node_uri_input.trim().to_string();
-                    let name = self.node_name_input.trim().to_string();
-                    if !uri.is_empty() {
-                        self.add_single_server_uri(
-                            &uri,
-                            if name.is_empty() { None } else { Some(&name) },
-                        );
-                        self.node_uri_input.clear();
-                        self.node_name_input.clear();
-                    }
-                }
-                ActiveField::SubUrlInput | ActiveField::SubHandleInput => {
-                    let url = self.sub_url_input.trim().to_string();
-                    let handle = self.sub_handle_input.trim().to_string();
-                    if !url.is_empty() {
-                        self.add_single_server_uri(
-                            &url,
-                            if handle.is_empty() {
-                                None
-                            } else {
-                                Some(&handle)
-                            },
-                        );
-                        self.sub_url_input.clear();
-                        self.sub_handle_input.clear();
-                    }
-                }
-                ActiveField::CustomRuleValue => {
-                    self.submit_custom_rule();
-                }
-                _ => {}
-            }
-            cx.notify();
-            return;
-        }
-
-        if !mods.control && !mods.alt && !mods.platform {
-            if let Some(ch) = &event.keystroke.key_char {
-                if !ch.chars().all(|c| c.is_control()) {
-                    self.append_to_active_field(ch);
-                    cx.notify();
-                }
-            } else if key == "space" {
-                self.append_to_active_field(" ");
-                cx.notify();
-            }
+    pub fn submit_custom_rule_ui(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let raw = self.custom_rule_input.read(cx).value().to_string();
+        if self.apply_custom_rules_raw(&raw) {
+            self.custom_rule_value.clear();
+            self.custom_rule_input
+                .update(cx, |s, cx| s.set_value("", window, cx));
         }
     }
 
-    fn append_to_active_field(&mut self, text: &str) {
-        let cleaned = text.replace('\r', "");
-        match self.active_field {
-            ActiveField::None => {}
-            ActiveField::ServerSearch => {
-                self.server_search.push_str(&cleaned.replace('\n', " "));
-            }
-            ActiveField::NodeUriInput => {
-                // Keep newlines for multi-line WireGuard / AmneziaWG .conf paste
-                self.node_uri_input.push_str(&cleaned);
-            }
-            ActiveField::NodeNameInput => {
-                self.node_name_input.push_str(&cleaned.replace('\n', " "));
-            }
-            ActiveField::SubUrlInput => {
-                self.sub_url_input.push_str(&cleaned);
-            }
-            ActiveField::SubHandleInput => {
-                self.sub_handle_input.push_str(&cleaned.replace('\n', " "));
-            }
-            ActiveField::RouteSearch => {
-                self.route_search.push_str(&cleaned.replace('\n', " "));
-            }
-            ActiveField::CustomRuleValue => {
-                self.custom_rule_value.push_str(&cleaned.replace('\n', " "));
-            }
-            ActiveField::CustomDns => {
-                self.state
-                    .vpn_prefs
-                    .custom_dns
-                    .push_str(&cleaned.replace('\n', ""));
-                self.state.save();
+    fn apply_custom_rules_raw(&mut self, raw: &str) -> bool {
+        let entries = parse_custom_rule_entries(&self.custom_rule_type, raw);
+        if entries.is_empty() {
+            return false;
+        }
+        let mut next_num = self
+            .state
+            .custom_rules
+            .iter()
+            .filter_map(|r| r.id.strip_prefix("rule-")?.parse::<u64>().ok())
+            .max()
+            .unwrap_or(0)
+            + 1;
+
+        for (rtype, val) in entries {
+            if let Some(existing) = self
+                .state
+                .custom_rules
+                .iter_mut()
+                .find(|r| r.rule_type == rtype && r.value.eq_ignore_ascii_case(&val))
+            {
+                existing.action = self.custom_rule_action.clone();
+            } else {
+                let id = format!("rule-{next_num}");
+                next_num += 1;
+                self.state.custom_rules.push(CustomRule {
+                    id,
+                    rule_type: rtype,
+                    value: val,
+                    action: self.custom_rule_action.clone(),
+                });
             }
         }
-    }
-
-    fn pop_from_active_field(&mut self) {
-        let target = match self.active_field {
-            ActiveField::None => return,
-            ActiveField::ServerSearch => &mut self.server_search,
-            ActiveField::NodeUriInput => &mut self.node_uri_input,
-            ActiveField::NodeNameInput => &mut self.node_name_input,
-            ActiveField::SubUrlInput => &mut self.sub_url_input,
-            ActiveField::SubHandleInput => &mut self.sub_handle_input,
-            ActiveField::RouteSearch => &mut self.route_search,
-            ActiveField::CustomRuleValue => &mut self.custom_rule_value,
-            ActiveField::CustomDns => &mut self.state.vpn_prefs.custom_dns,
-        };
-        target.pop();
-    }
-
-    pub fn submit_custom_rule(&mut self) {
-        let val = self.custom_rule_value.trim().to_string();
-        if val.is_empty() {
-            return;
-        }
-        let id = format!("rule-{}", self.state.custom_rules.len() + 1);
-        self.state.custom_rules.push(CustomRule {
-            id,
-            rule_type: self.custom_rule_type.clone(),
-            value: val,
-            action: self.custom_rule_action.clone(),
-        });
-        self.custom_rule_value.clear();
+        self.state.save();
         self.reconnect_if_active();
+        true
     }
+
+    pub fn submit_node_uri_ui(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let raw_uri = self
+            .pasted_multiline_uri
+            .take()
+            .unwrap_or_else(|| self.node_uri_input_state.read(cx).value().to_string());
+        let uri = raw_uri.trim().to_string();
+        let name = self
+            .node_name_input_state
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if !uri.is_empty() {
+            self.add_single_server_uri(&uri, if name.is_empty() { None } else { Some(&name) });
+            self.node_uri_input.clear();
+            self.node_name_input.clear();
+            self.node_uri_input_state
+                .update(cx, |s, cx| s.set_value("", window, cx));
+            self.node_name_input_state
+                .update(cx, |s, cx| s.set_value("", window, cx));
+        }
+    }
+
+    pub fn submit_sub_url_ui(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let url = self
+            .sub_url_input_state
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if !url.is_empty() {
+            self.add_single_server_uri(&url, None);
+            self.sub_url_input.clear();
+            self.sub_url_input_state
+                .update(cx, |s, cx| s.set_value("", window, cx));
+        }
+    }
+}
+
+fn is_ip_or_cidr(s: &str) -> bool {
+    if s.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    if let Some((ip_part, prefix_part)) = s.split_once('/') {
+        if let Ok(ip) = ip_part.parse::<std::net::IpAddr>() {
+            if let Ok(prefix) = prefix_part.parse::<u8>() {
+                return match ip {
+                    std::net::IpAddr::V4(_) => prefix <= 32,
+                    std::net::IpAddr::V6(_) => prefix <= 128,
+                };
+            }
+        }
+    }
+    false
+}
+
+fn strip_url_to_host(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let without_scheme = if lower.starts_with("https://") {
+        &trimmed[8..]
+    } else if lower.starts_with("http://") {
+        &trimmed[7..]
+    } else {
+        trimmed
+    };
+    let authority = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    let host_only = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
+    let no_port = if let Some((h, p)) = host_only.rsplit_once(':') {
+        if !h.is_empty() && !h.contains(':') && p.chars().all(|c| c.is_ascii_digit()) {
+            h
+        } else {
+            host_only
+        }
+    } else {
+        host_only
+    };
+    no_port
+        .trim()
+        .trim_start_matches("*.")
+        .trim_end_matches('.')
+        .trim()
+        .to_lowercase()
+}
+
+pub fn parse_custom_rule_entries(selected_type: &str, raw: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for part in raw.split([',', ';', '\n']) {
+        let token = part.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let sel = selected_type.trim().to_ascii_lowercase();
+        if sel == "cidr" || sel == "ip" {
+            out.push(("cidr".to_string(), token.to_string()));
+            continue;
+        }
+        if sel == "process" {
+            let proc_name = std::path::Path::new(token)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .filter(|n| !n.is_empty())
+                .unwrap_or(token)
+                .to_string();
+            out.push(("process".to_string(), proc_name));
+            continue;
+        }
+
+        if is_ip_or_cidr(token) {
+            out.push(("cidr".to_string(), token.to_string()));
+            continue;
+        }
+        if token.to_ascii_lowercase().starts_with("keyword:") {
+            out.push(("domain".to_string(), token.to_string()));
+            continue;
+        }
+        if token.to_ascii_lowercase().ends_with(".exe") {
+            let proc_name = std::path::Path::new(token)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .filter(|n| !n.is_empty())
+                .unwrap_or(token)
+                .to_string();
+            out.push(("process".to_string(), proc_name));
+            continue;
+        }
+
+        let cleaned = strip_url_to_host(token);
+        if cleaned.is_empty() {
+            continue;
+        }
+        if is_ip_or_cidr(&cleaned) {
+            out.push(("cidr".to_string(), cleaned));
+        } else if cleaned.ends_with(".exe") {
+            out.push(("process".to_string(), cleaned));
+        } else {
+            out.push(("domain".to_string(), cleaned));
+        }
+    }
+    out
+}
+
+fn styled_input(state: &Entity<InputState>, height: gpui::Pixels, font_px: f32, t: Theme) -> Input {
+    let input = Input::new(state)
+        .small()
+        .cleanable(true)
+        .text_size(px(font_px))
+        .py(px(2.0))
+        .bg(t.bg_elev)
+        .border_color(t.border)
+        .rounded(px(6.0));
+    Styled::h(input, height)
 }
 
 fn format_mb_per_sec(bps: u64) -> String {
@@ -1472,92 +1726,102 @@ fn render_flag_badge(cc: &str, size_px: f32, t: Theme) -> AnyElement {
 impl TachyonApp {
     fn render_titlebar(&self, t: Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let app_ver = env!("CARGO_PKG_VERSION");
+        let titlebar_drag = div()
+            .id("titlebar-drag")
+            .flex_1()
+            .h_full()
+            .pl(px(14.0))
+            .pr(px(8.0))
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .window_control_area(WindowControlArea::Drag)
+            .child(
+                div()
+                    .w(px(26.0))
+                    .h(px(26.0))
+                    .rounded(px(7.0))
+                    .bg(t.accent_bg)
+                    .border_1()
+                    .border_color(t.accent_border)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        svg()
+                            .path("icons/bolt.svg")
+                            .size(px(14.0))
+                            .text_color(t.accent),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(t.text)
+                                    .child("Tachyon"),
+                            )
+                            .child(
+                                div()
+                                    .px(px(5.0))
+                                    .py(px(1.0))
+                                    .rounded(px(4.0))
+                                    .bg(t.bg_elev)
+                                    .border_1()
+                                    .border_color(t.border)
+                                    .text_size(px(10.0))
+                                    .text_color(t.text_dim)
+                                    .child(app_ver),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(t.text_mute)
+                            .child(self.tr(
+                                "Маршрутизация и туннелирование",
+                                "Routing & Tunneling Engine",
+                            )),
+                    ),
+            );
+
+        #[cfg(not(target_os = "windows"))]
+        let titlebar_drag =
+            titlebar_drag.on_mouse_down(MouseButton::Left, |ev: &MouseDownEvent, window, _| {
+                if ev.click_count == 2 {
+                    window.zoom_window();
+                } else {
+                    window.start_window_move();
+                }
+            });
+
         div()
             .h(px(40.0))
             .w_full()
-            .px(px(14.0))
             .bg(t.bg)
             .border_b_1()
             .border_color(t.border)
             .flex()
             .items_center()
             .justify_between()
-            .on_mouse_down(MouseButton::Left, |ev: &MouseDownEvent, window, _| {
-                if ev.click_count == 2 {
-                    window.zoom_window();
-                } else {
-                    window.start_window_move();
-                }
-            })
+            .child(titlebar_drag)
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap(px(10.0))
-                    .child(
-                        div()
-                            .w(px(26.0))
-                            .h(px(26.0))
-                            .rounded(px(7.0))
-                            .bg(t.accent_bg)
-                            .border_1()
-                            .border_color(t.accent_border)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                svg()
-                                    .path("icons/bolt.svg")
-                                    .size(px(14.0))
-                                    .text_color(t.accent),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(6.0))
-                                    .child(
-                                        div()
-                                            .text_size(px(13.0))
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(t.text)
-                                            .child("Tachyon"),
-                                    )
-                                    .child(
-                                        div()
-                                            .px(px(5.0))
-                                            .py(px(1.0))
-                                            .rounded(px(4.0))
-                                            .bg(t.bg_elev)
-                                            .border_1()
-                                            .border_color(t.border)
-                                            .text_size(px(10.0))
-                                            .text_color(t.text_dim)
-                                            .child(app_ver),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(10.0))
-                                    .text_color(t.text_mute)
-                                    .child(self.tr(
-                                        "Маршрутизация и туннелирование",
-                                        "Routing & Tunneling Engine",
-                                    )),
-                            ),
-                    ),
-            )
-            .child(
-                div()
+                    .pr(px(14.0))
+                    .h_full()
+                    .occlude()
                     .flex()
                     .items_center()
                     .gap(px(4.0))
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
                         div()
                             .id("btn-lang-toggle")
@@ -1575,13 +1839,14 @@ impl TachyonApp {
                             .text_size(px(10.0))
                             .font_weight(FontWeight::BOLD)
                             .text_color(t.accent)
-                            .on_click(cx.listener(|this, _, _, cx| {
+                            .on_click(cx.listener(|this, _, window, cx| {
                                 this.state.language = if this.is_en() {
                                     "ru".to_string()
                                 } else {
                                     "en".to_string()
                                 };
                                 this.state.save();
+                                this.sync_input_placeholders(window, cx);
                                 cx.notify();
                             }))
                             .child(if self.is_en() { "EN" } else { "RU" }),
@@ -1600,6 +1865,7 @@ impl TachyonApp {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.state.light_theme = !this.state.light_theme;
                                 this.state.save();
+                                crate::theme::sync_kit_theme(this.state.light_theme, cx);
                                 cx.notify();
                             }))
                             .child(
@@ -1727,7 +1993,13 @@ impl TachyonApp {
             .pt(px(8.0))
             .pb(px(6.0))
             .flex()
-            .justify_center()
+            .items_center()
+            .child(
+                div()
+                    .flex_1()
+                    .h(px(36.0))
+                    .window_control_area(WindowControlArea::Drag),
+            )
             .child(
                 div()
                     .w_full()
@@ -1762,7 +2034,6 @@ impl TachyonApp {
                             .gap(px(6.0))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.tab = tab_id;
-                                this.active_field = ActiveField::None;
                                 if tab_id == Tab::Traffic {
                                     let v = this.vpn.clone();
                                     let eq = this.event_queue.clone();
@@ -1807,6 +2078,12 @@ impl TachyonApp {
                                 )
                             })
                     })),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .h(px(36.0))
+                    .window_control_area(WindowControlArea::Drag),
             )
     }
 
@@ -2840,53 +3117,19 @@ impl TachyonApp {
                                                     .id("input-srv-search")
                                                     .w(px(176.0))
                                                     .h(px(26.0))
-                                                    .px(px(8.0))
-                                                    .rounded(px(6.0))
-                                                    .bg(t.bg_elev)
-                                                    .border_1()
-                                                    .border_color(
-                                                        if self.active_field
-                                                            == ActiveField::ServerSearch
-                                                        {
-                                                            t.accent
-                                                        } else {
-                                                            t.border
-                                                        },
-                                                    )
-                                                    .cursor_text()
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap(px(6.0))
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.active_field =
-                                                            ActiveField::ServerSearch;
-                                                        cx.notify();
-                                                    }))
                                                     .child(
-                                                        svg()
-                                                            .path("icons/search.svg")
-                                                            .size(px(11.0))
-                                                            .text_color(t.text_dim),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(11.0))
-                                                            .text_color(
-                                                                if self.server_search.is_empty() {
-                                                                    t.text_mute
-                                                                } else {
-                                                                    t.text
-                                                                },
-                                                            )
-                                                            .child(if self.server_search.is_empty() {
-                                                                self.tr(
-                                                                    "Поиск страны или узла...",
-                                                                    "Search country or node...",
-                                                                )
-                                                                .to_string()
-                                                            } else {
-                                                                self.server_search.clone()
-                                                            }),
+                                                        styled_input(
+                                                            &self.server_search_input,
+                                                            px(26.0),
+                                                            11.0,
+                                                            t,
+                                                        )
+                                                        .prefix(
+                                                            svg()
+                                                                .path("icons/search.svg")
+                                                                .size(px(11.0))
+                                                                .text_color(t.text_dim),
+                                                        ),
                                                     ),
                                             )
                                             .child(
@@ -4412,46 +4655,15 @@ impl TachyonApp {
                             .id("input-route-search")
                             .w(px(230.0))
                             .h(px(28.0))
-                            .px(px(8.0))
-                            .rounded(px(6.0))
-                            .bg(t.bg_card)
-                            .border_1()
-                            .border_color(if self.active_field == ActiveField::RouteSearch {
-                                t.accent
-                            } else {
-                                t.border
-                            })
-                            .cursor_text()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.active_field = ActiveField::RouteSearch;
-                                cx.notify();
-                            }))
                             .child(
-                                svg()
-                                    .path("icons/search.svg")
-                                    .size(px(11.0))
-                                    .text_color(t.text_dim),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .text_color(if self.route_search.is_empty() {
-                                        t.text_mute
-                                    } else {
-                                        t.text
-                                    })
-                                    .child(if self.route_search.is_empty() {
-                                        self.tr(
-                                            "Поиск из 55 сервисов...",
-                                            "Search 55 services...",
-                                        )
-                                        .to_string()
-                                    } else {
-                                        self.route_search.clone()
-                                    }),
+                                styled_input(&self.route_search_input, px(28.0), 11.0, t)
+                                    .bg(t.bg_card)
+                                    .prefix(
+                                        svg()
+                                            .path("icons/search.svg")
+                                            .size(px(11.0))
+                                            .text_color(t.text_dim),
+                                    ),
                             ),
                     ),
             )
@@ -4637,40 +4849,7 @@ impl TachyonApp {
                             .id("input-custom-rule")
                             .flex_1()
                             .h(px(30.0))
-                            .px(px(10.0))
-                            .rounded(px(6.0))
-                            .bg(t.bg_elev)
-                            .border_1()
-                            .border_color(if self.active_field == ActiveField::CustomRuleValue {
-                                t.accent
-                            } else {
-                                t.border
-                            })
-                            .cursor_text()
-                            .flex()
-                            .items_center()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.active_field = ActiveField::CustomRuleValue;
-                                cx.notify();
-                            }))
-                            .child(
-                                div()
-                                    .text_size(px(11.5))
-                                    .text_color(if self.custom_rule_value.is_empty() {
-                                        t.text_mute
-                                    } else {
-                                        t.text
-                                    })
-                                    .child(if self.custom_rule_value.is_empty() {
-                                        self.tr(
-                                            "example.com, 1.2.3.0/24 или game.exe...",
-                                            "example.com, 1.2.3.0/24 or game.exe...",
-                                        )
-                                        .to_string()
-                                    } else {
-                                        self.custom_rule_value.clone()
-                                    }),
-                            ),
+                            .child(styled_input(&self.custom_rule_input, px(30.0), 11.5, t)),
                     )
                     .children(
                         [
@@ -4714,8 +4893,8 @@ impl TachyonApp {
                             .text_size(px(11.0))
                             .font_weight(FontWeight::BOLD)
                             .text_color(gpui::rgb(0x0B0B0D))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.submit_custom_rule();
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.submit_custom_rule_ui(window, cx);
                                 cx.notify();
                             }))
                             .child(self.tr("Добавить", "Add")),
@@ -4793,6 +4972,7 @@ impl TachyonApp {
                                             .justify_center()
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.state.custom_rules.retain(|r| r.id != rid);
+                                                this.state.save();
                                                 this.reconnect_if_active();
                                                 cx.notify();
                                             }))
@@ -5157,90 +5337,52 @@ impl TachyonApp {
                             .flex()
                             .items_center()
                             .gap(px(8.0))
-                            .child(
+                            .child({
+                                let view_entity = cx.entity().clone();
+                                let node_uri_entity = self.node_uri_input_state.clone();
                                 div()
                                     .id("input-node-uri")
                                     .flex_1()
                                     .h(px(32.0))
-                                    .px(px(10.0))
-                                    .rounded(px(6.0))
-                                    .bg(t.bg_elev)
-                                    .border_1()
-                                    .border_color(
-                                        if self.active_field == ActiveField::NodeUriInput {
-                                            t.accent
-                                        } else {
-                                            t.border
-                                        },
-                                    )
-                                    .cursor_text()
-                                    .flex()
-                                    .items_center()
-                                    .overflow_hidden()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.active_field = ActiveField::NodeUriInput;
-                                        cx.notify();
-                                    }))
                                     .child(
-                                        div()
-                                            .text_size(px(11.5))
-                                            .text_color(if self.node_uri_input.is_empty() {
-                                                t.text_mute
-                                            } else {
-                                                t.text
-                                            })
-                                            .child(if self.node_uri_input.is_empty() {
-                                                self.tr(
-                                                    "Вставьте vless://, awg://, vpn://, hy2://, wdtt://, tewfai://, подписку или [Interface] .conf...",
-                                                    "Paste vless://, awg://, vpn://, hy2://, wdtt://, tewfai://, subscription or [Interface] .conf...",
-                                                )
-                                                .to_string()
-                                            } else {
-                                                truncate_str(
-                                                    &self.node_uri_input.replace('\n', " ↵ "),
-                                                    78,
-                                                )
+                                        styled_input(&self.node_uri_input_state, px(32.0), 11.5, t)
+                                            .on_paste(move |clip, window, cx| {
+                                                if let Some(raw_text) = clip.text() {
+                                                    let normalized = raw_text.replace('\r', "");
+                                                    if normalized.contains('\n') {
+                                                        let preview =
+                                                            normalized.trim().replace('\n', " ↵ ");
+                                                        node_uri_entity.update(cx, |s, cx| {
+                                                            s.set_value(
+                                                                preview.clone(),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        });
+                                                        view_entity.update(cx, |this, cx| {
+                                                            this.pasted_multiline_uri =
+                                                                Some(normalized);
+                                                            this.node_uri_input = preview;
+                                                            cx.notify();
+                                                        });
+                                                        return true;
+                                                    }
+                                                }
+                                                false
                                             }),
-                                    ),
-                            )
+                                    )
+                            })
                             .child(
                                 div()
                                     .id("input-node-name")
                                     .w(px(170.0))
                                     .h(px(32.0))
-                                    .px(px(10.0))
-                                    .rounded(px(6.0))
-                                    .bg(t.bg_elev)
-                                    .border_1()
-                                    .border_color(
-                                        if self.active_field == ActiveField::NodeNameInput {
-                                            t.accent
-                                        } else {
-                                            t.border
-                                        },
-                                    )
-                                    .cursor_text()
-                                    .flex()
-                                    .items_center()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.active_field = ActiveField::NodeNameInput;
-                                        cx.notify();
-                                    }))
-                                    .child(
-                                        div()
-                                            .text_size(px(11.5))
-                                            .text_color(if self.node_name_input.is_empty() {
-                                                t.text_mute
-                                            } else {
-                                                t.text
-                                            })
-                                            .child(if self.node_name_input.is_empty() {
-                                                self.tr("Название (необяз.)", "Name (optional)")
-                                                    .to_string()
-                                            } else {
-                                                self.node_name_input.clone()
-                                            }),
-                                    ),
+                                    .child(styled_input(
+                                        &self.node_name_input_state,
+                                        px(32.0),
+                                        11.5,
+                                        t,
+                                    )),
                             )
                             .child(
                                 div()
@@ -5256,17 +5398,8 @@ impl TachyonApp {
                                     .text_size(px(11.5))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(gpui::rgb(0x0B0B0D))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        let uri = this.node_uri_input.trim().to_string();
-                                        let name = this.node_name_input.trim().to_string();
-                                        if !uri.is_empty() {
-                                            this.add_single_server_uri(
-                                                &uri,
-                                                if name.is_empty() { None } else { Some(&name) },
-                                            );
-                                            this.node_uri_input.clear();
-                                            this.node_name_input.clear();
-                                        }
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.submit_node_uri_ui(window, cx);
                                         cx.notify();
                                     }))
                                     .child(self.tr("Добавить", "Add")),
@@ -6629,6 +6762,7 @@ impl TachyonApp {
                                             ("9.9.9.9", "Quad9 9.9.9.9"),
                                             ("94.140.14.14", "AdGuard DNS"),
                                             ("77.88.8.8", "Yandex 77.88.8.8"),
+                                            ("custom", self.tr("Свой DNS", "Custom DNS")),
                                         ]
                                         .into_iter()
                                         .map(|(dval, dlabel)| {
@@ -6661,6 +6795,21 @@ impl TachyonApp {
                                         }),
                                     ),
                             )
+                            .when(p.dns == "custom", |el| {
+                                el.child(
+                                    div()
+                                        .id("input-custom-dns")
+                                        .w_full()
+                                        .max_w(px(420.0))
+                                        .h(px(30.0))
+                                        .child(styled_input(
+                                            &self.custom_dns_input_state,
+                                            px(30.0),
+                                            11.5,
+                                            t,
+                                        )),
+                                )
+                            })
                             .when(!self.dns_bench.is_empty(), |el| {
                                 el.child(
                                     div()
@@ -7012,10 +7161,13 @@ impl TachyonApp {
                                                                 t.text_dim
                                                             })
                                                             .on_click(cx.listener(
-                                                                move |this, _, _, cx| {
+                                                                move |this, _, window, cx| {
                                                                     this.state.language =
                                                                         lc.to_string();
                                                                     this.state.save();
+                                                                    this.sync_input_placeholders(
+                                                                        window, cx,
+                                                                    );
                                                                     cx.notify();
                                                                 },
                                                             ))
@@ -7202,29 +7354,78 @@ impl TachyonApp {
                             .justify_between()
                             .child(
                                 div()
-                                    .id("btn-check-updates")
-                                    .px(px(12.0))
-                                    .py(px(6.0))
-                                    .rounded(px(8.0))
-                                    .bg(t.bg_elev)
-                                    .border_1()
-                                    .border_color(t.border)
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(t.bg_hover))
-                                    .text_size(px(11.5))
-                                    .text_color(t.text_soft)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        let v = this.vpn.clone();
-                                        this.rt.spawn(async move {
-                                            v.check_github_update(false).await;
-                                        });
-                                        this.show_toast(this.tr(
-                                            "Проверка обновлений на GitHub...",
-                                            "Checking GitHub for updates...",
-                                        ));
-                                        cx.notify();
-                                    }))
-                                    .child(self.tr("Проверить обновления", "Check for Updates")),
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .child(
+                                        div()
+                                            .id("btn-check-updates")
+                                            .px(px(12.0))
+                                            .py(px(6.0))
+                                            .rounded(px(8.0))
+                                            .bg(t.bg_elev)
+                                            .border_1()
+                                            .border_color(t.border)
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(t.bg_hover))
+                                            .text_size(px(11.5))
+                                            .text_color(t.text_soft)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                let v = this.vpn.clone();
+                                                this.rt.spawn(async move {
+                                                    v.check_github_update(false).await;
+                                                });
+                                                this.show_toast(this.tr(
+                                                    "Проверка обновлений на GitHub...",
+                                                    "Checking GitHub for updates...",
+                                                ));
+                                                cx.notify();
+                                            }))
+                                            .child(self.tr(
+                                                "Проверить обновления",
+                                                "Check for Updates",
+                                            )),
+                                    )
+                                    .children({
+                                        #[cfg(target_os = "windows")]
+                                        {
+                                            Some(
+                                                div()
+                                                    .id("btn-open-installer")
+                                                    .px(px(12.0))
+                                                    .py(px(6.0))
+                                                    .rounded(px(8.0))
+                                                    .bg(t.bg_elev)
+                                                    .border_1()
+                                                    .border_color(t.border)
+                                                    .cursor_pointer()
+                                                    .hover(|s| s.bg(t.bg_hover))
+                                                    .text_size(px(11.5))
+                                                    .text_color(t.text_soft)
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        if let Ok(exe) = std::env::current_exe() {
+                                                            let _ = Command::new(exe)
+                                                                .arg("--install")
+                                                                .spawn();
+                                                            this.show_toast(this.tr(
+                                                                "Запуск мастера установки Tachyon...",
+                                                                "Launching Tachyon Setup...",
+                                                            ));
+                                                            cx.notify();
+                                                        }
+                                                    }))
+                                                    .child(self.tr(
+                                                        "Установить в систему",
+                                                        "Install to System",
+                                                    ))
+                                                    .into_any_element(),
+                                            )
+                                        }
+                                        #[cfg(not(target_os = "windows"))]
+                                        {
+                                            None::<AnyElement>
+                                        }
+                                    }),
                             )
                             .when(self.update_banner.available, |el| {
                                 el.child(
@@ -7331,6 +7532,7 @@ impl TachyonApp {
                     .top_0()
                     .left_0()
                     .size_full()
+                    .occlude()
                     .bg(gpui::rgba(0x000000A6))
                     .flex()
                     .items_center()
@@ -7396,39 +7598,12 @@ impl TachyonApp {
                                             .id("input-sub-url")
                                             .flex_1()
                                             .h(px(32.0))
-                                            .px(px(10.0))
-                                            .rounded(px(6.0))
-                                            .bg(t.bg_elev)
-                                            .border_1()
-                                            .border_color(
-                                                if self.active_field == ActiveField::SubUrlInput {
-                                                    t.accent
-                                                } else {
-                                                    t.border
-                                                },
-                                            )
-                                            .cursor_text()
-                                            .flex()
-                                            .items_center()
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.active_field = ActiveField::SubUrlInput;
-                                                cx.notify();
-                                            }))
-                                            .child(
-                                                div()
-                                                    .text_size(px(11.5))
-                                                    .text_color(if self.sub_url_input.is_empty() {
-                                                        t.text_mute
-                                                    } else {
-                                                        t.text
-                                                    })
-                                                    .child(if self.sub_url_input.is_empty() {
-                                                        "https://... / happ://... / vpn://..."
-                                                            .to_string()
-                                                    } else {
-                                                        truncate_str(&self.sub_url_input, 56)
-                                                    }),
-                                            ),
+                                            .child(styled_input(
+                                                &self.sub_url_input_state,
+                                                px(32.0),
+                                                11.5,
+                                                t,
+                                            )),
                                     )
                                     .child(
                                         div()
@@ -7444,12 +7619,8 @@ impl TachyonApp {
                                             .text_size(px(11.5))
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(gpui::rgb(0x0B0B0D))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                let url = this.sub_url_input.trim().to_string();
-                                                if !url.is_empty() {
-                                                    this.add_single_server_uri(&url, None);
-                                                    this.sub_url_input.clear();
-                                                }
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.submit_sub_url_ui(window, cx);
                                                 cx.notify();
                                             }))
                                             .child(self.tr("Подключить", "Add")),
@@ -7710,7 +7881,6 @@ impl Render for TachyonApp {
             .relative()
             .flex()
             .flex_col()
-            .on_key_down(cx.listener(Self::handle_key_down))
             .child(self.render_titlebar(t, cx))
             .child(self.render_navbar(t, cx))
             .child(
@@ -7818,4 +7988,44 @@ fn pick_conf_files_native() -> Vec<PathBuf> {
         }
     }
     Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_custom_rule_entries;
+
+    #[test]
+    fn test_parse_custom_rule_entries() {
+        assert_eq!(
+            parse_custom_rule_entries("domain", "https://Example.COM/path?q=1"),
+            vec![("domain".to_string(), "example.com".to_string())]
+        );
+        assert_eq!(
+            parse_custom_rule_entries("domain", "example.com, 1.2.3.0/24, game.exe"),
+            vec![
+                ("domain".to_string(), "example.com".to_string()),
+                ("cidr".to_string(), "1.2.3.0/24".to_string()),
+                ("process".to_string(), "game.exe".to_string()),
+            ]
+        );
+        assert_eq!(
+            parse_custom_rule_entries("domain", "http://198.51.100.10:8443/api"),
+            vec![("cidr".to_string(), "198.51.100.10".to_string())]
+        );
+        assert_eq!(
+            parse_custom_rule_entries("cidr", "10.0.0.0/8, 192.168.1.1"),
+            vec![
+                ("cidr".to_string(), "10.0.0.0/8".to_string()),
+                ("cidr".to_string(), "192.168.1.1".to_string()),
+            ]
+        );
+        assert_eq!(
+            parse_custom_rule_entries("process", r"C:\Games\Shooter\game.exe"),
+            vec![("process".to_string(), "game.exe".to_string())]
+        );
+        assert_eq!(
+            parse_custom_rule_entries("domain", "keyword:googlevideo"),
+            vec![("domain".to_string(), "keyword:googlevideo".to_string())]
+        );
+    }
 }

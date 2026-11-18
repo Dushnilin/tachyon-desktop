@@ -20,9 +20,9 @@
 
 | Платформа | Файл в релизе | Особенности запуска и установки |
 | :--- | :--- | :--- |
-| **Windows 10 / 11** (`x86_64`) | `Tachyon-windows-x86_64.exe`<br/>`Tachyon-windows-x86_64.zip` | Портативный одиночный `.exe` — драйвер `wintun.sys`, ядро `tachyon-core` и интерфейс уже вшиты внутрь бинарника (без внешних `.dll`). |
-| **Linux** (`x86_64` / `amd64`) | `tachyon_0.3.5_amd64.deb`<br/>`tachyon-linux-amd64.tar.gz` | Пакет `.deb` для Ubuntu/Debian/Mint или архив с `install.sh` для Arch/Fedora. Автоматически выставляет `cap_net_admin,cap_net_raw+eip` через `setcap`. |
-| **macOS 11+** (`Universal`) | `Tachyon-0.3.5-macOS.dmg` | Универсальный образ (`Apple Silicon M1–M4 + Intel x86_64`). Перетащите `Tachyon.app` в `Applications`. |
+| **Windows 10 / 11** (`x86_64`) | `Tachyon-Setup-x86_64.exe`<br/>`Tachyon-windows-x86_64.exe`<br/>`Tachyon-windows-x86_64.zip` | Установщик `Tachyon-Setup-x86_64.exe` (ярлыки, URI `tachyon://`, удаление из «Установленных приложений», тихий режим `/S`) или портативный одиночный `.exe` без внешних `.dll`. |
+| **Linux** (`x86_64` / `amd64`) | `tachyon_0.3.9_amd64.deb`<br/>`tachyon-linux-amd64.tar.gz` | Пакет `.deb` для Ubuntu/Debian/Mint или архив с `install.sh` для Arch/Fedora. Автоматически выставляет `cap_net_admin,cap_net_raw+eip` через `setcap`. |
+| **macOS 11+** (`Universal`) | `Tachyon-0.3.9-macOS.dmg` | Универсальный образ (`Apple Silicon M1–M4 + Intel x86_64`). Перетащите `Tachyon.app` в `Applications`. |
 
 > **Автообновление из клиента:** в разделе **Опции → Движок и обновления** встроена прямая проверка релизов `Dushnilin/tachyon-desktop` через GitHub Releases API с загрузкой свежего бинарного файла под текущую ОС и атомарной заменой на лету.
 
@@ -98,9 +98,8 @@ cd tachyon-desktop
 ### Windows (`x86_64`)
 
 ```powershell
-cd desktop-rs
-cargo build --release
-# Готовый автономный файл: desktop-rs/target/release/tachyon.exe
+# Сборка портативного .exe, .zip и установщика Tachyon-Setup-x86_64.exe в папку ./dist/
+powershell -ExecutionPolicy Bypass -File .\desktop-rs\scripts\package-windows.ps1 0.3.9
 ```
 
 ### Linux (`Ubuntu / Debian / Arch / Fedora`)
@@ -111,7 +110,7 @@ sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicat
 
 # Сборка .deb и портативного .tar.gz в папку ./dist/
 chmod +x desktop-rs/scripts/package-linux.sh
-./desktop-rs/scripts/package-linux.sh 0.3.1
+./desktop-rs/scripts/package-linux.sh 0.3.9
 ```
 
 ### macOS (`Universal: Apple Silicon + Intel`)
@@ -119,8 +118,8 @@ chmod +x desktop-rs/scripts/package-linux.sh
 ```bash
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
 chmod +x desktop-rs/scripts/package-macos.sh
-./desktop-rs/scripts/package-macos.sh --universal 0.3.1
-# Готовый образ: ./dist/Tachyon-0.3.1-macOS.dmg
+./desktop-rs/scripts/package-macos.sh --universal 0.3.9
+# Готовый образ: ./dist/Tachyon-0.3.9-macOS.dmg
 ```
 
 ---
@@ -139,6 +138,9 @@ chmod +x desktop-rs/scripts/package-macos.sh
 
 ⭐ **Boosty (подписки, донаты, эксклюзив):**  
 👉 [**Поддержать на Boosty**](https://boosty.to/tachyon)
+
+🏦 **СБП (Ozon Банк):**  
+👉 [**Поддержать через СБП (Ozon Банк)**](https://finance.ozon.ru/apps/sbp/ozonbankpay/019af2ed-d158-77a9-a698-2805a5e61be5)
 
 💳 **Карты РФ / СБП / Tinkoff Pay:**  
 👉 [**Поддержать проект на CloudTips**](https://pay.cloudtips.ru/p/449c5ef9)

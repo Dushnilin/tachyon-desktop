@@ -1,4 +1,5 @@
-use gpui::Rgba;
+use gpui::component::theme::{Theme as KitTheme, ThemeMode as KitThemeMode};
+use gpui::{App, Hsla, Rgba, px};
 
 #[inline]
 pub fn rgb_hex(hex: u32) -> Rgba {
@@ -107,4 +108,24 @@ impl Theme {
             Self::dark()
         }
     }
+}
+
+pub fn sync_kit_theme(light: bool, cx: &mut App) {
+    let t = Theme::for_mode(light);
+    let mode = if light {
+        KitThemeMode::Light
+    } else {
+        KitThemeMode::Dark
+    };
+    KitTheme::change(mode, None, cx);
+    KitTheme::update(cx, |kt| {
+        kt.colors.background = Hsla::from(t.bg_elev);
+        kt.colors.foreground = Hsla::from(t.text);
+        kt.colors.muted_foreground = Hsla::from(t.text_dim);
+        kt.colors.input = Hsla::from(t.border);
+        kt.colors.ring = Hsla::from(t.accent);
+        kt.colors.caret = Hsla::from(t.accent);
+        kt.colors.selection = Hsla::from(t.accent_border);
+        kt.radius = px(6.0);
+    });
 }
