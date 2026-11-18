@@ -795,6 +795,33 @@ pub const ROUTE_CATALOG: &[RouteCatalogItem] = &[
     },
 ];
 
+/// Настройки автоматического пинга узлов.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AutoPingPrefs {
+    #[serde(default)]
+    pub enabled: bool,
+    /// true — пинговать все узлы, false — только отмеченные в `ids`.
+    #[serde(default = "default_ap_all")]
+    pub all: bool,
+    #[serde(default = "default_ap_interval")]
+    pub interval_s: u64,
+    #[serde(default)]
+    pub ids: Vec<String>,
+}
+
+fn default_ap_all() -> bool {
+    true
+}
+fn default_ap_interval() -> u64 {
+    15
+}
+
+impl Default for AutoPingPrefs {
+    fn default() -> Self {
+        Self { enabled: false, all: true, interval_s: 15, ids: Vec::new() }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedState {
     #[serde(default)]
@@ -817,6 +844,8 @@ pub struct PersistedState {
     pub light_theme: bool,
     #[serde(default = "default_language")]
     pub language: String,
+    #[serde(default)]
+    pub auto_ping: AutoPingPrefs,
 }
 
 fn default_language() -> String {
@@ -846,6 +875,7 @@ impl Default for PersistedState {
             routed_apps: Vec::new(),
             light_theme: false,
             language: default_language(),
+            auto_ping: AutoPingPrefs::default(),
         }
     }
 }

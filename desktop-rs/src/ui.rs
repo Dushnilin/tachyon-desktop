@@ -11,7 +11,7 @@ use gpui::prelude::*;
 #[cfg(not(target_os = "windows"))]
 use gpui::{MouseButton, MouseDownEvent};
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, Entity, FontWeight, Render, SharedString,
+    AnyElement, App, ClipboardItem, Context, Entity, FocusHandle, FontWeight, Render, SharedString,
     Subscription, Window, WindowControlArea, div, img, px, svg,
 };
 use serde_json::{Value, json};
@@ -179,6 +179,13 @@ pub struct TachyonApp {
     pub toast: Option<(String, Instant)>,
     pub update_banner: UpdateBanner,
     pub last_conns_poll: Instant,
+    // Клавиатурный фокус (без него on_key_down не получает события)
+    pub focus_handle: FocusHandle,
+    // Живой RTT через туннель (не затирает прямой пинг узла)
+    pub live_rtt_ms: Option<i64>,
+    // Автопинг
+    pub last_auto_ping: Instant,
+    pub auto_ping_busy: Option<Instant>,
 }
 
 impl TachyonApp {
@@ -417,6 +424,10 @@ impl TachyonApp {
             toast: None,
             update_banner: UpdateBanner::default(),
             last_conns_poll: Instant::now(),
+            focus_handle: cx.focus_handle(),
+            live_rtt_ms: None,
+            last_auto_ping: Instant::now(),
+            auto_ping_busy: None,
         };
 
         // Initial background tasks
@@ -482,6 +493,19 @@ impl TachyonApp {
                         g.push(format!("conn:data:{data}"));
                     }
                 });
+            }
+        }
+
+        // Автопинг по таймеру
+        if self.state.auto_ping.enabled {
+            let interval = Duration::from_secs(self.state.auto_ping.interval_s.max(3));
+            // Сбрасываем зависший busy через 90с
+            if matches!(self.auto_ping_busy, Some(ts) if ts.elapsed() > Duration::from_secs(90)) {
+                self.auto_ping_busy = None;
+            }
+            if self.auto_ping_busy.is_none() && self.last_auto_ping.elapsed() >= interval {
+                self.last_auto_ping = Instant::now();
+                self.run_auto_ping();
             }
         }
 
@@ -552,13 +576,8 @@ impl TachyonApp {
                     }
                     if let Some(ping) = doc.get("ping").and_then(Value::as_i64) {
                         if ping > 0 {
-                            let aid = self.state.active_id.clone();
-                            if let Some(srv) =
-                                self.state.servers.iter_mut().find(|s| s.id == aid)
-                            {
-                                srv.ping_ms = Some(ping);
-                                srv.alive = Some(true);
-                            }
+                            // RTT «через туннель» — хранится отдельно, не затирает прямой пинг узла
+                            self.live_rtt_ms = Some(ping);
                         }
                     }
                     if let Some(bal) = doc.get("balancer") {
@@ -577,6 +596,7 @@ impl TachyonApp {
                     self.rx_bps = 0;
                     self.tx_bps = 0;
                     self.live_balancer = None;
+                    self.live_rtt_ms = None;
                 }
             } else if let Some(err) = msg.strip_prefix("error:") {
                 self.last_error = err.to_string();
@@ -610,6 +630,9 @@ impl TachyonApp {
                         srv.alive = Some(ms > 0);
                     }
                 }
+            } else if msg == "ping:auto:done" {
+                self.auto_ping_busy = None;
+                self.state.save();
             } else if let Some(done_str) = msg.strip_prefix("ping:batch:done:") {
                 self.state.save();
                 if let Ok(doc) = serde_json::from_str::<Value>(done_str) {
@@ -1108,7 +1131,7 @@ impl TachyonApp {
         if targets.is_empty() {
             return;
         }
-        self.spawn_ping_batch(targets);
+        self.spawn_ping_batch(targets, false);
     }
 
     pub fn ping_all_nodes(&mut self) {
@@ -1122,10 +1145,10 @@ impl TachyonApp {
         if targets.is_empty() {
             return;
         }
-        self.spawn_ping_batch(targets);
+        self.spawn_ping_batch(targets, false);
     }
 
-    fn spawn_ping_batch(&self, targets: Vec<(String, String)>) {
+    fn spawn_ping_batch(&self, targets: Vec<(String, String)>, is_auto: bool) {
         let eq = self.event_queue.clone();
         self.rt.spawn(async move {
             let total = targets.len();
@@ -1152,10 +1175,61 @@ impl TachyonApp {
             }
             let r = reachable.load(std::sync::atomic::Ordering::Relaxed);
             if let Ok(mut g) = eq.lock() {
-                let done = json!({ "reachable": r, "total": total }).to_string();
-                g.push(format!("ping:batch:done:{done}"));
+                if is_auto {
+                    g.push("ping:auto:done".to_string());
+                } else {
+                    let done = json!({ "reachable": r, "total": total }).to_string();
+                    g.push(format!("ping:batch:done:{done}"));
+                }
             }
         });
+    }
+
+    pub fn run_auto_ping(&mut self) {
+        let ap = &self.state.auto_ping;
+        let targets: Vec<(String, String)> = self
+            .state
+            .servers
+            .iter()
+            .filter(|s| !s.is_balancer && (ap.all || ap.ids.contains(&s.id)))
+            .map(|s| (s.id.clone(), s.vless.clone()))
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        self.auto_ping_busy = Some(Instant::now());
+        self.spawn_ping_batch(targets, true);
+    }
+
+    pub fn toggle_auto_ping(&mut self) {
+        self.state.auto_ping.enabled = !self.state.auto_ping.enabled;
+        self.last_auto_ping =
+            Instant::now().checked_sub(Duration::from_secs(3600)).unwrap_or_else(Instant::now);
+        self.state.save();
+    }
+
+    pub fn cycle_auto_ping_interval(&mut self) {
+        const STEPS: [u64; 7] = [5, 10, 15, 30, 60, 120, 300];
+        let cur = self.state.auto_ping.interval_s;
+        self.state.auto_ping.interval_s =
+            STEPS.iter().copied().find(|&x| x > cur).unwrap_or(STEPS[0]);
+        self.state.save();
+    }
+
+    pub fn toggle_auto_ping_all(&mut self) {
+        self.state.auto_ping.all = !self.state.auto_ping.all;
+        self.state.save();
+    }
+
+    pub fn toggle_ping_selected(&mut self, id: &str) {
+        let ap = &mut self.state.auto_ping;
+        if let Some(pos) = ap.ids.iter().position(|x| x == id) {
+            ap.ids.remove(pos);
+        } else {
+            ap.ids.push(id.to_string());
+        }
+        ap.all = false;
+        self.state.save();
     }
 
     pub fn create_custom_balancer_from_nodes(&mut self) {
@@ -2543,7 +2617,10 @@ impl TachyonApp {
                                             ),
                                     )
                                     .when_some(
-                                        active_srv.as_ref().and_then(|s| s.ping_ms),
+                                        // Когда подключены — показываем RTT через туннель,
+                                        // когда нет — прямой пинг узла
+                                        self.live_rtt_ms
+                                            .or_else(|| active_srv.as_ref().and_then(|s| s.ping_ms)),
                                         |el, ms| {
                                             el.child(
                                                 div()
@@ -7870,11 +7947,15 @@ impl TachyonApp {
 }
 
 impl Render for TachyonApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = Theme::for_mode(self.state.light_theme);
+
+        // Устанавливаем фокус на корневой элемент, чтобы input-поля получали клавиатурные события
+        window.focus(&self.focus_handle, cx);
 
         div()
             .id("tachyon-root")
+            .track_focus(&self.focus_handle)
             .size_full()
             .bg(t.bg)
             .text_color(t.text)
