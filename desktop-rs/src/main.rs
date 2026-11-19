@@ -21,16 +21,37 @@ use gpui::{
 
 use crate::icons::TachyonAssetSource;
 use crate::ui::TachyonApp;
-use crate::vpn::{VpnManager, app_data_dir, set_system_proxy};
+use crate::vpn::{VpnManager, app_data_dir, cleanup_stale_state_on_startup, flush_os_dns};
+
+fn has_tun_inbound(root: &serde_json::Value) -> bool {
+    root.get("inbounds")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|arr| {
+            arr.iter()
+                .any(|ib| ib.get("type").and_then(serde_json::Value::as_str) == Some("tun"))
+        })
+}
 
 fn run_core_worker_mode(cfg_path: &str) -> i32 {
+    let data_dir = app_data_dir();
+    let pid_file = data_dir.join("core.pid");
+    let err_file = data_dir.join("core.err");
+    let stop_file = data_dir.join("config.stop");
+    let _ = fs::remove_file(&err_file);
+    let _ = fs::write(&pid_file, std::process::id().to_string());
+
+    let fail = |msg: String| -> i32 {
+        eprintln!("run-core: {msg}");
+        let _ = fs::write(&err_file, &msg);
+        let _ = fs::remove_file(&pid_file);
+        1
+    };
+
     let Ok(raw) = fs::read_to_string(cfg_path) else {
-        eprintln!("run-core: failed to read {cfg_path}");
-        return 1;
+        return fail(format!("failed to read {cfg_path}"));
     };
     let Ok(root) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        eprintln!("run-core: invalid JSON in {cfg_path}");
-        return 1;
+        return fail(format!("invalid JSON in {cfg_path}"));
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -38,30 +59,49 @@ fn run_core_worker_mode(cfg_path: &str) -> i32 {
         .build()
         .expect("tokio runtime");
 
-    rt.block_on(async move {
+    let stop_file_wait = stop_file.clone();
+    let code = rt.block_on(async move {
         let mut bx = match core_runtime::start(&root).await {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("run-core: {e:#}");
+                let msg = format!("{e:#}");
+                eprintln!("run-core: {msg}");
+                let _ = fs::write(&err_file, &msg);
                 return 1;
             }
         };
-        let stop_file = app_data_dir().join("config.stop");
+
+        #[cfg(target_os = "windows")]
+        if has_tun_inbound(&root)
+            && core_runtime::inbound::tun::active_win_outbound_if_index().is_none()
+        {
+            let msg = "Не удалось открыть виртуальный адаптер Wintun (ошибка драйвера или прав)"
+                .to_string();
+            eprintln!("run-core: {msg}");
+            let _ = fs::write(&err_file, &msg);
+            bx.shutdown_wait().await;
+            return 1;
+        }
+
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
             _ = async {
                 loop {
-                    if stop_file.exists() {
-                        let _ = fs::remove_file(&stop_file);
+                    if stop_file_wait.exists() {
                         break;
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
             } => {}
         }
         bx.shutdown_wait().await;
+        flush_os_dns();
         0
-    })
+    });
+
+    let _ = fs::remove_file(&stop_file);
+    let _ = fs::remove_file(&pid_file);
+    code
 }
 
 fn main() {
@@ -95,7 +135,7 @@ fn main() {
     );
     let _rt_guard = rt.enter();
 
-    set_system_proxy(false);
+    cleanup_stale_state_on_startup();
 
     let event_queue: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     crate::tray::init(event_queue.clone());

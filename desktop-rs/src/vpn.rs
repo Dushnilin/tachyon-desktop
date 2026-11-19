@@ -3,6 +3,7 @@ use std::fs;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -1012,10 +1013,12 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 struct RunningEngine {
     in_proc: Option<BoxInstance>,
     worker: Option<Child>,
+    worker_pid: Option<u32>,
     running_config: Value,
     proxy_mode: bool,
     block_only: bool,
     has_node: bool,
+    suppress_fake_ip: bool,
 }
 
 impl RunningEngine {
@@ -1023,18 +1026,10 @@ impl RunningEngine {
         if let Some(mut bx) = self.in_proc.take() {
             bx.shutdown_wait().await;
         }
-        if let Some(mut child) = self.worker.take() {
-            let stop_file = app_data_dir().join("config.stop");
-            let _ = fs::write(&stop_file, b"1");
-            for _ in 0..10 {
-                if let Ok(Some(_)) = child.try_wait() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(120)).await;
-            }
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = fs::remove_file(&stop_file);
+        let child_opt = self.worker.take();
+        let pid_opt = self.worker_pid.take().or_else(read_core_pid_file);
+        if child_opt.is_some() || pid_opt.is_some() {
+            stop_worker_process(child_opt, pid_opt).await;
         }
     }
 }
@@ -1048,6 +1043,7 @@ pub struct VpnManager {
     speedtest_cancel: Arc<Mutex<Option<tokio::sync::watch::Sender<bool>>>>,
     last_connect_opts: Arc<Mutex<Option<String>>>,
     kill_switch: Arc<Mutex<bool>>,
+    connect_gen: Arc<AtomicU64>,
     send_js: Arc<dyn Fn(String) + Send + Sync>,
 }
 
@@ -1070,6 +1066,7 @@ impl VpnManager {
             speedtest_cancel: Arc::new(Mutex::new(None)),
             last_connect_opts: Arc::new(Mutex::new(None)),
             kill_switch: Arc::new(Mutex::new(false)),
+            connect_gen: Arc::new(AtomicU64::new(0)),
             send_js,
         }
     }
@@ -1091,6 +1088,12 @@ impl VpnManager {
         if let Some(eng) = guard.as_mut() {
             if let Some(child) = eng.worker.as_mut() {
                 if let Ok(Some(_)) = child.try_wait() {
+                    *guard = None;
+                    return false;
+                }
+            }
+            if let Some(pid) = eng.worker_pid {
+                if !is_pid_alive(pid) {
                     *guard = None;
                     return false;
                 }
@@ -1761,6 +1764,14 @@ impl VpnManager {
     }
 
     pub fn build_config(&self, opts: &ConnectOptions) -> Result<(Value, bool), String> {
+        self.build_config_with_fakeip_override(opts, false)
+    }
+
+    fn build_config_with_fakeip_override(
+        &self,
+        opts: &ConnectOptions,
+        suppress_fake_ip: bool,
+    ) -> Result<(Value, bool), String> {
         let has_main_node = !opts.block_only
             && opts.route != RouteMode::DesyncOnly
             && !opts.vless.trim().is_empty();
@@ -1852,7 +1863,7 @@ impl VpnManager {
         let remote_dns = Self::build_remote_dns_server(&opts.dns, &opts.dns_transport, dns_detour);
         dns_servers.push(remote_dns);
 
-        let fake_ip_enabled = opts.fake_ip && !opts.proxy_mode;
+        let fake_ip_enabled = opts.fake_ip && !opts.proxy_mode && !suppress_fake_ip;
         if fake_ip_enabled {
             let mut fip = json!({
                 "type": "fakeip",
@@ -2735,6 +2746,7 @@ impl VpnManager {
     }
 
     pub async fn connect(&self, options_json: String) {
+        let my_gen = self.connect_gen.fetch_add(1, Ordering::AcqRel) + 1;
         let opts = match ConnectOptions::parse(&options_json) {
             Ok(o) => {
                 *self.last_connect_opts.lock().unwrap() = Some(options_json.clone());
@@ -2747,30 +2759,28 @@ impl VpnManager {
         };
 
         self.ensure_community_rulesets(&opts, false).await;
-
-        let (cfg_val, has_node) = match self.build_config(&opts) {
-            Ok(res) => res,
-            Err(e) => {
-                self.emit_vpn(json!({ "state": "error", "error": e }));
-                return;
-            }
-        };
-
         let cfg_path = self.data_dir.join("config.json");
-        let cfg_text = serde_json::to_string_pretty(&cfg_val).unwrap_or_default();
-        let _ = fs::write(&cfg_path, &cfg_text);
 
         // Try in-place hot reload if already running in the same mode
         {
             let mut guard = self.engine.lock().await;
             if let Some(eng) = guard.as_mut() {
                 if eng.proxy_mode == opts.proxy_mode && !eng.block_only && !opts.block_only {
+                    let suppress_fake_ip = eng.suppress_fake_ip;
+                    let Ok((cfg_val, has_node)) =
+                        self.build_config_with_fakeip_override(&opts, suppress_fake_ip)
+                    else {
+                        return;
+                    };
+                    let cfg_text = serde_json::to_string_pretty(&cfg_val).unwrap_or_default();
+                    let _ = fs::write(&cfg_path, &cfg_text);
+
                     let mut reloaded = false;
                     if let Some(bx) = eng.in_proc.as_mut() {
                         if bx.reload_in_place(&cfg_val).await.is_ok() {
                             reloaded = true;
                         }
-                    } else if eng.worker.is_some() {
+                    } else if eng.worker.is_some() || eng.worker_pid.is_some() {
                         let body = json!({ "path": cfg_path.to_string_lossy() }).to_string();
                         if let Ok((status, _)) = clash_api_request(
                             API_PORT,
@@ -2810,15 +2820,46 @@ impl VpnManager {
         {
             let mut guard = self.engine.lock().await;
             if let Some(mut old) = guard.take() {
+                let was_proxy = old.proxy_mode;
                 old.stop().await;
+                if was_proxy {
+                    set_system_proxy(false);
+                }
             }
         }
+
+        if self.connect_gen.load(Ordering::Acquire) != my_gen {
+            return;
+        }
+
+        // Определяем, активен ли в текущей сети шлюз с тем же FakeIP-пулом (198.18.0.0/15),
+        // строго до поднятия локального TUN, чтобы избежать конфликта таблиц FakeIP.
+        let suppress_fake_ip = if opts.fake_ip && !opts.proxy_mode {
+            detect_upstream_fakeip().await
+        } else {
+            false
+        };
+        if suppress_fake_ip {
+            flush_os_dns();
+        }
+
+        let (cfg_val, has_node) =
+            match self.build_config_with_fakeip_override(&opts, suppress_fake_ip) {
+                Ok(res) => res,
+                Err(e) => {
+                    self.emit_vpn(json!({ "state": "error", "error": e }));
+                    return;
+                }
+            };
+        let cfg_text = serde_json::to_string_pretty(&cfg_val).unwrap_or_default();
+        let _ = fs::write(&cfg_path, &cfg_text);
 
         #[cfg(target_os = "windows")]
         refresh_cached_windows_phys_ifindex();
 
         let mut started_in_proc: Option<BoxInstance> = None;
         let mut started_worker: Option<Child> = None;
+        let mut started_worker_pid: Option<u32> = None;
 
         // On Windows/macOS/Linux, opening a TUN adapter (Wintun / utun / /dev/net/tun)
         // requires administrator/root privileges. Note that `core_runtime::inbound::tun::Tun::bind`
@@ -2841,8 +2882,9 @@ impl VpnManager {
                     if tun_failed_passively {
                         bx.shutdown_wait().await;
                         match spawn_elevated_worker(&cfg_path, &self.secret).await {
-                            Ok(child) => {
-                                started_worker = Some(child);
+                            Ok((child, pid)) => {
+                                started_worker = child;
+                                started_worker_pid = pid;
                             }
                             Err(elev_err) => {
                                 self.emit_vpn(json!({
@@ -2870,8 +2912,9 @@ impl VpnManager {
 
                     if need_elevation {
                         match spawn_elevated_worker(&cfg_path, &self.secret).await {
-                            Ok(child) => {
-                                started_worker = Some(child);
+                            Ok((child, pid)) => {
+                                started_worker = child;
+                                started_worker_pid = pid;
                             }
                             Err(elev_err) => {
                                 self.emit_vpn(json!({
@@ -2894,8 +2937,9 @@ impl VpnManager {
             }
         } else {
             match spawn_elevated_worker(&cfg_path, &self.secret).await {
-                Ok(child) => {
-                    started_worker = Some(child);
+                Ok((child, pid)) => {
+                    started_worker = child;
+                    started_worker_pid = pid;
                 }
                 Err(elev_err) => {
                     self.emit_vpn(json!({
@@ -2907,21 +2951,40 @@ impl VpnManager {
             }
         }
 
+        if self.connect_gen.load(Ordering::Acquire) != my_gen {
+            let mut aborted = RunningEngine {
+                in_proc: started_in_proc,
+                worker: started_worker,
+                worker_pid: started_worker_pid,
+                running_config: cfg_val,
+                proxy_mode: opts.proxy_mode,
+                block_only: opts.block_only,
+                has_node,
+                suppress_fake_ip,
+            };
+            aborted.stop().await;
+            cleanup_orphaned_wintun_routes();
+            flush_os_dns();
+            return;
+        }
+
         {
             let mut guard = self.engine.lock().await;
             *guard = Some(RunningEngine {
                 in_proc: started_in_proc,
                 worker: started_worker,
+                worker_pid: started_worker_pid,
                 running_config: cfg_val,
                 proxy_mode: opts.proxy_mode,
                 block_only: opts.block_only,
                 has_node,
+                suppress_fake_ip,
             });
         }
 
         if opts.proxy_mode {
             set_system_proxy(true);
-        } else {
+        } else if windows_proxy_points_to_us() {
             set_system_proxy(false);
         }
         flush_os_dns();
@@ -2940,6 +3003,7 @@ impl VpnManager {
     }
 
     pub async fn disconnect(&self) {
+        self.connect_gen.fetch_add(1, Ordering::AcqRel);
         self.stop_stats_loop();
         let mut was_proxy = false;
         {
@@ -2949,12 +3013,14 @@ impl VpnManager {
                 eng.stop().await;
             }
         }
-        if was_proxy {
+        if was_proxy || windows_proxy_points_to_us() {
             set_system_proxy(false);
         }
         if *self.kill_switch.lock().unwrap() {
             apply_kill_switch(false);
         }
+        cleanup_orphaned_wintun_routes();
+        flush_os_dns();
         self.emit_vpn(json!({ "state": "off" }));
     }
 
@@ -4843,13 +4909,227 @@ fn is_current_process_elevated() -> bool {
     }
 }
 
-async fn spawn_elevated_worker(cfg_path: &Path, secret: &str) -> Result<Child, String> {
+fn core_pid_path() -> PathBuf {
+    app_data_dir().join("core.pid")
+}
+
+fn core_err_path() -> PathBuf {
+    app_data_dir().join("core.err")
+}
+
+fn read_core_pid_file() -> Option<u32> {
+    fs::read_to_string(core_pid_path())
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&pid| pid != 0 && pid != std::process::id())
+}
+
+fn read_core_err_file() -> Option<String> {
+    fs::read_to_string(core_err_path())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn is_pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, GetLastError};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        const STILL_ACTIVE_CODE: u32 = 259;
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return unsafe { GetLastError() } == ERROR_ACCESS_DENIED;
+        }
+        let mut exit_code: u32 = 0;
+        let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
+        unsafe {
+            CloseHandle(handle);
+        }
+        ok != 0 && exit_code == STILL_ACTIVE_CODE
+    }
+    #[cfg(unix)]
+    {
+        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if rc == 0 {
+            true
+        } else {
+            std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        }
+    }
+}
+
+fn terminate_pid(pid: u32) {
+    if pid == 0 || pid == std::process::id() {
+        return;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_TERMINATE, TerminateProcess,
+        };
+        let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+        if !handle.is_null() {
+            unsafe {
+                let _ = TerminateProcess(handle, 1);
+                CloseHandle(handle);
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        unsafe {
+            let _ = libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+    }
+}
+
+fn cleanup_orphaned_wintun_routes() {
+    #[cfg(target_os = "windows")]
+    {
+        if read_core_pid_file().is_some_and(is_pid_alive) {
+            return;
+        }
+        use std::os::windows::process::CommandExt;
+        for prefix in [("0.0.0.0", "128.0.0.0"), ("128.0.0.0", "128.0.0.0")] {
+            let _ = Command::new("route")
+                .args(["delete", prefix.0, "mask", prefix.1, "172.19.0.1"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .status();
+        }
+    }
+}
+
+async fn stop_worker_process(mut child_opt: Option<Child>, pid_opt: Option<u32>) {
+    let stop_file = app_data_dir().join("config.stop");
+    let _ = fs::write(&stop_file, b"1");
+
+    // Ждём штатного завершения `--run-core` (`bx.shutdown_wait` с watchdog до 20 с).
+    // Файл `config.stop` не удаляется, пока процесс не завершится.
+    let mut exited = false;
+    for _ in 0..220 {
+        let child_done = match child_opt.as_mut() {
+            Some(c) => matches!(c.try_wait(), Ok(Some(_))),
+            None => true,
+        };
+        let pid_done = match pid_opt {
+            Some(pid) => !is_pid_alive(pid),
+            None => true,
+        };
+        if child_done && pid_done {
+            exited = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    if !exited {
+        if let Some(pid) = pid_opt {
+            terminate_pid(pid);
+        }
+        if let Some(mut c) = child_opt.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        for _ in 0..20 {
+            if pid_opt.is_none_or(|p| !is_pid_alive(p)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    } else if let Some(mut c) = child_opt.take() {
+        let _ = c.wait();
+    }
+
+    let _ = fs::remove_file(&stop_file);
+    let _ = fs::remove_file(core_pid_path());
+}
+
+fn is_fakeip_pool_addr(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 198 && (o[1] == 18 || o[1] == 19)
+        }
+        IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            (first & 0xffc0) == 0xfc00
+        }
+    }
+}
+
+async fn detect_upstream_fakeip() -> bool {
+    for host in ["cloudflare.com", "google.com"] {
+        if let Ok(Ok(addrs)) = tokio::time::timeout(
+            Duration::from_millis(350),
+            tokio::net::lookup_host((host, 443)),
+        )
+        .await
+        {
+            if addrs.into_iter().any(|sa| is_fakeip_pool_addr(sa.ip())) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn cleanup_stale_state_on_startup() {
+    if let Some(stale_pid) = read_core_pid_file() {
+        if is_pid_alive(stale_pid) {
+            let stop_file = app_data_dir().join("config.stop");
+            let _ = fs::write(&stop_file, b"1");
+            for _ in 0..60 {
+                if !is_pid_alive(stale_pid) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if is_pid_alive(stale_pid) {
+                terminate_pid(stale_pid);
+            }
+        }
+    }
+    let _ = fs::remove_file(app_data_dir().join("config.stop"));
+    let _ = fs::remove_file(core_pid_path());
+    let _ = fs::remove_file(core_err_path());
+    cleanup_orphaned_wintun_routes();
+    #[cfg(target_os = "windows")]
+    {
+        if windows_proxy_points_to_us() {
+            set_system_proxy(false);
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    set_system_proxy(false);
+    apply_kill_switch(false);
+    flush_os_dns();
+}
+
+async fn spawn_elevated_worker(
+    cfg_path: &Path,
+    secret: &str,
+) -> Result<(Option<Child>, Option<u32>), String> {
+    if let Some(stale_pid) = read_core_pid_file() {
+        if is_pid_alive(stale_pid) {
+            stop_worker_process(None, Some(stale_pid)).await;
+        }
+    }
+    let _ = fs::remove_file(app_data_dir().join("config.stop"));
+    let _ = fs::remove_file(core_pid_path());
+    let _ = fs::remove_file(core_err_path());
+
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let cfg_str = cfg_path.to_string_lossy().into_owned();
-    let _ = fs::remove_file(app_data_dir().join("config.stop"));
 
     #[cfg(target_os = "linux")]
-    let mut child = {
+    let (mut child_opt, mut worker_pid): (Option<Child>, Option<u32>) = {
         // First try granting capabilities to the binary via pkexec so future starts don't even need a worker
         let _ = Command::new("pkexec")
             .args([
@@ -4859,7 +5139,7 @@ async fn spawn_elevated_worker(cfg_path: &Path, secret: &str) -> Result<Child, S
             ])
             .status();
 
-        Command::new("pkexec")
+        let ch = Command::new("pkexec")
             .arg(&exe)
             .arg("--run-core")
             .arg(&cfg_str)
@@ -4867,59 +5147,118 @@ async fn spawn_elevated_worker(cfg_path: &Path, secret: &str) -> Result<Child, S
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| format!("pkexec error: {e}"))?
+            .map_err(|e| format!("pkexec error: {e}"))?;
+        let pid = Some(ch.id());
+        (Some(ch), pid)
     };
 
     #[cfg(target_os = "macos")]
-    let mut child = {
+    let (mut child_opt, mut worker_pid): (Option<Child>, Option<u32>) = {
         let script = format!(
             "do shell script \"'{}' --run-core '{}'\" with administrator privileges",
             exe.to_string_lossy().replace('\'', "'\\''"),
             cfg_str.replace('\'', "'\\''")
         );
-        Command::new("osascript")
+        let ch = Command::new("osascript")
             .arg("-e")
             .arg(&script)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| format!("osascript error: {e}"))?
+            .map_err(|e| format!("osascript error: {e}"))?;
+        let pid = Some(ch.id());
+        (Some(ch), pid)
     };
 
     #[cfg(target_os = "windows")]
-    let mut child = {
+    let (mut child_opt, mut worker_pid): (Option<Child>, Option<u32>) = {
+        use std::io::Read;
         use std::os::windows::process::CommandExt;
         let ps_cmd = format!(
-            "$p = Start-Process -FilePath '{}' -ArgumentList '--run-core','{}' -Verb RunAs -WindowStyle Hidden -PassThru; Wait-Process -Id $p.Id",
+            "$p = Start-Process -FilePath '{}' -ArgumentList '--run-core','{}' -Verb RunAs -WindowStyle Hidden -PassThru; if ($p) {{ Write-Output $p.Id }} else {{ exit 1 }}",
             exe.to_string_lossy().replace('\'', "''"),
             cfg_str.replace('\'', "''")
         );
-        Command::new("powershell")
+        let mut launcher = Command::new("powershell")
             .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps_cmd])
             .creation_flags(CREATE_NO_WINDOW)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| format!("UAC elevation error: {e}"))?
+            .map_err(|e| format!("UAC elevation error: {e}"))?;
+
+        let uac_deadline = Instant::now() + Duration::from_secs(45);
+        let mut status_opt = None;
+        while Instant::now() < uac_deadline {
+            match launcher.try_wait() {
+                Ok(Some(st)) => {
+                    status_opt = Some(st);
+                    break;
+                }
+                Ok(None) => tokio::time::sleep(Duration::from_millis(100)).await,
+                Err(e) => return Err(format!("UAC wait error: {e}")),
+            }
+        }
+        let Some(status) = status_opt else {
+            let _ = launcher.kill();
+            let _ = launcher.wait();
+            return Err("Превышено время ожидания подтверждения прав администратора".to_string());
+        };
+        if !status.success() {
+            return Err("Запрос прав администратора отклонён".to_string());
+        }
+        let mut out_str = String::new();
+        if let Some(mut out) = launcher.stdout.take() {
+            let _ = out.read_to_string(&mut out_str);
+        }
+        let pid = out_str
+            .lines()
+            .find_map(|line| line.trim().parse::<u32>().ok())
+            .or_else(read_core_pid_file);
+        (None, pid)
     };
 
     // Wait up to 15 seconds for Clash API to come up
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
-        if let Ok(Some(code)) = child.try_wait() {
-            return Err(format!("Elevated worker exited with {code}"));
+        if worker_pid.is_none() {
+            worker_pid = read_core_pid_file();
+        }
+        if let Some(err_msg) = read_core_err_file() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = fs::remove_file(core_pid_path());
+            return Err(err_msg);
+        }
+        if let Some(c) = child_opt.as_mut() {
+            if let Ok(Some(code)) = c.try_wait() {
+                let err_msg = read_core_err_file()
+                    .unwrap_or_else(|| format!("Elevated worker exited with {code}"));
+                return Err(err_msg);
+            }
+        } else if let Some(pid) = worker_pid {
+            if !is_pid_alive(pid) {
+                let err_msg = read_core_err_file()
+                    .unwrap_or_else(|| format!("Привилегированный процесс {pid} завершился"));
+                let _ = fs::remove_file(core_pid_path());
+                return Err(err_msg);
+            }
         }
         if let Ok((200, _)) = clash_api_request(API_PORT, secret, "GET", "/connections", None).await
         {
-            return Ok(child);
+            if worker_pid.is_none() {
+                worker_pid = read_core_pid_file();
+            }
+            return Ok((child_opt, worker_pid));
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    let _ = child.kill();
-    Err("Таймаут ожидания запуска привилегированного процесса".to_string())
+    stop_worker_process(child_opt, worker_pid.or_else(read_core_pid_file)).await;
+    cleanup_orphaned_wintun_routes();
+    Err(read_core_err_file()
+        .unwrap_or_else(|| "Таймаут ожидания запуска привилегированного процесса".to_string()))
 }
 
 pub async fn icmp_or_tcp_ping_ms(host: &str, timeout_ms: u64) -> i64 {
@@ -5217,6 +5556,61 @@ fn default_macos_phys_ifindex() -> Option<libc::c_uint> {
     None
 }
 
+fn windows_proxy_points_to_us() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        let our_addr = format!("127.0.0.1:{PROXY_PORT}");
+        if let Ok(out) = Command::new("reg")
+            .args([
+                "query",
+                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+                "/v",
+                "ProxyServer",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            return text.contains(&our_addr);
+        }
+        false
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn notify_wininet_proxy_changed() {
+    const INTERNET_OPTION_REFRESH: u32 = 37;
+    const INTERNET_OPTION_SETTINGS_CHANGED: u32 = 39;
+    #[link(name = "wininet")]
+    unsafe extern "system" {
+        fn InternetSetOptionW(
+            h_internet: *mut std::ffi::c_void,
+            dw_option: u32,
+            lp_buffer: *const std::ffi::c_void,
+            dw_buffer_length: u32,
+        ) -> i32;
+    }
+    unsafe {
+        let _ = InternetSetOptionW(
+            std::ptr::null_mut(),
+            INTERNET_OPTION_SETTINGS_CHANGED,
+            std::ptr::null(),
+            0,
+        );
+        let _ = InternetSetOptionW(
+            std::ptr::null_mut(),
+            INTERNET_OPTION_REFRESH,
+            std::ptr::null(),
+            0,
+        );
+    }
+}
+
 pub fn set_system_proxy(enable: bool) {
     #[cfg(target_os = "linux")]
     {
@@ -5271,11 +5665,12 @@ pub fn set_system_proxy(enable: bool) {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
+        const REG_PATH: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
         let enable_val = if enable { "1" } else { "0" };
         let _ = Command::new("reg")
             .args([
                 "add",
-                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+                REG_PATH,
                 "/v",
                 "ProxyEnable",
                 "/t",
@@ -5290,7 +5685,7 @@ pub fn set_system_proxy(enable: bool) {
             let _ = Command::new("reg")
                 .args([
                     "add",
-                    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+                    REG_PATH,
                     "/v",
                     "ProxyServer",
                     "/t",
@@ -5301,7 +5696,13 @@ pub fn set_system_proxy(enable: bool) {
                 ])
                 .creation_flags(CREATE_NO_WINDOW)
                 .status();
+        } else if windows_proxy_points_to_us() {
+            let _ = Command::new("reg")
+                .args(["delete", REG_PATH, "/v", "ProxyServer", "/f"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .status();
         }
+        notify_wininet_proxy_changed();
     }
 }
 
@@ -6480,5 +6881,54 @@ mod tests {
             .find(|o| o["tag"] == "PROXY")
             .unwrap();
         assert!(proxy_ob.get("tcp_fast_open").is_none());
+    }
+
+    #[test]
+    fn upstream_fakeip_detection_and_override_disables_local_fakeip() {
+        assert!(is_fakeip_pool_addr("198.18.0.69".parse().unwrap()));
+        assert!(is_fakeip_pool_addr("198.19.255.1".parse().unwrap()));
+        assert!(is_fakeip_pool_addr("fc00::1".parse().unwrap()));
+        assert!(!is_fakeip_pool_addr("1.1.1.1".parse().unwrap()));
+        assert!(!is_fakeip_pool_addr("10.255.0.1".parse().unwrap()));
+
+        let mut st = crate::state::PersistedState::default();
+        st.vpn_prefs.mode = "tun".to_string();
+        st.vpn_prefs.route = "desync".to_string();
+        st.vpn_prefs.fake_ip = true;
+        st.desync_prefs.enabled = true;
+
+        let mgr = VpnManager::new(Arc::new(|_| {}));
+        let opts = ConnectOptions::parse(&st.build_connect_payload(None)).expect("parse opts");
+
+        let (cfg_normal, _) = mgr
+            .build_config_with_fakeip_override(&opts, false)
+            .expect("normal build");
+        assert!(
+            cfg_normal["dns"]["servers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["tag"] == "dns-fakeip")
+        );
+        assert_eq!(
+            cfg_normal["experimental"]["cache_file"]["store_fakeip"],
+            json!(true)
+        );
+
+        let (cfg_suppressed, _) = mgr
+            .build_config_with_fakeip_override(&opts, true)
+            .expect("suppressed build");
+        assert!(
+            !cfg_suppressed["dns"]["servers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["tag"] == "dns-fakeip")
+        );
+        assert_eq!(
+            cfg_suppressed["experimental"]["cache_file"]["store_fakeip"],
+            json!(false)
+        );
+        core_config::check_str(&cfg_suppressed.to_string()).expect("check_str suppressed fakeip");
     }
 }
