@@ -1,6 +1,8 @@
-# Rust build artifacts
+# Rust & WiX build artifacts
 target/
 desktop-rs/target/
+desktop-rs/wix/bin/
+desktop-rs/wix/obj/
 dist/
 *.pdb
 

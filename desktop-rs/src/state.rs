@@ -62,10 +62,12 @@ pub type SubscriptionEntry = SubscriptionItem;
 pub struct CustomRule {
     pub id: String,
     #[serde(default = "default_rule_type")]
-    pub rule_type: String, // "domain" | "ip" | "cidr" | "process"
+    pub rule_type: String, // "domain" | "domain_regex" | "ip" | "cidr" | "port" | "process"
     pub value: String,
     #[serde(default = "default_rule_action")]
     pub action: String, // "vpn" | "desync" | "direct" | "block" | "NODE_<id>"
+    #[serde(default)]
+    pub time_window: String,
 }
 
 fn default_rule_type() -> String {
@@ -146,6 +148,18 @@ pub struct VpnPrefs {
     pub tcp_fast_open: bool,
     #[serde(default)]
     pub tcp_multi_path: bool,
+    #[serde(default = "default_true")]
+    pub close_to_tray: bool,
+    #[serde(default)]
+    pub minimize_to_tray: bool,
+    #[serde(default)]
+    pub ipv6_enabled: bool,
+    #[serde(default = "default_dns_transport")]
+    pub dns_transport: String, // "https" | "h3" | "quic" | "tls" | "udp"
+    #[serde(default)]
+    pub ntp_enabled: bool,
+    #[serde(default = "default_ntp_server")]
+    pub ntp_server: String,
 }
 
 fn default_mode() -> String {
@@ -196,6 +210,12 @@ fn default_dns_strategy() -> String {
 fn default_tun_stack() -> String {
     "mixed".to_string()
 }
+fn default_dns_transport() -> String {
+    "https".to_string()
+}
+fn default_ntp_server() -> String {
+    "time.cloudflare.com".to_string()
+}
 
 impl Default for VpnPrefs {
     fn default() -> Self {
@@ -234,6 +254,12 @@ impl Default for VpnPrefs {
             tun_stack: default_tun_stack(),
             tcp_fast_open: false,
             tcp_multi_path: false,
+            close_to_tray: true,
+            minimize_to_tray: false,
+            ipv6_enabled: false,
+            dns_transport: default_dns_transport(),
+            ntp_enabled: false,
+            ntp_server: default_ntp_server(),
         }
     }
 }
@@ -305,6 +331,16 @@ pub struct DesyncPrefs {
     pub anticheat_bypass: bool,
     #[serde(default = "default_true")]
     pub lists_override_game_bypass: bool,
+    #[serde(default)]
+    pub host_fake: bool,
+    #[serde(default)]
+    pub fake_payload: String,
+    #[serde(default)]
+    pub udp_fake_payload: String,
+    #[serde(default)]
+    pub udp_out_range: String,
+    #[serde(default)]
+    pub udp_keep_socket: bool,
 }
 
 fn default_desync_preset() -> String {
@@ -373,6 +409,11 @@ impl Default for DesyncPrefs {
             stun_fake: true,
             anticheat_bypass: true,
             lists_override_game_bypass: true,
+            host_fake: false,
+            fake_payload: String::new(),
+            udp_fake_payload: String::new(),
+            udp_out_range: String::new(),
+            udp_keep_socket: false,
         }
     }
 }
@@ -818,7 +859,12 @@ fn default_ap_interval() -> u64 {
 
 impl Default for AutoPingPrefs {
     fn default() -> Self {
-        Self { enabled: false, all: true, interval_s: 15, ids: Vec::new() }
+        Self {
+            enabled: false,
+            all: true,
+            interval_s: 15,
+            ids: Vec::new(),
+        }
     }
 }
 
@@ -898,7 +944,10 @@ impl PersistedState {
             {
                 srv.country = detected.clone();
                 changed = true;
-            } else if detected != "auto" && has_regional_indicator_flags(&srv.name) && cur_cc != detected {
+            } else if detected != "auto"
+                && has_regional_indicator_flags(&srv.name)
+                && cur_cc != detected
+            {
                 srv.country = detected;
                 changed = true;
             }
@@ -1053,6 +1102,7 @@ impl PersistedState {
                     "type": rtype,
                     "value": r.value.trim(),
                     "action": r.action,
+                    "timeWindow": r.time_window.trim(),
                 })
             })
             .collect();
@@ -1140,10 +1190,17 @@ impl PersistedState {
             "fakeSni": self.desync_prefs.fake_sni,
             "repeats": self.desync_prefs.repeats,
             "splitDelayMs": self.desync_prefs.split_delay_ms,
-            "udpFake": self.desync_prefs.udp_fake && self.desync_prefs.quic_fake,
+            "udpFake": self.desync_prefs.udp_fake,
+            "quicDesync": self.desync_prefs.quic_fake,
+            "quicRepeats": self.desync_prefs.quic_repeats,
             "discordUdpFake": self.desync_prefs.discord_udp_fake,
-            "udpRepeats": self.desync_prefs.quic_repeats.max(self.desync_prefs.udp_repeats),
+            "udpRepeats": self.desync_prefs.udp_repeats.max(self.desync_prefs.quic_repeats),
             "udpFakeTtl": self.desync_prefs.udp_fake_ttl,
+            "hostFake": self.desync_prefs.host_fake,
+            "fakePayload": self.desync_prefs.fake_payload.trim(),
+            "udpFakePayload": self.desync_prefs.udp_fake_payload.trim(),
+            "udpOutRange": self.desync_prefs.udp_out_range.trim(),
+            "udpKeepSocket": self.desync_prefs.udp_keep_socket,
             "autoTune": self.desync_prefs.auto_tune,
             "blockQuic": self.desync_prefs.block_quic,
             "anticheatBypass": self.desync_prefs.anticheat_bypass,
@@ -1158,6 +1215,7 @@ impl PersistedState {
             "rules": app_rules,
             "apps": self.routed_apps,
             "dns": dns_val,
+            "dnsTransport": self.vpn_prefs.dns_transport,
             "dnsBootstrap": self.vpn_prefs.dns_bootstrap,
             "fakeIp": self.vpn_prefs.fake_ip,
             "dnsRouteMode": self.vpn_prefs.dns_route_mode,
@@ -1171,6 +1229,9 @@ impl PersistedState {
             "sniff": self.vpn_prefs.sniff,
             "tcpFastOpen": self.vpn_prefs.tcp_fast_open,
             "tcpMultiPath": self.vpn_prefs.tcp_multi_path,
+            "ipv6Enabled": self.vpn_prefs.ipv6_enabled,
+            "ntpEnabled": self.vpn_prefs.ntp_enabled,
+            "ntpServer": self.vpn_prefs.ntp_server.trim(),
             "mtu": self.vpn_prefs.tun_mtu,
             "allowLan": self.vpn_prefs.allow_lan,
             "proxyTlsFragment": self.vpn_prefs.tls_fragment,
@@ -1304,8 +1365,14 @@ pub fn detect_country_code(name: &str) -> String {
             ][..],
             "de",
         ),
-        (&["испан", "spain", "мадрид", "madrid", "барселон"][..], "es"),
-        (&["итали", "italy", "милан", "milan", "рим", "rome"][..], "it"),
+        (
+            &["испан", "spain", "мадрид", "madrid", "барселон"][..],
+            "es",
+        ),
+        (
+            &["итали", "italy", "милан", "milan", "рим", "rome"][..],
+            "it",
+        ),
         (&["латви", "latvia", "рига", "riga"][..], "lv"),
         (&["литв", "lithuania", "вильнюс", "vilnius"][..], "lt"),
         (
@@ -1335,14 +1402,30 @@ pub fn detect_country_code(name: &str) -> String {
             ][..],
             "us",
         ),
-        (&["турци", "turkey", "türkiye", "стамбул", "istanbul", "анталья"][..], "tr"),
+        (
+            &[
+                "турци",
+                "turkey",
+                "türkiye",
+                "стамбул",
+                "istanbul",
+                "анталья",
+            ][..],
+            "tr",
+        ),
         (&["франц", "france", "париж", "paris", "марсель"][..], "fr"),
         (&["швеци", "sweden", "стокгольм", "stockholm"][..], "se"),
-        (&["швейцар", "switzerland", "цюрих", "zurich", "женев"][..], "ch"),
+        (
+            &["швейцар", "switzerland", "цюрих", "zurich", "женев"][..],
+            "ch",
+        ),
         (&["австри", "austria", "вена", "vienna"][..], "at"),
         (&["чехи", "czech", "прага", "prague"][..], "cz"),
         (&["беларус", "минск", "belarus", "minsk"][..], "by"),
-        (&["казахст", "алмат", "астан", "kazakhstan", "almaty"][..], "kz"),
+        (
+            &["казахст", "алмат", "астан", "kazakhstan", "almaty"][..],
+            "kz",
+        ),
         (
             &[
                 "росси",
@@ -1364,7 +1447,10 @@ pub fn detect_country_code(name: &str) -> String {
         (&["коре", "korea", "сеул", "seoul"][..], "kr"),
         (&["гонконг", "hong kong", "hongkong"][..], "hk"),
         (&["оаэ", "эмират", "дубай", "dubai", "uae"][..], "ae"),
-        (&["канад", "canada", "торонто", "toronto", "монреаль"][..], "ca"),
+        (
+            &["канад", "canada", "торонто", "toronto", "монреаль"][..],
+            "ca",
+        ),
         (&["болгар", "bulgaria", "софия", "sofia"][..], "bg"),
         (&["румын", "romania", "бухарест", "bucharest"][..], "ro"),
         (&["венгр", "hungary", "будапешт", "budapest"][..], "hu"),
@@ -1380,7 +1466,10 @@ pub fn detect_country_code(name: &str) -> String {
         (&["армени", "armenia", "ереван", "yerevan"][..], "am"),
         (&["азербайджан", "azerbaijan", "баку", "baku"][..], "az"),
         (&["узбекист", "uzbekistan", "ташкент", "tashkent"][..], "uz"),
-        (&["европ", "europe", "авто | белые списки", "автовыбор"][..], "eu"),
+        (
+            &["европ", "europe", "авто | белые списки", "автовыбор"][..],
+            "eu",
+        ),
     ] {
         if needles.iter().any(|n| lower.contains(n)) {
             return cc.to_string();
@@ -1518,13 +1607,12 @@ pub fn detect_protocol_badge(uri: &str) -> &'static str {
     }
     if let Some(rest) = trimmed.strip_prefix("tachyon-node://") {
         let b64_part = rest.split('#').next().unwrap_or(rest).trim();
-        if let Ok(bytes) = base64::Engine::decode(
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-            b64_part,
-        )
-        .or_else(|_| {
-            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64_part)
-        }) && let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes)
+        if let Ok(bytes) =
+            base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, b64_part)
+                .or_else(|_| {
+                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64_part)
+                })
+            && let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes)
             && let Some(ty) = val.get("type").and_then(|v| v.as_str())
         {
             return match ty.to_ascii_lowercase().as_str() {
@@ -1576,7 +1664,10 @@ pub fn detect_protocol_badge(uri: &str) -> &'static str {
         }
         return "NODE";
     }
-    if lower.starts_with("awg://") || lower.starts_with("amneziawg://") || lower.starts_with("vpn://") {
+    if lower.starts_with("awg://")
+        || lower.starts_with("amneziawg://")
+        || lower.starts_with("vpn://")
+    {
         "AWG"
     } else if lower.starts_with("wg://") || lower.starts_with("wireguard://") {
         "WG"
@@ -1614,7 +1705,10 @@ pub fn detect_protocol_badge(uri: &str) -> &'static str {
         "SNELL"
     } else if lower.starts_with("mtproto://") || lower.starts_with("tg://") {
         "MTPROTO"
-    } else if lower.starts_with("fptn:") || lower.starts_with("fptnb:") || lower.starts_with("fptn://") {
+    } else if lower.starts_with("fptn:")
+        || lower.starts_with("fptnb:")
+        || lower.starts_with("fptn://")
+    {
         "FPTN"
     } else if lower.starts_with("sudoku://") {
         "SUDOKU"
@@ -1630,7 +1724,10 @@ pub fn detect_protocol_badge(uri: &str) -> &'static str {
         "VMESS"
     } else if lower.starts_with("ss://") || lower.starts_with("shadowsocks://") {
         "SS"
-    } else if lower.starts_with("socks5://") || lower.starts_with("socks://") || lower.starts_with("socks5h://") {
+    } else if lower.starts_with("socks5://")
+        || lower.starts_with("socks://")
+        || lower.starts_with("socks5h://")
+    {
         "SOCKS5"
     } else if lower.starts_with("http://") || lower.starts_with("https://") {
         "HTTP"
@@ -1942,6 +2039,7 @@ fn scan_leveldb_bytes(
                             rule_type,
                             value,
                             action,
+                            time_window: String::new(),
                         });
                     }
                     if !parsed.is_empty() {

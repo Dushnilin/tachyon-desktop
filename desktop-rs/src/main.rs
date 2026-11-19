@@ -4,9 +4,9 @@ extern crate gpui_kit as gpui;
 
 mod http;
 mod icons;
-mod installer;
 mod state;
 mod theme;
+mod tray;
 mod ui;
 mod vpn;
 
@@ -82,10 +82,6 @@ fn main() {
         return;
     }
 
-    if let Some(code) = crate::installer::maybe_run_installer_or_uninstaller(&args) {
-        std::process::exit(code);
-    }
-
     if let Ok(exe) = std::env::current_exe() {
         let _ = fs::remove_file(exe.with_extension("exe.old"));
         let _ = fs::remove_file(exe.with_extension("new"));
@@ -102,6 +98,7 @@ fn main() {
     set_system_proxy(false);
 
     let event_queue: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    crate::tray::init(event_queue.clone());
     let eq_cb = event_queue.clone();
     let vpn = Arc::new(VpnManager::new(Arc::new(move |msg: String| {
         if let Ok(mut guard) = eq_cb.lock() {
@@ -123,7 +120,7 @@ fn main() {
                 }),
                 window_decorations: Some(WindowDecorations::Client),
                 app_owns_titlebar_drag: true,
-                window_min_size: Some(size(px(860.0), px(620.0))),
+                window_min_size: Some(size(px(460.0), px(500.0))),
                 app_id: Some("io.tachyon.desktop".to_string()),
                 ..Default::default()
             };

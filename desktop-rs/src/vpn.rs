@@ -59,9 +59,16 @@ pub struct DesyncOptions {
     pub repeats: u32,
     pub split_delay_ms: u32,
     pub udp_fake: bool,
+    pub quic_desync: bool,
+    pub quic_repeats: u32,
     pub discord_udp_fake: bool,
     pub udp_repeats: u32,
     pub udp_fake_ttl: u32,
+    pub host_fake: bool,
+    pub fake_payload: String,
+    pub udp_fake_payload: String,
+    pub udp_out_range: String,
+    pub udp_keep_socket: bool,
     pub auto_tune: bool,
     pub block_quic: bool,
     pub anticheat_bypass: bool,
@@ -89,9 +96,16 @@ impl Default for DesyncOptions {
             repeats: 2,
             split_delay_ms: 1,
             udp_fake: true,
+            quic_desync: true,
+            quic_repeats: 6,
             discord_udp_fake: true,
             udp_repeats: 6,
             udp_fake_ttl: 6,
+            host_fake: false,
+            fake_payload: String::new(),
+            udp_fake_payload: String::new(),
+            udp_out_range: String::new(),
+            udp_keep_socket: false,
             auto_tune: true,
             block_quic: true,
             anticheat_bypass: true,
@@ -111,6 +125,7 @@ pub struct CustomRouteRule {
     pub rtype: String,
     pub value: String,
     pub action: String,
+    pub time_window: String,
 }
 
 #[derive(Debug, Clone)]
@@ -369,6 +384,12 @@ pub struct ConnectOptions {
     pub tun_stack: String,
     pub strict_route: bool,
     pub sniff: bool,
+    pub tcp_fast_open: bool,
+    pub tcp_multi_path: bool,
+    pub ipv6_enabled: bool,
+    pub dns_transport: String,
+    pub ntp_enabled: bool,
+    pub ntp_server: String,
 }
 
 impl ConnectOptions {
@@ -407,6 +428,12 @@ impl ConnectOptions {
                 tun_stack: "mixed".to_string(),
                 strict_route: true,
                 sniff: true,
+                tcp_fast_open: false,
+                tcp_multi_path: false,
+                ipv6_enabled: false,
+                dns_transport: "https".to_string(),
+                ntp_enabled: false,
+                ntp_server: "time.cloudflare.com".to_string(),
             });
         }
 
@@ -512,11 +539,7 @@ impl ConnectOptions {
         let mut extra_nodes = Vec::new();
         if let Some(arr) = root.get("extraNodes").and_then(Value::as_array) {
             for item in arr {
-                let tag = item
-                    .get("tag")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim();
+                let tag = item.get("tag").and_then(Value::as_str).unwrap_or("").trim();
                 let ev = item
                     .get("vless")
                     .and_then(Value::as_str)
@@ -595,6 +618,12 @@ impl ConnectOptions {
             if let Some(v) = d.get("udpFake").and_then(Value::as_bool) {
                 desync.udp_fake = v;
             }
+            if let Some(v) = d.get("quicDesync").and_then(Value::as_bool) {
+                desync.quic_desync = v;
+            }
+            if let Some(v) = d.get("quicRepeats").and_then(Value::as_u64) {
+                desync.quic_repeats = (v as u32).min(50);
+            }
             if let Some(v) = d.get("discordUdpFake").and_then(Value::as_bool) {
                 desync.discord_udp_fake = v;
             }
@@ -603,6 +632,21 @@ impl ConnectOptions {
             }
             if let Some(v) = d.get("udpFakeTtl").and_then(Value::as_u64) {
                 desync.udp_fake_ttl = (v as u32).clamp(1, 128);
+            }
+            if let Some(v) = d.get("hostFake").and_then(Value::as_bool) {
+                desync.host_fake = v;
+            }
+            if let Some(v) = d.get("fakePayload").and_then(Value::as_str) {
+                desync.fake_payload = v.trim().to_string();
+            }
+            if let Some(v) = d.get("udpFakePayload").and_then(Value::as_str) {
+                desync.udp_fake_payload = v.trim().to_string();
+            }
+            if let Some(v) = d.get("udpOutRange").and_then(Value::as_str) {
+                desync.udp_out_range = v.trim().to_string();
+            }
+            if let Some(v) = d.get("udpKeepSocket").and_then(Value::as_bool) {
+                desync.udp_keep_socket = v;
             }
             if let Some(v) = d.get("autoTune").and_then(Value::as_bool) {
                 desync.auto_tune = v;
@@ -613,10 +657,7 @@ impl ConnectOptions {
             if let Some(v) = d.get("anticheatBypass").and_then(Value::as_bool) {
                 desync.anticheat_bypass = v;
             }
-            if let Some(v) = d
-                .get("listsOverrideGameBypass")
-                .and_then(Value::as_bool)
-            {
+            if let Some(v) = d.get("listsOverrideGameBypass").and_then(Value::as_bool) {
                 desync.lists_override_game_bypass = v;
             }
         }
@@ -661,18 +702,35 @@ impl ConnectOptions {
             if let Some(p) = b.get("pool").and_then(Value::as_u64) {
                 balancer.pool = (p as u32).clamp(1, 32);
             }
-            if let Some(pt) = b.get("poolTolerance").or_else(|| b.get("pool_tolerance")).and_then(Value::as_u64) {
+            if let Some(pt) = b
+                .get("poolTolerance")
+                .or_else(|| b.get("pool_tolerance"))
+                .and_then(Value::as_u64)
+            {
                 balancer.pool_tolerance = (pt as u32).clamp(10, 2000);
             }
-            if let Some(q) = b.get("quotaMib").or_else(|| b.get("quota_mib")).and_then(Value::as_u64) {
+            if let Some(q) = b
+                .get("quotaMib")
+                .or_else(|| b.get("quota_mib"))
+                .and_then(Value::as_u64)
+            {
                 balancer.quota_mib = (q as u32).clamp(1, 1_048_576);
             }
-            if let Some(arr) = b.get("stickyHash").or_else(|| b.get("sticky_hash")).and_then(Value::as_array) {
+            if let Some(arr) = b
+                .get("stickyHash")
+                .or_else(|| b.get("sticky_hash"))
+                .and_then(Value::as_array)
+            {
                 let parsed: Vec<String> = arr
                     .iter()
                     .filter_map(Value::as_str)
                     .map(|s| s.trim().to_ascii_lowercase())
-                    .filter(|s| matches!(s.as_str(), "source_ip" | "domain" | "dest_ip" | "dest_port" | "process"))
+                    .filter(|s| {
+                        matches!(
+                            s.as_str(),
+                            "source_ip" | "domain" | "dest_ip" | "dest_port" | "process"
+                        )
+                    })
                     .collect();
                 if !parsed.is_empty() {
                     balancer.sticky_hash = parsed;
@@ -730,11 +788,19 @@ impl ConnectOptions {
                 } else {
                     act_raw.to_ascii_lowercase()
                 };
+                let time_window = item
+                    .get("timeWindow")
+                    .or_else(|| item.get("time_window"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
                 if !value.is_empty() && action != "off" && action != "none" {
                     custom_rules.push(CustomRouteRule {
                         rtype,
                         value,
                         action,
+                        time_window,
                     });
                 }
             }
@@ -744,7 +810,12 @@ impl ConnectOptions {
             .get("dnsStrategy")
             .and_then(Value::as_str)
             .map(str::trim)
-            .filter(|s| matches!(*s, "prefer_ipv4" | "prefer_ipv6" | "ipv4_only" | "ipv6_only"))
+            .filter(|s| {
+                matches!(
+                    *s,
+                    "prefer_ipv4" | "prefer_ipv6" | "ipv4_only" | "ipv6_only"
+                )
+            })
             .unwrap_or("prefer_ipv4")
             .to_string();
         let dns_reverse_mapping = root
@@ -774,13 +845,38 @@ impl ConnectOptions {
             .get("strictRoute")
             .and_then(Value::as_bool)
             .unwrap_or(true);
-        let sniff = root
-            .get("sniff")
+        let sniff = root.get("sniff").and_then(Value::as_bool).unwrap_or(true);
+        let tcp_fast_open = root
+            .get("tcpFastOpen")
             .and_then(Value::as_bool)
-            .unwrap_or(true);
+            .unwrap_or(false);
+        let tcp_multi_path = root
+            .get("tcpMultiPath")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let ipv6_enabled = root
+            .get("ipv6Enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let dns_transport = root
+            .get("dnsTransport")
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| matches!(s.as_str(), "https" | "h3" | "quic" | "tls" | "udp"))
+            .unwrap_or_else(|| "https".to_string());
+        let ntp_enabled = root
+            .get("ntpEnabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let ntp_server = root
+            .get("ntpServer")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("time.cloudflare.com")
+            .to_string();
 
-        let allow_without_node =
-            block_only || route == RouteMode::DesyncOnly || desync.enabled;
+        let allow_without_node = block_only || route == RouteMode::DesyncOnly || desync.enabled;
         if !allow_without_node && vless.is_empty() {
             return Err("Не выбран сервер для подключения".to_string());
         }
@@ -813,6 +909,12 @@ impl ConnectOptions {
             tun_stack,
             strict_route,
             sniff,
+            tcp_fast_open,
+            tcp_multi_path,
+            ipv6_enabled,
+            dns_transport,
+            ntp_enabled,
+            ntp_server,
         })
     }
 }
@@ -1033,10 +1135,7 @@ impl VpnManager {
         ];
         for url in &urls {
             if let Ok(resp) = fetch_url(url, "GET", &[], None, None, Duration::from_secs(8)).await {
-                if resp.status == 200
-                    && resp.body.len() > 96
-                    && &resp.body[0..4] == b"TSRS"
-                {
+                if resp.status == 200 && resp.body.len() > 96 && &resp.body[0..4] == b"TSRS" {
                     let tmp = path.with_extension("trs.tmp");
                     if fs::write(&tmp, &resp.body).is_ok() {
                         let _ = fs::rename(&tmp, &path);
@@ -1097,7 +1196,10 @@ impl VpnManager {
             for entry in entries.flatten() {
                 let fname = entry.file_name().to_string_lossy().into_owned();
                 if let Some(rest) = fname.strip_prefix("community-") {
-                    if let Some(stem) = rest.strip_suffix(".trs").or_else(|| rest.strip_suffix(".srs")) {
+                    if let Some(stem) = rest
+                        .strip_suffix(".trs")
+                        .or_else(|| rest.strip_suffix(".srs"))
+                    {
                         let can = canonical_ruleset_name(stem);
                         if !can.is_empty() {
                             target.insert(can);
@@ -1192,8 +1294,8 @@ impl VpnManager {
             "badseq_badack_badsum" | "combo" | "badsum_combo" | "badseq,badsum" => {
                 "badseq_badack_badsum"
             }
-            "md5_badack" | "tcp_md5_badack" | "md5+badack" | "md5sig_badack"
-            | "md5sig+badack" | "md5sig,badack" => "md5_badack",
+            "md5_badack" | "tcp_md5_badack" | "md5+badack" | "md5sig_badack" | "md5sig+badack"
+            | "md5sig,badack" => "md5_badack",
             "datanoack" | "data_no_ack" | "noack" => "datanoack",
             _ => "md5",
         };
@@ -1235,6 +1337,18 @@ impl VpnManager {
             parse_single_split_pos(sp_raw)
         };
 
+        let snis: Vec<String> = d
+            .fake_sni
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        let primary_sni = snis
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "www.google.com".to_string());
+
         let is_auto_preset = mapped_preset == "auto";
         let mut obj = json!({
             "type": "desync",
@@ -1244,14 +1358,50 @@ impl VpnManager {
             "fooling": valid_fooling,
             "split_pos": split_pos_val,
             "tlsrec_first": if mapped_preset == "multi_disorder" || is_auto_preset { true } else { d.tlsrec_first },
-            "fake_sni": if d.fake_sni.trim().is_empty() { "www.google.com" } else { d.fake_sni.trim() },
+            "fake_sni": primary_sni,
             "repeats": d.repeats.clamp(1, 100),
             "split_delay_ms": d.split_delay_ms.clamp(0, 1000),
             "auto_tune": if is_auto_preset { true } else { d.auto_tune },
             "udp_fake": d.udp_fake,
+            "quic_desync": d.quic_desync,
             "udp_repeats": d.udp_repeats.clamp(1, 50),
             "udp_fake_ttl": d.udp_fake_ttl.clamp(1, 128),
         });
+        if snis.len() > 1 {
+            obj["sni_pool"] = json!(snis);
+        }
+        if d.quic_repeats > 0 {
+            obj["quic_repeats"] = json!(d.quic_repeats.clamp(1, 50));
+        }
+        if d.host_fake {
+            obj["host_fake"] = json!(true);
+        }
+        let fp = d.fake_payload.trim();
+        if !fp.is_empty() {
+            let valid_fp =
+                if let Some(hex_s) = fp.strip_prefix("0x").or_else(|| fp.strip_prefix("0X")) {
+                    !hex_s.is_empty()
+                        && hex_s.len().is_multiple_of(2)
+                        && hex_s.bytes().all(|b| b.is_ascii_hexdigit())
+                } else {
+                    true
+                };
+            if valid_fp {
+                obj["fake_payload"] = json!(fp);
+            }
+        }
+        let ufp = d.udp_fake_payload.trim();
+        if !ufp.is_empty() && core_config::desync::parse_udp_fake_payload_hex(&json!(ufp)).is_ok() {
+            obj["udp_fake_payload"] = json!(ufp);
+        }
+        let uor = d.udp_out_range.trim();
+        if !uor.is_empty() && core_config::desync::UdpOutRange::from_json_value(&json!(uor)).is_ok()
+        {
+            obj["udp_out_range"] = json!(uor);
+        }
+        if d.udp_keep_socket {
+            obj["udp_keep_socket"] = json!(true);
+        }
         // Omit `fake_ttl` when running in `auto` mode with the default TTL=6 so `tachyon-core`
         // keeps `explicit_fake_ttl = false` and uses dynamic SYN+ACK hop-distance estimation.
         if !is_auto_preset || d.fake_ttl != 6 || valid_fooling == "autottl" {
@@ -1324,6 +1474,34 @@ impl VpnManager {
                 }
             }
             return Ok((true, ep, server_host));
+        }
+
+        if matches!(ntype.as_str(), "tailscale" | "openvpn" | "openvpn-client") {
+            if server_host.is_none() {
+                server_host = node
+                    .pointer("/servers/0/server")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        node.get("control_url")
+                            .and_then(Value::as_str)
+                            .and_then(|u| u.split("://").nth(1))
+                            .and_then(|rest| rest.split('/').next())
+                            .map(|hp| hp.split(':').next().unwrap_or("").trim().to_string())
+                            .filter(|s| !s.is_empty())
+                    });
+            }
+            if let Some(obj) = node.as_object_mut() {
+                if ntype == "openvpn" {
+                    obj.insert("type".to_string(), json!("openvpn-client"));
+                }
+                obj.insert("tag".to_string(), json!(tag));
+                if let Some(dt) = detour_tag {
+                    obj.insert("detour".to_string(), json!(dt));
+                }
+            }
+            return Ok((true, node, server_host));
         }
 
         if let Some(obj) = node.as_object_mut() {
@@ -1479,8 +1657,7 @@ impl VpnManager {
             return Ok((ep_list, final_obs, hosts));
         }
 
-        let (is_ep, val, host) =
-            Self::prepare_parsed_node(trimmed, tag, tls_fragment, detour_tag)?;
+        let (is_ep, val, host) = Self::prepare_parsed_node(trimmed, tag, tls_fragment, detour_tag)?;
         let mut ep_list = Vec::new();
         let mut ob_list = Vec::new();
         let mut hosts = Vec::new();
@@ -1493,6 +1670,94 @@ impl VpnManager {
             ob_list.push(val);
         }
         Ok((ep_list, ob_list, hosts))
+    }
+
+    fn build_remote_dns_server(dns_raw: &str, transport: &str, dns_detour: &str) -> Value {
+        let make = |ty: &str, server: &str, port: Option<u16>, path: Option<&str>, detour: &str| {
+            let t = ty.trim().to_ascii_lowercase();
+            match t.as_str() {
+                "h3" | "https" => json!({
+                    "type": t,
+                    "tag": "dns_remote",
+                    "server": server,
+                    "server_port": port.unwrap_or(443),
+                    "path": path.unwrap_or("/dns-query"),
+                    "detour": detour
+                }),
+                "quic" | "tls" => json!({
+                    "type": t,
+                    "tag": "dns_remote",
+                    "server": server,
+                    "server_port": port.unwrap_or(853),
+                    "detour": detour
+                }),
+                _ => json!({
+                    "type": "udp",
+                    "tag": "dns_remote",
+                    "server": server,
+                    "server_port": port.unwrap_or(53),
+                    "detour": detour
+                }),
+            }
+        };
+
+        let trimmed = dns_raw.trim();
+        if let Some((scheme, rest)) = trimmed.split_once("://") {
+            let low_scheme = scheme.trim().to_ascii_lowercase();
+            if matches!(low_scheme.as_str(), "https" | "h3" | "quic" | "tls" | "udp") {
+                let (authority, path_opt) = if let Some(idx) = rest.find('/') {
+                    let p = &rest[idx..];
+                    (&rest[..idx], if p.is_empty() { None } else { Some(p) })
+                } else {
+                    (rest, None)
+                };
+                let (host, port_opt) = if let Some(v6_tail) = authority.strip_prefix('[') {
+                    if let Some((h, tail)) = v6_tail.split_once(']') {
+                        let p = tail.strip_prefix(':').and_then(|s| s.parse::<u16>().ok());
+                        (h.trim(), p)
+                    } else {
+                        (authority.trim(), None)
+                    }
+                } else if let Some((h, p_str)) = authority.rsplit_once(':') {
+                    if let Ok(p) = p_str.parse::<u16>() {
+                        (h.trim(), Some(p))
+                    } else {
+                        (authority.trim(), None)
+                    }
+                } else {
+                    (authority.trim(), None)
+                };
+                if !host.is_empty() {
+                    return make(&low_scheme, host, port_opt, path_opt, dns_detour);
+                }
+            }
+        }
+
+        let norm_tr = match transport.trim().to_ascii_lowercase().as_str() {
+            "h3" | "quic" | "tls" | "udp" => transport.trim().to_ascii_lowercase(),
+            _ => "https".to_string(),
+        };
+        let lower = trimmed.to_ascii_lowercase();
+        match lower.as_str() {
+            "adguard" => make(&norm_tr, "94.140.14.14", None, None, dns_detour),
+            "quad9" | "9.9.9.9" => make(&norm_tr, "9.9.9.9", None, None, dns_detour),
+            "google" | "8.8.8.8" => make(&norm_tr, "8.8.8.8", None, None, dns_detour),
+            "yandex" | "77.88.8.8" => json!({
+                "type": "udp",
+                "tag": "dns_remote",
+                "server": "77.88.8.8",
+                "server_port": 53,
+                "detour": "direct"
+            }),
+            _ if trimmed.parse::<IpAddr>().is_ok() => json!({
+                "type": "udp",
+                "tag": "dns_remote",
+                "server": trimmed,
+                "server_port": 53,
+                "detour": dns_detour
+            }),
+            _ => make(&norm_tr, "1.1.1.1", None, None, dns_detour),
+        }
     }
 
     pub fn build_config(&self, opts: &ConnectOptions) -> Result<(Value, bool), String> {
@@ -1584,64 +1849,20 @@ impl VpnManager {
         } else {
             "direct"
         };
-        let dns_choice = opts.dns.trim().to_ascii_lowercase();
-        let remote_dns = match dns_choice.as_str() {
-            "adguard" => json!({
-                "type": "https",
-                "tag": "dns_remote",
-                "server": "94.140.14.14",
-                "server_port": 443,
-                "path": "/dns-query",
-                "detour": dns_detour
-            }),
-            "quad9" | "9.9.9.9" => json!({
-                "type": "https",
-                "tag": "dns_remote",
-                "server": "9.9.9.9",
-                "server_port": 443,
-                "path": "/dns-query",
-                "detour": dns_detour
-            }),
-            "google" | "8.8.8.8" => json!({
-                "type": "https",
-                "tag": "dns_remote",
-                "server": "8.8.8.8",
-                "server_port": 443,
-                "path": "/dns-query",
-                "detour": dns_detour
-            }),
-            "yandex" | "77.88.8.8" => json!({
-                "type": "udp",
-                "tag": "dns_remote",
-                "server": "77.88.8.8",
-                "server_port": 53,
-                "detour": "direct"
-            }),
-            _ if dns_choice.parse::<IpAddr>().is_ok() => json!({
-                "type": "udp",
-                "tag": "dns_remote",
-                "server": dns_choice,
-                "server_port": 53,
-                "detour": dns_detour
-            }),
-            _ => json!({
-                "type": "https",
-                "tag": "dns_remote",
-                "server": "1.1.1.1",
-                "server_port": 443,
-                "path": "/dns-query",
-                "detour": dns_detour
-            }),
-        };
+        let remote_dns = Self::build_remote_dns_server(&opts.dns, &opts.dns_transport, dns_detour);
         dns_servers.push(remote_dns);
 
         let fake_ip_enabled = opts.fake_ip && !opts.proxy_mode;
         if fake_ip_enabled {
-            dns_servers.push(json!({
+            let mut fip = json!({
                 "type": "fakeip",
                 "tag": "dns-fakeip",
                 "inet4_range": "198.18.0.0/15"
-            }));
+            });
+            if opts.ipv6_enabled {
+                fip["inet6_range"] = json!("fc00::/18");
+            }
+            dns_servers.push(fip);
         }
 
         let mut dns_rules = vec![json!({
@@ -1685,11 +1906,16 @@ impl VpnManager {
 
         let mut inbounds = Vec::new();
         if !opts.proxy_mode {
+            let tun_addrs = if opts.ipv6_enabled {
+                json!(["172.19.0.1/30", "fdfe:dcba:9876::1/126"])
+            } else {
+                json!(["172.19.0.1/30"])
+            };
             inbounds.push(json!({
                 "type": "tun",
                 "tag": "tun-in",
                 "interface_name": default_tun_device(),
-                "address": ["172.19.0.1/30"],
+                "address": tun_addrs,
                 "mtu": opts.mtu.clamp(1280, 9000),
                 "auto_route": true,
                 "strict_route": opts.strict_route,
@@ -1804,14 +2030,52 @@ impl VpnManager {
             "tag": "block"
         }));
 
-        let mut rules = vec![
-            json!({ "action": "sniff" }),
+        if opts.tcp_fast_open || opts.tcp_multi_path {
+            for ob in &mut outbounds {
+                if let Some(obj) = ob.as_object_mut() {
+                    let ty = obj
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    let tcp_dial = matches!(
+                        ty.as_str(),
+                        "direct"
+                            | "desync"
+                            | "vless"
+                            | "vmess"
+                            | "trojan"
+                            | "shadowsocks"
+                            | "socks"
+                            | "http"
+                            | "ssh"
+                            | "shadowtls"
+                            | "naive"
+                            | "trusttunnel"
+                    );
+                    if tcp_dial {
+                        if opts.tcp_fast_open {
+                            obj.insert("tcp_fast_open".to_string(), json!(true));
+                        }
+                        if opts.tcp_multi_path {
+                            obj.insert("tcp_multi_path".to_string(), json!(true));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut rules = Vec::new();
+        if opts.sniff {
+            rules.push(json!({ "action": "sniff" }));
+        }
+        rules.extend([
             json!({ "protocol": "dns", "action": "hijack-dns" }),
             json!({ "process_name": ["tachyon", "tachyon-desktop", "tachyon-core", "tachyon-core.exe", "Tachyon.exe", "tachyon.exe"], "outbound": "direct" }),
             json!({ "network": "udp", "port": [135, 137, 138, 139, 445, 1900, 3702, 5353, 5355], "action": "reject" }),
             json!({ "ip_is_private": true, "outbound": "direct" }),
             json!({ "ip_cidr": [format!("{bootstrap_ip}/32")], "outbound": "direct" }),
-        ];
+        ]);
 
         let mut server_ips = Vec::new();
         let mut server_domains = Vec::new();
@@ -1977,13 +2241,16 @@ impl VpnManager {
             match opts.route {
                 RouteMode::Apps | RouteMode::Selective => {
                     if !app_procs.is_empty() {
-                        rules.push(json!({ "process_name": app_procs, "outbound": vpn_target_tag }));
+                        rules
+                            .push(json!({ "process_name": app_procs, "outbound": vpn_target_tag }));
                     }
                     direct_or_desync
                 }
                 RouteMode::AppsExclude => {
                     if !app_procs.is_empty() {
-                        rules.push(json!({ "process_name": app_procs, "outbound": direct_or_desync }));
+                        rules.push(
+                            json!({ "process_name": app_procs, "outbound": direct_or_desync }),
+                        );
                     }
                     vpn_target_tag
                 }
@@ -2050,8 +2317,111 @@ impl VpnManager {
         if !endpoints.is_empty() {
             root["endpoints"] = Value::Array(endpoints);
         }
+        if opts.ntp_enabled {
+            let ntp_srv = {
+                let s = opts.ntp_server.trim();
+                if s.is_empty() {
+                    "time.cloudflare.com"
+                } else {
+                    s
+                }
+            };
+            root["ntp"] = json!({
+                "enabled": true,
+                "server": ntp_srv,
+                "server_port": 123,
+                "interval": "30m",
+                "write_to_system": false
+            });
+        }
 
         Ok((root, main_parsed.is_some()))
+    }
+
+    fn is_valid_time_window(raw: &str) -> bool {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+        let (days_tok, range_tok, tz_tok) = match tokens.as_slice() {
+            [r] => (None, *r, None),
+            [a, b] => {
+                if a.contains(':') && a.contains('-') {
+                    (None, *a, Some(*b))
+                } else {
+                    (Some(*a), *b, None)
+                }
+            }
+            [d, r, tz] => (Some(*d), *r, Some(*tz)),
+            _ => return false,
+        };
+        let valid_day = |s: &str| -> bool {
+            matches!(
+                s.trim().to_ascii_lowercase().as_str(),
+                "mon"
+                    | "monday"
+                    | "1"
+                    | "пн"
+                    | "tue"
+                    | "tues"
+                    | "tuesday"
+                    | "2"
+                    | "вт"
+                    | "wed"
+                    | "wednesday"
+                    | "3"
+                    | "ср"
+                    | "thu"
+                    | "thur"
+                    | "thurs"
+                    | "thursday"
+                    | "4"
+                    | "чт"
+                    | "fri"
+                    | "friday"
+                    | "5"
+                    | "пт"
+                    | "sat"
+                    | "saturday"
+                    | "6"
+                    | "сб"
+                    | "sun"
+                    | "sunday"
+                    | "7"
+                    | "вс"
+                    | "weekdays"
+                    | "weekend"
+            )
+        };
+        if let Some(d) = days_tok {
+            for part in d.split(',') {
+                for seg in part.split('-') {
+                    if !valid_day(seg) {
+                        return false;
+                    }
+                }
+            }
+        }
+        let Some((s_t, e_t)) = range_tok.split_once('-') else {
+            return false;
+        };
+        let valid_hm = |hm: &str| -> bool {
+            let Some((hh, mm)) = hm.split_once(':') else {
+                return false;
+            };
+            matches!((hh.parse::<u8>(), mm.parse::<u8>()), (Ok(h), Ok(m)) if h <= 23 && m <= 59)
+        };
+        if !valid_hm(s_t) || !valid_hm(e_t) {
+            return false;
+        }
+        if let Some(tz) = tz_tok {
+            let low = tz.to_ascii_lowercase();
+            if low != "utc" && low != "local" && !low.starts_with('+') && !low.starts_with('-') {
+                return false;
+            }
+        }
+        true
     }
 
     fn append_custom_and_community_rules(
@@ -2088,25 +2458,134 @@ impl VpnManager {
 
             let mut dom_suffixes = Vec::new();
             let mut dom_keywords = Vec::new();
+            let mut dom_regexes = Vec::new();
             let mut ip_cidrs = Vec::new();
             let mut procs = Vec::new();
+            let mut proc_paths = Vec::new();
+            let mut ports: Vec<u16> = Vec::new();
+            let mut port_ranges: Vec<String> = Vec::new();
+
+            let emit_matcher =
+                |mut matcher: Map<String, Value>, tw: Option<&str>, rules_out: &mut Vec<Value>| {
+                    if let Some(window_str) = tw {
+                        matcher.insert("time_window".to_string(), json!(window_str));
+                    }
+                    if group == "block" {
+                        matcher.insert("action".to_string(), json!("reject"));
+                        rules_out.push(Value::Object(matcher));
+                    } else if group == "direct" {
+                        matcher.insert("outbound".to_string(), json!("direct"));
+                        rules_out.push(Value::Object(matcher));
+                    } else if group == "desync" {
+                        if opts.desync.block_quic {
+                            let mut q = matcher.clone();
+                            q.insert("network".to_string(), json!("udp"));
+                            q.insert("port".to_string(), json!(443));
+                            q.insert("action".to_string(), json!("reject"));
+                            rules_out.push(Value::Object(q));
+                        }
+                        matcher.insert("outbound".to_string(), json!("DESYNC"));
+                        rules_out.push(Value::Object(matcher));
+                    } else if valid_extra_tags.contains(group) {
+                        matcher.insert("outbound".to_string(), json!(group));
+                        rules_out.push(Value::Object(matcher));
+                    } else {
+                        matcher.insert("outbound".to_string(), json!(vpn_target_tag));
+                        rules_out.push(Value::Object(matcher));
+                    }
+                };
+
+            let mut windowed: Vec<(String, Map<String, Value>)> = Vec::new();
 
             for cr in matching {
                 let val = cr.value.trim();
                 if val.is_empty() {
                     continue;
                 }
-                if cr.rtype == "process" || val.to_ascii_lowercase().ends_with(".exe") {
-                    procs.push(val.to_string());
-                } else if cr.rtype == "ip" || ip_re.is_match(val) {
-                    if val.contains('/') {
-                        ip_cidrs.push(val.to_string());
+                let tw = {
+                    let t = cr.time_window.trim();
+                    if !t.is_empty() && Self::is_valid_time_window(t) {
+                        Some(t.to_string())
                     } else {
-                        ip_cidrs.push(format!("{val}/32"));
+                        None
+                    }
+                };
+
+                if cr.rtype == "process_path"
+                    || (cr.rtype == "process" && (val.contains('/') || val.contains('\\')))
+                {
+                    if let Some(w) = tw {
+                        let mut m = Map::new();
+                        m.insert("process_path".to_string(), json!([val]));
+                        windowed.push((w, m));
+                    } else {
+                        proc_paths.push(val.to_string());
+                    }
+                } else if cr.rtype == "process" || val.to_ascii_lowercase().ends_with(".exe") {
+                    if let Some(w) = tw {
+                        let mut m = Map::new();
+                        m.insert("process_name".to_string(), json!([val]));
+                        windowed.push((w, m));
+                    } else {
+                        procs.push(val.to_string());
+                    }
+                } else if cr.rtype == "domain_regex" {
+                    if Regex::new(val).is_ok() {
+                        if let Some(w) = tw {
+                            let mut m = Map::new();
+                            m.insert("domain_regex".to_string(), json!([val]));
+                            windowed.push((w, m));
+                        } else {
+                            dom_regexes.push(val.to_string());
+                        }
+                    }
+                } else if cr.rtype == "port" || cr.rtype == "port_range" {
+                    let norm = val.replace('-', ":");
+                    if let Some((a, b)) = norm.split_once(':') {
+                        if a.trim().parse::<u16>().is_ok() && b.trim().parse::<u16>().is_ok() {
+                            let pr = format!("{}:{}", a.trim(), b.trim());
+                            if let Some(w) = tw {
+                                let mut m = Map::new();
+                                m.insert("port_range".to_string(), json!([pr]));
+                                windowed.push((w, m));
+                            } else {
+                                port_ranges.push(pr);
+                            }
+                        }
+                    } else if let Ok(p) = val.parse::<u16>()
+                        && p > 0
+                    {
+                        if let Some(w) = tw {
+                            let mut m = Map::new();
+                            m.insert("port".to_string(), json!([p]));
+                            windowed.push((w, m));
+                        } else {
+                            ports.push(p);
+                        }
+                    }
+                } else if cr.rtype == "ip" || ip_re.is_match(val) {
+                    let cidr = if val.contains('/') {
+                        val.to_string()
+                    } else {
+                        format!("{val}/32")
+                    };
+                    if let Some(w) = tw {
+                        let mut m = Map::new();
+                        m.insert("ip_cidr".to_string(), json!([cidr]));
+                        windowed.push((w, m));
+                    } else {
+                        ip_cidrs.push(cidr);
                     }
                 } else if let Some(kw) = val.strip_prefix("keyword:") {
-                    if !kw.trim().is_empty() {
-                        dom_keywords.push(kw.trim().to_string());
+                    let kwt = kw.trim();
+                    if !kwt.is_empty() {
+                        if let Some(w) = tw {
+                            let mut m = Map::new();
+                            m.insert("domain_keyword".to_string(), json!([kwt]));
+                            windowed.push((w, m));
+                        } else {
+                            dom_keywords.push(kwt.to_string());
+                        }
                     }
                 } else {
                     let clean = val
@@ -2119,56 +2598,59 @@ impl VpnManager {
                         .trim()
                         .trim_start_matches('.');
                     if !clean.is_empty() {
-                        dom_suffixes.push(clean.to_string());
+                        if let Some(w) = tw {
+                            let mut m = Map::new();
+                            m.insert("domain_suffix".to_string(), json!([clean]));
+                            windowed.push((w, m));
+                        } else {
+                            dom_suffixes.push(clean.to_string());
+                        }
                     }
                 }
             }
-
-            let emit_matcher = |mut matcher: Map<String, Value>, rules_out: &mut Vec<Value>| {
-                if group == "block" {
-                    matcher.insert("action".to_string(), json!("reject"));
-                    rules_out.push(Value::Object(matcher));
-                } else if group == "direct" {
-                    matcher.insert("outbound".to_string(), json!("direct"));
-                    rules_out.push(Value::Object(matcher));
-                } else if group == "desync" {
-                    if opts.desync.block_quic {
-                        let mut q = matcher.clone();
-                        q.insert("network".to_string(), json!("udp"));
-                        q.insert("port".to_string(), json!(443));
-                        q.insert("action".to_string(), json!("reject"));
-                        rules_out.push(Value::Object(q));
-                    }
-                    matcher.insert("outbound".to_string(), json!("DESYNC"));
-                    rules_out.push(Value::Object(matcher));
-                } else if valid_extra_tags.contains(group) {
-                    matcher.insert("outbound".to_string(), json!(group));
-                    rules_out.push(Value::Object(matcher));
-                } else {
-                    matcher.insert("outbound".to_string(), json!(vpn_target_tag));
-                    rules_out.push(Value::Object(matcher));
-                }
-            };
 
             if !dom_suffixes.is_empty() {
                 let mut m = Map::new();
                 m.insert("domain_suffix".to_string(), json!(dom_suffixes));
-                emit_matcher(m, rules_list);
+                emit_matcher(m, None, rules_list);
             }
             if !dom_keywords.is_empty() {
                 let mut m = Map::new();
                 m.insert("domain_keyword".to_string(), json!(dom_keywords));
-                emit_matcher(m, rules_list);
+                emit_matcher(m, None, rules_list);
+            }
+            if !dom_regexes.is_empty() {
+                let mut m = Map::new();
+                m.insert("domain_regex".to_string(), json!(dom_regexes));
+                emit_matcher(m, None, rules_list);
             }
             if !ip_cidrs.is_empty() {
                 let mut m = Map::new();
                 m.insert("ip_cidr".to_string(), json!(ip_cidrs));
-                emit_matcher(m, rules_list);
+                emit_matcher(m, None, rules_list);
             }
             if !procs.is_empty() {
                 let mut m = Map::new();
                 m.insert("process_name".to_string(), json!(procs));
-                emit_matcher(m, rules_list);
+                emit_matcher(m, None, rules_list);
+            }
+            if !proc_paths.is_empty() {
+                let mut m = Map::new();
+                m.insert("process_path".to_string(), json!(proc_paths));
+                emit_matcher(m, None, rules_list);
+            }
+            if !ports.is_empty() {
+                let mut m = Map::new();
+                m.insert("port".to_string(), json!(ports));
+                emit_matcher(m, None, rules_list);
+            }
+            if !port_ranges.is_empty() {
+                let mut m = Map::new();
+                m.insert("port_range".to_string(), json!(port_ranges));
+                emit_matcher(m, None, rules_list);
+            }
+            for (tw, m) in windowed {
+                emit_matcher(m, Some(&tw), rules_list);
             }
         }
 
@@ -2378,7 +2860,9 @@ impl VpnManager {
                     let err_str = format!("{err:#}");
                     let need_elevation = !opts.proxy_mode
                         && (err_str.to_ascii_lowercase().contains("permission")
-                            || err_str.to_ascii_lowercase().contains("operation not permitted")
+                            || err_str
+                                .to_ascii_lowercase()
+                                .contains("operation not permitted")
                             || err_str.to_ascii_lowercase().contains("access is denied")
                             || err_str.to_ascii_lowercase().contains("eperm")
                             || err_str.to_ascii_lowercase().contains("eacces")
@@ -2537,7 +3021,8 @@ impl VpnManager {
                             "totalUp": up_total
                         });
                         if let Ok((200, pbody)) =
-                            clash_api_request(API_PORT, &secret, "GET", "/proxies/PROXY", None).await
+                            clash_api_request(API_PORT, &secret, "GET", "/proxies/PROXY", None)
+                                .await
                         {
                             if let Ok(pdoc) = serde_json::from_str::<Value>(&pbody) {
                                 if pdoc.get("type").and_then(Value::as_str) == Some("URLTest")
@@ -2555,8 +3040,7 @@ impl VpnManager {
                                         .to_string();
                                     let telemetry =
                                         pdoc.get("telemetry").cloned().unwrap_or_else(|| json!({}));
-                                    let all =
-                                        pdoc.get("all").cloned().unwrap_or_else(|| json!([]));
+                                    let all = pdoc.get("all").cloned().unwrap_or_else(|| json!([]));
                                     if let Some(active_rtt) = telemetry
                                         .get(&now_tag)
                                         .and_then(|t| t.get("rtt_ms"))
@@ -2793,7 +3277,11 @@ impl VpnManager {
             if let Some(val) = decode_inline_node_uri(resolved) {
                 let raw_tag = custom_handle_opt
                     .as_deref()
-                    .or_else(|| val.get("tag").and_then(Value::as_str).filter(|s| !s.is_empty()))
+                    .or_else(|| {
+                        val.get("tag")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                    })
                     .unwrap_or("Сервер");
                 let country = detect_country_code(raw_tag);
                 let tag = crate::state::clean_node_display_name(raw_tag);
@@ -2877,7 +3365,11 @@ impl VpnManager {
                 Ok(val) => {
                     let raw_tag = custom_handle_opt
                         .as_deref()
-                        .or_else(|| val.get("tag").and_then(Value::as_str).filter(|s| !s.is_empty()))
+                        .or_else(|| {
+                            val.get("tag")
+                                .and_then(Value::as_str)
+                                .filter(|s| !s.is_empty())
+                        })
                         .unwrap_or("Сервер");
                     let country = detect_country_code(raw_tag);
                     let tag = crate::state::clean_node_display_name(raw_tag);
@@ -3012,6 +3504,83 @@ impl VpnManager {
     }
 
     pub async fn provision_warp_awg(&self) -> String {
+        if self.is_running().await {
+            if let Ok((200, body)) = clash_api_request(
+                API_PORT,
+                &self.secret,
+                "POST",
+                "/tachyon/warp/register",
+                Some(r#"{"tag":"Cloudflare WARP"}"#),
+            )
+            .await
+            {
+                if let Ok(doc) = serde_json::from_str::<Value>(&body) {
+                    if let Some(acct) = doc.get("account") {
+                        let priv_b64 = acct
+                            .get("private_key")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let peer_pub = acct
+                            .get("peer_public_key")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let inet4 = acct
+                            .get("inet4")
+                            .and_then(Value::as_str)
+                            .unwrap_or("172.16.0.2/32");
+                        let endpoint = acct
+                            .get("endpoint")
+                            .and_then(Value::as_str)
+                            .unwrap_or("162.159.192.1:2408");
+                        let reserved_param = acct
+                            .get("reserved")
+                            .and_then(Value::as_array)
+                            .filter(|a| a.len() >= 3)
+                            .map(|a| {
+                                format!(
+                                    "&reserved={},{},{}",
+                                    a[0].as_u64().unwrap_or(0),
+                                    a[1].as_u64().unwrap_or(0),
+                                    a[2].as_u64().unwrap_or(0),
+                                )
+                            })
+                            .unwrap_or_default();
+                        if !priv_b64.is_empty() && !peer_pub.is_empty() {
+                            let awg_uri = format!(
+                                "awg://{}@{}?publickey={}&address={}{}&mtu=1280&jc=4&jmin=40&jmax=70&s1=0&s2=0&h1=1&h2=2&h3=3&h4=4#Cloudflare%20WARP%20(AmneziaWG)",
+                                core_config::subscription::percent_encode_component(priv_b64),
+                                endpoint,
+                                core_config::subscription::percent_encode_component(peer_pub),
+                                core_config::subscription::percent_encode_component(inet4),
+                                reserved_param,
+                            );
+                            let masque_uri = doc
+                                .get("masque_outbound")
+                                .cloned()
+                                .map(|mut ob| {
+                                    if let Some(m) = ob.as_object_mut() {
+                                        m.insert(
+                                            "tag".to_string(),
+                                            json!("Cloudflare WARP (MASQUE)"),
+                                        );
+                                    }
+                                    encode_inline_node_uri(&ob)
+                                })
+                                .unwrap_or_default();
+                            return json!({
+                                "ok": true,
+                                "uri": awg_uri,
+                                "masque_uri": masque_uri,
+                                "name": "Cloudflare WARP (AmneziaWG)",
+                                "ip": inet4
+                            })
+                            .to_string();
+                        }
+                    }
+                }
+            }
+        }
+
         let mut priv_bytes = [0u8; 32];
         let _ = getrandom::fill(&mut priv_bytes);
         let secret = x25519_dalek::StaticSecret::from(priv_bytes);
@@ -3086,7 +3655,10 @@ impl VpnManager {
         let peer_endpoint = cfg
             .pointer("/peers/0/endpoint/v4")
             .and_then(Value::as_str)
-            .or_else(|| cfg.pointer("/peers/0/endpoint/host").and_then(Value::as_str))
+            .or_else(|| {
+                cfg.pointer("/peers/0/endpoint/host")
+                    .and_then(Value::as_str)
+            })
             .filter(|s| !s.trim().is_empty())
             .map(|s| {
                 let st = s.trim();
@@ -3127,6 +3699,188 @@ impl VpnManager {
             "ip": client_ip
         })
         .to_string()
+    }
+
+    async fn clash_json(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<String, String> {
+        if !self.is_running().await {
+            return Err("Подключите туннель для обращения к API ядра".to_string());
+        }
+        let body_str = body.map(|v| v.to_string());
+        let (status, resp) =
+            clash_api_request(API_PORT, &self.secret, method, path, body_str.as_deref())
+                .await
+                .map_err(|e| format!("API error: {e}"))?;
+        if (200..300).contains(&status) {
+            Ok(resp)
+        } else {
+            let msg = serde_json::from_str::<Value>(&resp)
+                .ok()
+                .and_then(|v| v.get("message").and_then(Value::as_str).map(str::to_string))
+                .unwrap_or_else(|| format!("HTTP {status}"));
+            Err(msg)
+        }
+    }
+
+    /// Проверяет маршрут и опционально выполняет живую пробу через `/tachyon/route-check`.
+    pub async fn route_check(&self, target: &str, probe: bool) -> Result<String, String> {
+        let tgt = target.trim();
+        if tgt.is_empty() {
+            return Err("Укажите домен, URL или IP".to_string());
+        }
+        self.clash_json(
+            "POST",
+            "/tachyon/route-check",
+            Some(json!({ "target": tgt, "probe": probe })),
+        )
+        .await
+    }
+
+    /// Проверяет состояние DNS-резолвера ядра и UDP/53 через `/tachyon/dns-check`.
+    pub async fn dns_check(&self, domain: &str) -> Result<String, String> {
+        let host = if domain.trim().is_empty() {
+            "example.com"
+        } else {
+            domain.trim()
+        };
+        self.clash_json(
+            "POST",
+            "/tachyon/dns-check",
+            Some(json!({ "domain": host })),
+        )
+        .await
+    }
+
+    /// Запрашивает аудит маршрутов IPv4/IPv6/WebRTC/DNS через `/tachyon/leak`.
+    pub async fn leak_audit(&self) -> Result<String, String> {
+        self.clash_json("GET", "/tachyon/leak", None).await
+    }
+
+    /// Возвращает телеметрию памяти ядра через `/tachyon/memory`.
+    pub async fn memory_stats(&self) -> Result<String, String> {
+        self.clash_json("GET", "/tachyon/memory", None).await
+    }
+
+    /// Освобождает кэши ядра при повышенной нагрузке через `/tachyon/memory/trim`.
+    pub async fn memory_trim(&self) -> Result<String, String> {
+        self.clash_json("POST", "/tachyon/memory/trim", Some(json!({})))
+            .await
+    }
+
+    /// Читает недавние записи журнала соединений из `/tachyon/flight`.
+    pub async fn get_flight_recorder(&self) -> Result<String, String> {
+        self.clash_json("GET", "/tachyon/flight", None).await
+    }
+
+    /// Очищает буфер журнала соединений через `DELETE /tachyon/flight`.
+    pub async fn clear_flight_recorder(&self) -> Result<String, String> {
+        self.clash_json("DELETE", "/tachyon/flight", None).await
+    }
+
+    /// Строит `DesyncConfig` из текущих UI-настроек для активных проб.
+    pub fn build_desync_config_for_probe(
+        d: &DesyncOptions,
+    ) -> core_runtime::outbound::desync::DesyncConfig {
+        let val = Self::build_desync_outbound("DESYNC", d);
+        if let Some(obj) = val.as_object() {
+            if let Ok(cfg) = core_runtime::outbound::desync::DesyncConfig::from_json(obj) {
+                return cfg;
+            }
+        }
+        core_runtime::outbound::desync::DesyncConfig::default()
+    }
+
+    async fn resolve_probe_target(raw: &str) -> Result<(String, SocketAddr), String> {
+        let cleaned = raw
+            .trim()
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .trim();
+        let host = if cleaned.is_empty() {
+            "www.youtube.com".to_string()
+        } else if let Some((h, _)) = cleaned.rsplit_once(':')
+            && !cleaned.starts_with('[')
+        {
+            h.trim().to_string()
+        } else {
+            cleaned.trim_matches(&['[', ']'][..]).to_string()
+        };
+        let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 443u16))
+            .await
+            .map_err(|e| format!("DNS error: {e}"))?
+            .collect();
+        let chosen = addrs
+            .iter()
+            .find(|sa| sa.is_ipv4() && !is_fake_or_tun_ip(sa.ip()))
+            .or_else(|| addrs.iter().find(|sa| !is_fake_or_tun_ip(sa.ip())))
+            .or_else(|| addrs.first())
+            .copied()
+            .ok_or_else(|| "Не удалось определить IP-адрес цели".to_string())?;
+        Ok((host, chosen))
+    }
+
+    /// Выполняет потоковую HTTPS-пробу текущей конфигурации фрагментации/десинхронизации.
+    pub async fn run_desync_probe(
+        &self,
+        domain: &str,
+        d: &DesyncOptions,
+    ) -> Result<String, String> {
+        let (host, addr) = Self::resolve_probe_target(domain).await?;
+        let cfg = Self::build_desync_config_for_probe(d);
+        let outcome = core_runtime::outbound::desync::probe_desync_https_stream(
+            addr,
+            &host,
+            None,
+            &cfg,
+            Duration::from_secs(6),
+        )
+        .await;
+        Ok(json!({
+            "host": host,
+            "ip": addr.ip().to_string(),
+            "ok": outcome.ok,
+            "verified_32k": outcome.verified_32k,
+            "status": format!("{:?}", outcome.status),
+            "block_reason": outcome.block_reason,
+            "detail": outcome.detail,
+            "rtt_ms": outcome.rtt_ms,
+            "rx_wire_bytes": outcome.rx_wire_bytes,
+            "rx_app_bytes": outcome.rx_app_bytes,
+        })
+        .to_string())
+    }
+
+    /// Калибрует оптимальный TTL на маршруте до узла через `calibrate_ttl_hops`.
+    pub async fn run_desync_ttl_calibration(
+        &self,
+        domain: &str,
+        d: &DesyncOptions,
+    ) -> Result<String, String> {
+        let (host, addr) = Self::resolve_probe_target(domain).await?;
+        let cfg = Self::build_desync_config_for_probe(d);
+        let report = core_runtime::outbound::desync::calibrate_ttl_hops(
+            addr,
+            &host,
+            &cfg,
+            Duration::from_secs(4),
+        )
+        .await;
+        Ok(json!({
+            "domain": report.domain,
+            "resolved_ip": report.resolved_ip,
+            "optimal_ttl": report.optimal_ttl,
+            "min_working_ttl": report.min_working_ttl,
+            "max_working_ttl": report.max_working_ttl,
+            "summary": report.summary,
+        })
+        .to_string())
     }
 
     pub async fn check_exit_node_info(&self) -> String {
@@ -3207,11 +3961,35 @@ impl VpnManager {
 
     pub async fn run_dns_benchmark(&self) -> String {
         let targets = [
-            ("yandex", "Яндекс DNS (77.88.8.8)", "77.88.8.8", 53u16, "UDP/TCP 53"),
-            ("cloudflare", "Cloudflare (1.1.1.1)", "1.1.1.1", 443u16, "DoH / HTTPS"),
-            ("google", "Google (8.8.8.8)", "8.8.8.8", 443u16, "DoH / HTTPS"),
+            (
+                "yandex",
+                "Яндекс DNS (77.88.8.8)",
+                "77.88.8.8",
+                53u16,
+                "UDP/TCP 53",
+            ),
+            (
+                "cloudflare",
+                "Cloudflare (1.1.1.1)",
+                "1.1.1.1",
+                443u16,
+                "DoH / HTTPS",
+            ),
+            (
+                "google",
+                "Google (8.8.8.8)",
+                "8.8.8.8",
+                443u16,
+                "DoH / HTTPS",
+            ),
             ("quad9", "Quad9 (9.9.9.9)", "9.9.9.9", 443u16, "DoH / HTTPS"),
-            ("adguard", "AdGuard (94.140.14.14)", "94.140.14.14", 443u16, "DoH / HTTPS"),
+            (
+                "adguard",
+                "AdGuard (94.140.14.14)",
+                "94.140.14.14",
+                443u16,
+                "DoH / HTTPS",
+            ),
         ];
         let mut results = Vec::new();
         for (id, name, host, port, proto) in targets {
@@ -3229,11 +4007,36 @@ impl VpnManager {
 
     pub async fn run_diagnostics_matrix(&self) -> String {
         let probes = [
-            ("direct_ru", "Рунет (Яндекс)", "Проверка базового прямого канала", "https://ya.ru"),
-            ("cloudflare", "Cloudflare Edge", "Зарубежный CDN и DoH-инфраструктура", "https://cp.cloudflare.com/generate_204"),
-            ("youtube", "YouTube Web & Video", "Доступность видеоплатформы и манифестов", "https://www.youtube.com/generate_204"),
-            ("discord", "Discord API & Gateway", "Голосовой и текстовый шлюз Discord", "https://discord.com/api/v9/experiments"),
-            ("telegram", "Telegram Web", "Веб-шлюз и медиасерверы Telegram", "https://web.telegram.org/"),
+            (
+                "direct_ru",
+                "Рунет (Яндекс)",
+                "Проверка базового прямого канала",
+                "https://ya.ru",
+            ),
+            (
+                "cloudflare",
+                "Cloudflare Edge",
+                "Зарубежный CDN и DoH-инфраструктура",
+                "https://cp.cloudflare.com/generate_204",
+            ),
+            (
+                "youtube",
+                "YouTube Web & Video",
+                "Доступность видеоплатформы и манифестов",
+                "https://www.youtube.com/generate_204",
+            ),
+            (
+                "discord",
+                "Discord API & Gateway",
+                "Голосовой и текстовый шлюз Discord",
+                "https://discord.com/api/v9/experiments",
+            ),
+            (
+                "telegram",
+                "Telegram Web",
+                "Веб-шлюз и медиасерверы Telegram",
+                "https://web.telegram.org/",
+            ),
         ];
         let proxy = if self.is_running().await {
             Some(PROXY_PORT)
@@ -3393,7 +4196,9 @@ impl VpnManager {
     }
 
     pub async fn check_github_update(&self, silent: bool) {
-        let current = env!("CARGO_PKG_VERSION").trim_start_matches('v').to_string();
+        let current = env!("CARGO_PKG_VERSION")
+            .trim_start_matches('v')
+            .to_string();
         let core_ver = option_env!("TACHYON_CORE_VERSION")
             .unwrap_or(env!("CARGO_PKG_VERSION"))
             .trim_start_matches('v')
@@ -3432,7 +4237,9 @@ impl VpnManager {
     }
 
     pub async fn install_github_update(&self) {
-        let current = env!("CARGO_PKG_VERSION").trim_start_matches('v').to_string();
+        let current = env!("CARGO_PKG_VERSION")
+            .trim_start_matches('v')
+            .to_string();
         let core_ver = option_env!("TACHYON_CORE_VERSION")
             .unwrap_or(env!("CARGO_PKG_VERSION"))
             .trim_start_matches('v')
@@ -3554,9 +4361,7 @@ impl VpnManager {
             {
                 if (200..300).contains(&r.status) {
                     let sums_text = String::from_utf8_lossy(&r.body);
-                    if let Err(err_msg) =
-                        verify_asset_sha256(&bytes, &rel.asset_name, &sums_text)
-                    {
+                    if let Err(err_msg) = verify_asset_sha256(&bytes, &rel.asset_name, &sums_text) {
                         self.emit(format!("core-update:error:{err_msg}"));
                         return;
                     }
@@ -3656,9 +4461,7 @@ fn is_newer_semver(candidate: &str, current: &str) -> bool {
 }
 
 async fn fetch_latest_github_release(proxy_port: Option<u16>) -> Result<GithubReleaseInfo, String> {
-    let endpoints = [
-        "https://api.github.com/repos/Dushnilin/tachyon-desktop/releases/latest",
-    ];
+    let endpoints = ["https://api.github.com/repos/Dushnilin/tachyon-desktop/releases/latest"];
 
     let mut headers = vec![
         ("Accept", "application/vnd.github+json"),
@@ -3685,15 +4488,17 @@ async fn fetch_latest_github_release(proxy_port: Option<u16>) -> Result<GithubRe
         .await
         {
             Ok(r) if (200..300).contains(&r.status) => Ok(r),
-            Ok(_) | Err(_) if proxy_port.is_some() => fetch_url(
-                api_url,
-                "GET",
-                &headers,
-                None,
-                None,
-                Duration::from_secs(12),
-            )
-            .await,
+            Ok(_) | Err(_) if proxy_port.is_some() => {
+                fetch_url(
+                    api_url,
+                    "GET",
+                    &headers,
+                    None,
+                    None,
+                    Duration::from_secs(12),
+                )
+                .await
+            }
             Err(e) => Err(e),
             Ok(r) => Ok(r),
         };
@@ -3780,6 +4585,11 @@ fn score_release_asset_for_current_os(name: &str) -> i32 {
 
     #[cfg(target_os = "windows")]
     {
+        if lower.ends_with(".msi")
+            && (lower.contains("tachyon") || lower.contains("windows") || lower.contains("x86_64"))
+        {
+            return 75;
+        }
         if lower.contains("windows")
             || lower.contains("win")
             || lower.contains("setup")
@@ -3838,7 +4648,11 @@ fn score_release_asset_for_current_os(name: &str) -> i32 {
     }
 }
 
-fn apply_self_binary_update(exe_path: &Path, bytes: &[u8], asset_name: &str) -> Result<bool, String> {
+fn apply_self_binary_update(
+    exe_path: &Path,
+    bytes: &[u8],
+    asset_name: &str,
+) -> Result<bool, String> {
     let lower = asset_name.to_ascii_lowercase();
 
     #[cfg(target_os = "windows")]
@@ -3874,7 +4688,13 @@ fn apply_self_binary_update(exe_path: &Path, bytes: &[u8], asset_name: &str) -> 
                 inner_cmd.replace('\'', "''")
             );
             let status = Command::new("powershell")
-                .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &outer_ps])
+                .args([
+                    "-NoProfile",
+                    "-WindowStyle",
+                    "Hidden",
+                    "-Command",
+                    &outer_ps,
+                ])
                 .creation_flags(CREATE_NO_WINDOW)
                 .status()
                 .map_err(|e| format!("Ошибка запроса прав администратора для обновления: {e}"))?;
@@ -3882,7 +4702,10 @@ fn apply_self_binary_update(exe_path: &Path, bytes: &[u8], asset_name: &str) -> 
             if status.success() && exe_path.exists() {
                 return Ok(true);
             }
-            return Err("Не удалось заменить исполняемый файл (отказ UAC или файл заблокирован)".to_string());
+            return Err(
+                "Не удалось заменить исполняемый файл (отказ UAC или файл заблокирован)"
+                    .to_string(),
+            );
         }
     }
 
@@ -3900,7 +4723,8 @@ fn apply_self_binary_update(exe_path: &Path, bytes: &[u8], asset_name: &str) -> 
             }
             // Fallback for /usr/bin/tachyon requiring root via pkexec
             let staged = app_data_dir().join("tachyon.update.bin");
-            fs::write(&staged, bytes).map_err(|e| format!("Не удалось сохранить обновление: {e}"))?;
+            fs::write(&staged, bytes)
+                .map_err(|e| format!("Не удалось сохранить обновление: {e}"))?;
             let _ = fs::set_permissions(&staged, fs::Permissions::from_mode(0o755));
             let status = Command::new("pkexec")
                 .args([
@@ -3942,7 +4766,7 @@ fn apply_self_binary_update(exe_path: &Path, bytes: &[u8], asset_name: &str) -> 
         }
     }
 
-    // Fallback: save installer/archive to app_data_dir/updates and open it in file manager
+    // Fallback: save installer/archive to app_data_dir/updates and launch MSI if applicable
     let updates_dir = app_data_dir().join("updates");
     let _ = fs::create_dir_all(&updates_dir);
     let safe_name = if asset_name.is_empty() {
@@ -3952,6 +4776,10 @@ fn apply_self_binary_update(exe_path: &Path, bytes: &[u8], asset_name: &str) -> 
     };
     let dest = updates_dir.join(safe_name);
     fs::write(&dest, bytes).map_err(|e| format!("Не удалось сохранить пакет обновления: {e}"))?;
+    #[cfg(target_os = "windows")]
+    if lower.ends_with(".msi") {
+        let _ = Command::new("msiexec").arg("/i").arg(&dest).spawn();
+    }
     Ok(false)
 }
 
@@ -4191,7 +5019,7 @@ fn windows_icmp_ping_ms(host: &str, timeout_ms: u64) -> Option<i64> {
     }
     if count > 0 {
         let reply = unsafe { &*(reply_buf.as_ptr() as *const IcmpEchoReply) };
-        if reply.status == 0 {
+        if reply.status == 0 && reply.address == dest_in_addr {
             let rtt = (reply.round_trip_time as i64).max(elapsed_ms).max(1);
             return Some(rtt);
         }
@@ -4331,8 +5159,7 @@ async fn connect_bypassing_tun(addr: SocketAddr) -> std::io::Result<tokio::net::
 }
 
 #[cfg(target_os = "windows")]
-static CACHED_WIN_PHYS_IFINDEX: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
+static CACHED_WIN_PHYS_IFINDEX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[cfg(target_os = "windows")]
 pub fn refresh_cached_windows_phys_ifindex() {
@@ -4639,7 +5466,11 @@ pub fn enumerate_apps() -> Vec<RunningApp> {
                             no_display = true;
                         }
                     }
-                    if !no_display && !name.is_empty() && !exec.is_empty() && seen.insert(exec.clone()) {
+                    if !no_display
+                        && !name.is_empty()
+                        && !exec.is_empty()
+                        && seen.insert(exec.clone())
+                    {
                         apps.push(RunningApp {
                             binary: exec.clone(),
                             name,
@@ -4884,6 +5715,38 @@ pub fn build_subscription_servers_list(nodes: &[Value], handle: &str) -> Vec<Val
     servers
 }
 
+#[cfg(target_os = "windows")]
+fn friendly_windows_app_name(exe: &str) -> String {
+    let lower = exe.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "chrome.exe" => "Google Chrome".to_string(),
+        "msedge.exe" => "Microsoft Edge".to_string(),
+        "firefox.exe" => "Mozilla Firefox".to_string(),
+        "brave.exe" => "Brave Browser".to_string(),
+        "opera.exe" => "Opera".to_string(),
+        "yandex.exe" | "browser.exe" => "Яндекс Браузер".to_string(),
+        "discord.exe" => "Discord".to_string(),
+        "telegram.exe" => "Telegram Desktop".to_string(),
+        "spotify.exe" => "Spotify".to_string(),
+        "steam.exe" => "Steam".to_string(),
+        "epicgameslauncher.exe" => "Epic Games".to_string(),
+        "code.exe" => "Visual Studio Code".to_string(),
+        "obs64.exe" => "OBS Studio".to_string(),
+        "qbittorrent.exe" => "qBittorrent".to_string(),
+        _ => {
+            let stem = exe
+                .strip_suffix(".exe")
+                .or_else(|| exe.strip_suffix(".EXE"))
+                .unwrap_or(exe);
+            let mut chars = stem.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => exe.to_string(),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4958,8 +5821,8 @@ mod tests {
     #[test]
     fn subscription_balancers_hide_internal_members_and_auto_synthesize() {
         let raw_two_nodes = "vless://11111111-1111-1111-1111-111111111111@198.51.100.10:443?security=tls&type=tcp#NL-1\nvless://22222222-2222-2222-2222-222222222222@198.51.100.20:443?security=tls&type=tcp#DE-1";
-        let parsed =
-            parse_subscription_payload_with_hwid(raw_two_nodes, None, None).expect("parse two nodes");
+        let parsed = parse_subscription_payload_with_hwid(raw_two_nodes, None, None)
+            .expect("parse two nodes");
         let list = build_subscription_servers_list(&parsed, "TestSub");
         assert_eq!(list.len(), 3);
         assert_eq!(list[0]["isBalancer"], json!(true));
@@ -4969,7 +5832,7 @@ mod tests {
     #[test]
     fn github_updater_semver_scoring_and_sha256_verification() {
         assert!(is_newer_semver("v0.3.4", "0.3.3"));
-        assert!(is_newer_semver("0.3.9", "0.3.3"));
+        assert!(is_newer_semver("0.4.0", "0.3.9"));
         assert!(!is_newer_semver("0.3.3", "0.3.3"));
         assert!(!is_newer_semver("0.3.2", "0.3.3"));
 
@@ -4980,12 +5843,16 @@ mod tests {
                 100
             );
             assert_eq!(
-                score_release_asset_for_current_os("Tachyon-Setup-x86_64.exe"),
-                70
+                score_release_asset_for_current_os("Tachyon-0.4.0-x86_64.msi"),
+                75
             );
             assert!(
                 score_release_asset_for_current_os("Tachyon-windows-x86_64.exe")
-                    > score_release_asset_for_current_os("Tachyon-Setup-x86_64.exe")
+                    > score_release_asset_for_current_os("Tachyon-0.4.0-x86_64.msi")
+            );
+            assert!(
+                score_release_asset_for_current_os("Tachyon-0.4.0-x86_64.msi")
+                    > score_release_asset_for_current_os("Tachyon-windows-x86_64.zip")
             );
             assert_eq!(score_release_asset_for_current_os("SHA256SUMS.txt"), 0);
         }
@@ -5018,7 +5885,8 @@ mod tests {
         ];
 
         for uri in uris {
-            let opts = ConnectOptions::parse(uri).expect("ConnectOptions::parse should accept 0.4.0 URI");
+            let opts =
+                ConnectOptions::parse(uri).expect("ConnectOptions::parse should accept 0.4.0 URI");
             let (cfg, has_node) = mgr.build_config(&opts).expect("build_config for 0.4.0 URI");
             assert!(has_node);
             let cfg_str = serde_json::to_string(&cfg).expect("serialize config");
@@ -5118,9 +5986,7 @@ mod tests {
         );
 
         let opts = ConnectOptions::parse(&share_link).expect("ConnectOptions::parse awg2 link");
-        let (cfg, _) = mgr
-            .build_config(&opts)
-            .expect("build_config awg2 link");
+        let (cfg, _) = mgr.build_config(&opts).expect("build_config awg2 link");
         core_config::check_str(&cfg.to_string()).expect("core_config::check_str awg2");
 
         // 2. Single-line pasted .conf (when browser <input> strips newlines)
@@ -5170,9 +6036,7 @@ mod tests {
         let vpn_link = node_to_share_link(&vpn_nodes[0]).expect("vpn:// node_to_share_link");
         assert!(vpn_link.starts_with("awg://"));
         let vpn_opts = ConnectOptions::parse(&vpn_link).expect("ConnectOptions vpn_link");
-        let (vpn_cfg, _) = mgr
-            .build_config(&vpn_opts)
-            .expect("build_config vpn_link");
+        let (vpn_cfg, _) = mgr.build_config(&vpn_opts).expect("build_config vpn_link");
         core_config::check_str(&vpn_cfg.to_string()).expect("check_str vpn_link");
 
         // 5. Legacy `amneziawg://...?pub=...&ip=172.16.0.2/32` URI (must not collide with AWG masque `ip`)
@@ -5264,6 +6128,7 @@ mod tests {
             rule_type: "domain".to_string(),
             value: "cloudfront.net".to_string(),
             action: "desync".to_string(),
+            time_window: String::new(),
         });
 
         let payload_on = st.build_connect_payload(None);
@@ -5272,7 +6137,9 @@ mod tests {
         assert_eq!(opts_on.desync.wscale, Some(1));
         assert!(opts_on.desync.lists_override_game_bypass);
 
-        let (cfg_on, _) = mgr.build_config(&opts_on).expect("build_config lists_override=true");
+        let (cfg_on, _) = mgr
+            .build_config(&opts_on)
+            .expect("build_config lists_override=true");
         core_config::check_str(&cfg_on.to_string()).expect("check_str lists_override=true");
 
         let desync_ob = cfg_on["outbounds"]
@@ -5336,7 +6203,8 @@ mod tests {
         // 2. lists_override_game_bypass = false: полное правило античита идёт ДО списков
         st.desync_prefs.lists_override_game_bypass = false;
         let payload_off = st.build_connect_payload(None);
-        let opts_off = ConnectOptions::parse(&payload_off).expect("parse opts lists_override=false");
+        let opts_off =
+            ConnectOptions::parse(&payload_off).expect("parse opts lists_override=false");
         let (cfg_off, _) = mgr
             .build_config(&opts_off)
             .expect("build_config lists_override=false");
@@ -5372,40 +6240,245 @@ mod tests {
         let reexported = node_to_share_link(&parsed_csqtt).expect("re-export csqtt v2");
         assert!(reexported.starts_with("csqtt://"));
         let opts_csqtt = ConnectOptions::parse(&reexported).expect("ConnectOptions csqtt v2");
-        let (cfg_csqtt, has_node) = mgr.build_config(&opts_csqtt).expect("build_config csqtt v2");
+        let (cfg_csqtt, has_node) = mgr
+            .build_config(&opts_csqtt)
+            .expect("build_config csqtt v2");
         assert!(has_node);
         core_config::check_str(&cfg_csqtt.to_string()).expect("check_str csqtt v2");
     }
-}
 
-#[cfg(target_os = "windows")]
-fn friendly_windows_app_name(exe: &str) -> String {
-    let lower = exe.trim().to_ascii_lowercase();
-    match lower.as_str() {
-        "chrome.exe" => "Google Chrome".to_string(),
-        "msedge.exe" => "Microsoft Edge".to_string(),
-        "firefox.exe" => "Mozilla Firefox".to_string(),
-        "brave.exe" => "Brave Browser".to_string(),
-        "opera.exe" => "Opera".to_string(),
-        "yandex.exe" | "browser.exe" => "Яндекс Браузер".to_string(),
-        "discord.exe" => "Discord".to_string(),
-        "telegram.exe" => "Telegram Desktop".to_string(),
-        "spotify.exe" => "Spotify".to_string(),
-        "steam.exe" => "Steam".to_string(),
-        "epicgameslauncher.exe" => "Epic Games".to_string(),
-        "code.exe" => "Visual Studio Code".to_string(),
-        "obs64.exe" => "OBS Studio".to_string(),
-        "qbittorrent.exe" => "qBittorrent".to_string(),
-        _ => {
-            let stem = exe
-                .strip_suffix(".exe")
-                .or_else(|| exe.strip_suffix(".EXE"))
-                .unwrap_or(exe);
-            let mut chars = stem.chars();
-            match chars.next() {
-                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                None => exe.to_string(),
-            }
+    #[test]
+    fn desync_advanced_fields_and_sni_pool_validate() {
+        let mgr = VpnManager::new(Arc::new(|_| {}));
+
+        let mut st = crate::state::PersistedState::default();
+        st.vpn_prefs.route = "desync".to_string();
+        st.desync_prefs.preset = "custom".to_string();
+        st.desync_prefs.mode = "fake_split".to_string();
+        st.desync_prefs.fake_sni = "www.google.com, ya.ru, vk.com".to_string();
+        st.desync_prefs.host_fake = true;
+        st.desync_prefs.fake_payload = "0x1603010005".to_string();
+        st.desync_prefs.udp_fake_payload = "0x000100002112a442".to_string();
+        st.desync_prefs.udp_out_range = "1-3".to_string();
+        st.desync_prefs.udp_keep_socket = true;
+        st.desync_prefs.quic_fake = true;
+        st.desync_prefs.quic_repeats = 5;
+
+        let payload = st.build_connect_payload(None);
+        let opts = ConnectOptions::parse(&payload).expect("parse adv desync");
+        let (cfg, has_node) = mgr.build_config(&opts).expect("build adv desync config");
+        assert!(!has_node);
+        core_config::check_str(&cfg.to_string()).expect("check_str adv desync");
+
+        let desync_ob = cfg["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["tag"] == "DESYNC")
+            .expect("DESYNC outbound");
+        assert_eq!(desync_ob["fake_sni"], json!("www.google.com"));
+        assert_eq!(
+            desync_ob["sni_pool"],
+            json!(["www.google.com", "ya.ru", "vk.com"])
+        );
+        assert_eq!(desync_ob["host_fake"], json!(true));
+        assert_eq!(desync_ob["udp_out_range"], json!("1-3"));
+        assert_eq!(desync_ob["udp_keep_socket"], json!(true));
+        assert_eq!(desync_ob["quic_desync"], json!(true));
+        assert_eq!(desync_ob["quic_repeats"], json!(5));
+    }
+
+    #[test]
+    fn endpoint_vs_outbound_routing_for_wg_ts_ovpn_and_openconnect() {
+        let wg_node = json!({
+            "type": "wireguard",
+            "address": ["10.0.0.2/32"],
+            "private_key": "cO0+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY=",
+            "peers": [{
+                "address": "198.51.100.1",
+                "port": 51820,
+                "public_key": "dO0+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY=",
+                "allowed_ips": ["0.0.0.0/0"]
+            }]
+        });
+        let (wg_ep, wg_val, _) =
+            VpnManager::prepare_parsed_node(&encode_inline_node_uri(&wg_node), "WG", false, None)
+                .expect("wg node");
+        assert!(wg_ep);
+        assert_eq!(wg_val["type"], json!("wireguard"));
+
+        let ts_node = json!({
+            "type": "tailscale",
+            "control_url": "https://controlplane.tailscale.com",
+            "auth_key": "tskey-auth-dummy"
+        });
+        let (ts_ep, ts_val, host) =
+            VpnManager::prepare_parsed_node(&encode_inline_node_uri(&ts_node), "TS", false, None)
+                .expect("ts node");
+        assert!(ts_ep);
+        assert_eq!(ts_val["type"], json!("tailscale"));
+        assert_eq!(host.as_deref(), Some("controlplane.tailscale.com"));
+
+        let ovpn_node = json!({
+            "type": "openvpn",
+            "server": "198.51.100.5",
+            "server_port": 1194,
+            "tls": { "enabled": true }
+        });
+        let (ovpn_ep, ovpn_val, _) = VpnManager::prepare_parsed_node(
+            &encode_inline_node_uri(&ovpn_node),
+            "OVPN",
+            false,
+            None,
+        )
+        .expect("ovpn node");
+        assert!(ovpn_ep);
+        assert_eq!(ovpn_val["type"], json!("openvpn-client"));
+
+        let oc_node = json!({
+            "type": "openconnect",
+            "server": "198.51.100.6",
+            "server_port": 443,
+            "cookie": "webvpn=1"
+        });
+        let (oc_ep, oc_val, _) =
+            VpnManager::prepare_parsed_node(&encode_inline_node_uri(&oc_node), "OC", false, None)
+                .expect("openconnect node");
+        assert!(!oc_ep);
+        assert_eq!(oc_val["type"], json!("openconnect"));
+    }
+
+    #[test]
+    fn config_transports_ipv6_ntp_sniff_dialer_and_rules_validate() {
+        let mgr = VpnManager::new(Arc::new(|_| {}));
+
+        let vless_uri = "vless://11111111-1111-1111-1111-111111111111@198.51.100.10:443?security=tls&type=tcp&sni=example.com#Node";
+        for transport in ["https", "h3", "quic", "tls", "udp"] {
+            let mut st = crate::state::PersistedState::default();
+            st.servers.push(crate::state::ServerNode {
+                id: "n1".to_string(),
+                name: "Node".to_string(),
+                country: "nl".to_string(),
+                vless: vless_uri.to_string(),
+                sub_id: None,
+                is_balancer: false,
+                balancer_mode: None,
+                member_count: None,
+                ping_ms: None,
+                alive: None,
+            });
+            st.active_id = "n1".to_string();
+            st.vpn_prefs.dns = "cloudflare".to_string();
+            st.vpn_prefs.dns_transport = transport.to_string();
+            st.vpn_prefs.ipv6_enabled = true;
+            st.vpn_prefs.ntp_enabled = true;
+            st.vpn_prefs.ntp_server = "time.cloudflare.com".to_string();
+            st.vpn_prefs.sniff = false;
+            st.vpn_prefs.tcp_fast_open = true;
+            st.vpn_prefs.tcp_multi_path = true;
+            st.custom_rules = vec![
+                crate::state::CustomRule {
+                    id: "r1".to_string(),
+                    rule_type: "domain_regex".to_string(),
+                    value: "^.*\\.internal\\.example$".to_string(),
+                    action: "direct".to_string(),
+                    time_window: "mon-fri 09:00-18:00".to_string(),
+                },
+                crate::state::CustomRule {
+                    id: "r2".to_string(),
+                    rule_type: "port".to_string(),
+                    value: "8000-8080".to_string(),
+                    action: "vpn".to_string(),
+                    time_window: String::new(),
+                },
+                crate::state::CustomRule {
+                    id: "r3".to_string(),
+                    rule_type: "process".to_string(),
+                    value: r"C:\Apps\tool.exe".to_string(),
+                    action: "direct".to_string(),
+                    time_window: String::new(),
+                },
+            ];
+
+            let payload = st.build_connect_payload(None);
+            let opts = ConnectOptions::parse(&payload).expect("parse opts");
+            let (cfg, has_node) = mgr.build_config(&opts).expect("build_config");
+            assert!(has_node);
+            core_config::check_str(&cfg.to_string())
+                .unwrap_or_else(|e| panic!("transport {transport} failed check_str: {e}"));
+
+            let remote_dns = cfg["dns"]["servers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["tag"] == "dns_remote")
+                .unwrap();
+            assert_eq!(remote_dns["type"], json!(transport));
+            assert_eq!(
+                cfg["inbounds"][0]["address"],
+                json!(["172.19.0.1/30", "fdfe:dcba:9876::1/126"])
+            );
+            let fakeip_srv = cfg["dns"]["servers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["tag"] == "dns-fakeip")
+                .unwrap();
+            assert_eq!(fakeip_srv["inet6_range"], json!("fc00::/18"));
+            assert_eq!(cfg["ntp"]["enabled"], json!(true));
+            assert_eq!(cfg["ntp"]["server"], json!("time.cloudflare.com"));
+            let rules_arr = cfg["route"]["rules"].as_array().unwrap();
+            assert!(
+                !rules_arr
+                    .iter()
+                    .any(|r| r.get("action") == Some(&json!("sniff")))
+            );
+            assert!(rules_arr.iter().any(|r| r.get("domain_regex").is_some()
+                && r.get("time_window") == Some(&json!("mon-fri 09:00-18:00"))));
+            assert!(
+                rules_arr
+                    .iter()
+                    .any(|r| r.get("port_range") == Some(&json!(["8000:8080"])))
+            );
+            assert!(
+                rules_arr
+                    .iter()
+                    .any(|r| r.get("process_path") == Some(&json!([r"C:\Apps\tool.exe"])))
+            );
         }
+
+        // anytls must NOT get tcp_fast_open
+        let anytls_ob = json!({
+            "type": "anytls",
+            "server": "198.51.100.30",
+            "server_port": 443,
+            "password": "secret",
+            "tls": { "enabled": true, "server_name": "any.example.com" }
+        });
+        let mut st_any = crate::state::PersistedState::default();
+        st_any.servers.push(crate::state::ServerNode {
+            id: "any1".to_string(),
+            name: "AnyTLS".to_string(),
+            country: "nl".to_string(),
+            vless: encode_inline_node_uri(&anytls_ob),
+            sub_id: None,
+            is_balancer: false,
+            balancer_mode: None,
+            member_count: None,
+            ping_ms: None,
+            alive: None,
+        });
+        st_any.active_id = "any1".to_string();
+        st_any.vpn_prefs.tcp_fast_open = true;
+        let opts_any = ConnectOptions::parse(&st_any.build_connect_payload(None)).unwrap();
+        let (cfg_any, _) = mgr.build_config(&opts_any).unwrap();
+        core_config::check_str(&cfg_any.to_string()).expect("anytls with tfo global pref");
+        let proxy_ob = cfg_any["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["tag"] == "PROXY")
+            .unwrap();
+        assert!(proxy_ob.get("tcp_fast_open").is_none());
     }
 }

@@ -102,11 +102,7 @@ impl Theme {
     }
 
     pub fn for_mode(light: bool) -> Self {
-        if light {
-            Self::light()
-        } else {
-            Self::dark()
-        }
+        if light { Self::light() } else { Self::dark() }
     }
 }
 

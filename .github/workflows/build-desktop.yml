@@ -74,7 +74,7 @@ jobs:
         run: |
           RAW_TAG="${{ inputs.release_tag != '' && inputs.release_tag || github.ref_name }}"
           VER="${RAW_TAG#v}"
-          if [[ ! "${VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then VER="0.3.9"; fi
+          if [[ ! "${VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then VER="0.4.0"; fi
           chmod +x desktop-rs/scripts/package-linux.sh
           ./desktop-rs/scripts/package-linux.sh "${VER}"
 
@@ -128,7 +128,7 @@ jobs:
         run: |
           RAW_TAG="${{ inputs.release_tag != '' && inputs.release_tag || github.ref_name }}"
           VER="${RAW_TAG#v}"
-          if [[ ! "${VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then VER="0.3.9"; fi
+          if [[ ! "${VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then VER="0.4.0"; fi
           chmod +x desktop-rs/scripts/package-macos.sh
           ./desktop-rs/scripts/package-macos.sh --universal "${VER}"
 
@@ -141,7 +141,7 @@ jobs:
             tachyon-desktop/dist/tachyon-desktop-macos-universal
 
   build-windows:
-    name: Windows (x86_64 .exe & .zip — Pure Rust)
+    name: Windows (x86_64 .msi, .exe & .zip — Pure Rust)
     runs-on: windows-latest
     steps:
       - name: Checkout tachyon-desktop
@@ -174,12 +174,18 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Package Windows (.exe, .zip & Setup installer)
+      - name: Install .NET 8 SDK for WiX MSI packaging
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Package Windows (.exe, .zip & .msi installer)
         working-directory: tachyon-desktop
+        shell: powershell
         run: |
           $RawTag = "${{ inputs.release_tag != '' && inputs.release_tag || github.ref_name }}"
           $Ver = $RawTag.TrimStart('v')
-          if ($Ver -notmatch '^[0-9]+\.[0-9]+\.[0-9]+') { $Ver = "0.3.9" }
+          if ($Ver -notmatch '^[0-9]+\.[0-9]+\.[0-9]+') { $Ver = "0.4.0" }
           ./desktop-rs/scripts/package-windows.ps1 $Ver
 
       - name: Upload Windows Artifacts
@@ -190,7 +196,7 @@ jobs:
             tachyon-desktop/dist/Tachyon.exe
             tachyon-desktop/dist/Tachyon-windows-x86_64.exe
             tachyon-desktop/dist/Tachyon-windows-x86_64.zip
-            tachyon-desktop/dist/Tachyon-Setup-x86_64.exe
+            tachyon-desktop/dist/*.msi
 
   release:
     name: Publish GitHub Release
@@ -198,6 +204,20 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     runs-on: ubuntu-24.04
     steps:
+      - name: Checkout tag annotation
+        uses: actions/checkout@v4
+        with:
+          path: repo
+          fetch-depth: 1
+
+      - name: Extract release notes from tag
+        shell: bash
+        run: |
+          TAG="${{ inputs.release_tag != '' && inputs.release_tag || github.ref_name }}"
+          git -C repo fetch --force --depth=1 origin "refs/tags/${TAG}:refs/tags/${TAG}" 2>/dev/null || true
+          git -C repo tag -l --format='%(contents)' "${TAG}" > release_notes.md
+          cat release_notes.md
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -216,5 +236,6 @@ jobs:
         with:
           tag_name: ${{ inputs.release_tag != '' && inputs.release_tag || github.ref_name }}
           name: "${{ inputs.release_tag != '' && inputs.release_tag || github.ref_name }}"
+          body_path: release_notes.md
           generate_release_notes: false
           files: release-assets/*

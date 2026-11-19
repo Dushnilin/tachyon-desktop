@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<WixLocalization Culture="ru-RU" Codepage="1251" xmlns="http://wixtoolset.org/schemas/v4/wxl">
+  <String Id="DowngradeError" Value="На этом компьютере уже установлена более новая версия Tachyon." />
+  <String Id="AppDescription" Value="Клиент селективной маршрутизации и туннелирования Tachyon" />
+  <String Id="LaunchAfterInstall" Value="Запустить Tachyon после завершения установки" />
+  <String Id="InstallDirTitle" Value="{\WixUI_Font_Title}Папка установки и параметры" />
+  <String Id="InstallDirDescription" Value="Нажмите «Далее» для установки в папку по умолчанию или выберите другую папку и параметры запуска." />
+  <String Id="DesktopShortcutCheckbox" Value="Создать ярлык на рабочем столе" />
+  <String Id="AutostartCheckbox" Value="Запускать Tachyon при входе в Windows" />
+  <String Id="FeatureMainTitle" Value="Tachyon Desktop" />
+  <String Id="FeatureMainDescription" Value="Исполняемый файл клиента со встроенным сетевым ядром tachyon-core и виртуальным адаптером Wintun." />
+  <String Id="WixSchedFirewallExceptionsInstall" Value="Настройка исключений брандмауэра Windows" />
+  <String Id="WixSchedFirewallExceptionsUninstall" Value="Подготовка удаления исключений брандмауэра Windows" />
+  <String Id="WixRollbackFirewallExceptionsInstall" Value="Откат изменений брандмауэра Windows" />
+  <String Id="WixExecFirewallExceptionsInstall" Value="Добавление исключений брандмауэра Windows" />
+  <String Id="WixRollbackFirewallExceptionsUninstall" Value="Восстановление правил брандмауэра Windows" />
+  <String Id="WixExecFirewallExceptionsUninstall" Value="Удаление исключений брандмауэра Windows" />
+  <String Id="msierrFirewallCannotConnect" Value="Не удалось подключиться к брандмауэру Windows ([2] [3] [4] [5])." />
+</WixLocalization>

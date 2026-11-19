@@ -2,18 +2,19 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui::component::Sizable as _;
 use gpui::component::input::{Input, InputEvent, InputState};
 use gpui::prelude::*;
-#[cfg(not(target_os = "windows"))]
-use gpui::{MouseButton, MouseDownEvent};
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, Entity, FocusHandle, FontWeight, Render, SharedString,
+    AnyElement, App, ClipboardItem, Context, Entity, FontWeight, Render, SharedString,
     Subscription, Window, WindowControlArea, div, img, px, svg,
 };
+#[cfg(not(target_os = "windows"))]
+use gpui::{MouseButton, MouseDownEvent};
 use serde_json::{Value, json};
 
 use crate::icons::flag_image;
@@ -117,6 +118,27 @@ pub struct UpdateBanner {
     pub progress_pct: u32,
 }
 
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct LayoutMetrics {
+    width: f32,
+    height: f32,
+    avail_w: f32,
+    narrow: bool,
+    compact: bool,
+    short: bool,
+    wide: bool,
+    is_maximized: bool,
+}
+
+fn adaptive_card_width(avail: f32, min_card: f32, max_cols: usize, gap: f32) -> f32 {
+    if avail <= min_card + 20.0 {
+        return avail.max(200.0);
+    }
+    let cols = (((avail + gap) / (min_card + gap)).floor() as usize).clamp(1, max_cols);
+    ((avail - gap * (cols.saturating_sub(1) as f32)) / (cols as f32)).floor()
+}
+
 pub struct TachyonApp {
     pub state: PersistedState,
     pub tab: Tab,
@@ -130,10 +152,17 @@ pub struct TachyonApp {
     pub server_search_input: Entity<InputState>,
     pub route_search_input: Entity<InputState>,
     pub custom_rule_input: Entity<InputState>,
+    pub custom_rule_tw_input: Entity<InputState>,
     pub node_uri_input_state: Entity<InputState>,
     pub node_name_input_state: Entity<InputState>,
     pub sub_url_input_state: Entity<InputState>,
     pub custom_dns_input_state: Entity<InputState>,
+    pub ntp_server_input_state: Entity<InputState>,
+    pub fake_sni_input_state: Entity<InputState>,
+    pub udp_out_range_input_state: Entity<InputState>,
+    pub udp_fake_payload_input_state: Entity<InputState>,
+    pub desync_probe_input_state: Entity<InputState>,
+    pub diag_target_input_state: Entity<InputState>,
     pub pasted_multiline_uri: Option<String>,
     _input_subscriptions: Vec<Subscription>,
 
@@ -165,6 +194,7 @@ pub struct TachyonApp {
     pub custom_rule_type: String,
     pub custom_rule_value: String,
     pub custom_rule_action: String,
+    pub custom_rule_time_window: String,
     pub collapsed_countries: HashSet<String>,
 
     // Diagnostics & Tools
@@ -179,13 +209,24 @@ pub struct TachyonApp {
     pub toast: Option<(String, Instant)>,
     pub update_banner: UpdateBanner,
     pub last_conns_poll: Instant,
-    // Клавиатурный фокус (без него on_key_down не получает события)
-    pub focus_handle: FocusHandle,
     // Живой RTT через туннель (не затирает прямой пинг узла)
     pub live_rtt_ms: Option<i64>,
     // Автопинг
     pub last_auto_ping: Instant,
     pub auto_ping_busy: Option<Instant>,
+    // Трей и новые функции ядра
+    pub close_to_tray_flag: Arc<AtomicBool>,
+    pub desync_probe_domain: String,
+    pub desync_probe_busy: bool,
+    pub desync_probe_report: Option<String>,
+    pub adaptive_snapshot: Vec<core_runtime::outbound::desync::GuiLearnedDomain>,
+    pub adaptive_l3_scores: Vec<u32>,
+    pub traffic_flight_mode: bool,
+    pub flight_entries: Vec<Value>,
+    pub diag_target: String,
+    pub diag_busy: bool,
+    pub inspector_report: Option<String>,
+    pub memory_report: Option<Value>,
 }
 
 impl TachyonApp {
@@ -212,6 +253,11 @@ impl TachyonApp {
         crate::theme::sync_kit_theme(state.light_theme, cx);
         let is_en = state.language.eq_ignore_ascii_case("en");
         let custom_dns_init = state.vpn_prefs.custom_dns.clone();
+        let ntp_server_init = state.vpn_prefs.ntp_server.clone();
+        let fake_sni_init = state.desync_prefs.fake_sni.clone();
+        let udp_out_range_init = state.desync_prefs.udp_out_range.clone();
+        let udp_fake_payload_init = state.desync_prefs.udp_fake_payload.clone();
+        let close_to_tray_flag = Arc::new(AtomicBool::new(state.vpn_prefs.close_to_tray));
 
         let server_search_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder(if is_en {
@@ -260,28 +306,57 @@ impl TachyonApp {
                     "https://dns.example.com/dns-query или 1.1.1.1"
                 })
         });
+        let custom_rule_tw_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(if is_en {
+                "Schedule (opt): mon-fri 09:00-18:00"
+            } else {
+                "Расписание (необяз.): mon-fri 09:00-18:00"
+            })
+        });
+        let ntp_server_input_state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(ntp_server_init)
+                .placeholder("time.cloudflare.com")
+        });
+        let fake_sni_input_state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(fake_sni_init)
+                .placeholder("www.google.com, ya.ru, vk.com")
+        });
+        let udp_out_range_input_state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(udp_out_range_init)
+                .placeholder("1-2")
+        });
+        let udp_fake_payload_input_state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(udp_fake_payload_init)
+                .placeholder("0x000100002112a442...")
+        });
+        let desync_probe_input_state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value("www.youtube.com")
+                .placeholder("www.youtube.com")
+        });
+        let diag_target_input_state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value("youtube.com")
+                .placeholder("youtube.com")
+        });
 
         let subs = vec![
-            cx.subscribe_in(
-                &server_search_input,
-                window,
-                |this, state, event, _, cx| {
-                    if matches!(event, InputEvent::Change) {
-                        this.server_search = state.read(cx).value().to_string();
-                        cx.notify();
-                    }
-                },
-            ),
-            cx.subscribe_in(
-                &route_search_input,
-                window,
-                |this, state, event, _, cx| {
-                    if matches!(event, InputEvent::Change) {
-                        this.route_search = state.read(cx).value().to_string();
-                        cx.notify();
-                    }
-                },
-            ),
+            cx.subscribe_in(&server_search_input, window, |this, state, event, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.server_search = state.read(cx).value().to_string();
+                    cx.notify();
+                }
+            }),
+            cx.subscribe_in(&route_search_input, window, |this, state, event, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.route_search = state.read(cx).value().to_string();
+                    cx.notify();
+                }
+            }),
             cx.subscribe_in(
                 &custom_rule_input,
                 window,
@@ -368,7 +443,135 @@ impl TachyonApp {
                     _ => {}
                 },
             ),
+            cx.subscribe_in(
+                &custom_rule_tw_input,
+                window,
+                |this, state, event, window, cx| match event {
+                    InputEvent::Change => {
+                        this.custom_rule_time_window = state.read(cx).value().trim().to_string();
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter { .. } => {
+                        this.submit_custom_rule_ui(window, cx);
+                        cx.notify();
+                    }
+                    _ => {}
+                },
+            ),
+            cx.subscribe_in(
+                &ntp_server_input_state,
+                window,
+                |this, state, event, _, cx| match event {
+                    InputEvent::Change => {
+                        this.state.vpn_prefs.ntp_server = state.read(cx).value().trim().to_string();
+                        this.state.save();
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter { .. } | InputEvent::Blur => {
+                        this.state.vpn_prefs.ntp_server = state.read(cx).value().trim().to_string();
+                        this.state.save();
+                        if this.state.vpn_prefs.ntp_enabled {
+                            this.reconnect_if_active();
+                        }
+                        cx.notify();
+                    }
+                    _ => {}
+                },
+            ),
+            cx.subscribe_in(
+                &fake_sni_input_state,
+                window,
+                |this, state, event, _, cx| match event {
+                    InputEvent::Change => {
+                        this.state.desync_prefs.fake_sni = state.read(cx).value().to_string();
+                        this.state.save();
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter { .. } | InputEvent::Blur => {
+                        this.state.desync_prefs.fake_sni =
+                            state.read(cx).value().trim().to_string();
+                        this.state.save();
+                        this.reconnect_if_active();
+                        cx.notify();
+                    }
+                    _ => {}
+                },
+            ),
+            cx.subscribe_in(
+                &udp_out_range_input_state,
+                window,
+                |this, state, event, _, cx| match event {
+                    InputEvent::Change => {
+                        this.state.desync_prefs.udp_out_range =
+                            state.read(cx).value().trim().to_string();
+                        this.state.save();
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter { .. } | InputEvent::Blur => {
+                        this.state.desync_prefs.udp_out_range =
+                            state.read(cx).value().trim().to_string();
+                        this.state.save();
+                        this.reconnect_if_active();
+                        cx.notify();
+                    }
+                    _ => {}
+                },
+            ),
+            cx.subscribe_in(
+                &udp_fake_payload_input_state,
+                window,
+                |this, state, event, _, cx| match event {
+                    InputEvent::Change => {
+                        this.state.desync_prefs.udp_fake_payload =
+                            state.read(cx).value().trim().to_string();
+                        this.state.save();
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter { .. } | InputEvent::Blur => {
+                        this.state.desync_prefs.udp_fake_payload =
+                            state.read(cx).value().trim().to_string();
+                        this.state.save();
+                        this.reconnect_if_active();
+                        cx.notify();
+                    }
+                    _ => {}
+                },
+            ),
+            cx.subscribe_in(
+                &desync_probe_input_state,
+                window,
+                |this, state, event, _, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        this.desync_probe_domain = state.read(cx).value().trim().to_string();
+                        cx.notify();
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &diag_target_input_state,
+                window,
+                |this, state, event, _, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        this.diag_target = state.read(cx).value().trim().to_string();
+                        cx.notify();
+                    }
+                },
+            ),
         ];
+
+        crate::tray::register_main_window();
+        crate::tray::update_status(false, is_en);
+        let ctt_flag = close_to_tray_flag.clone();
+        let eq_close = event_queue.clone();
+        window.on_window_should_close(cx, move |_window, _cx| {
+            if ctt_flag.load(Ordering::Acquire) && crate::tray::hide_to_tray() {
+                return false;
+            }
+            if let Ok(mut g) = eq_close.lock() {
+                g.push("tray:exit".to_string());
+            }
+            false
+        });
 
         let mut app = Self {
             state,
@@ -381,10 +584,17 @@ impl TachyonApp {
             server_search_input,
             route_search_input,
             custom_rule_input,
+            custom_rule_tw_input,
             node_uri_input_state,
             node_name_input_state,
             sub_url_input_state,
             custom_dns_input_state,
+            ntp_server_input_state,
+            fake_sni_input_state,
+            udp_out_range_input_state,
+            udp_fake_payload_input_state,
+            desync_probe_input_state,
+            diag_target_input_state,
             pasted_multiline_uri: None,
             _input_subscriptions: subs,
             vpn_status: "disconnected".to_string(),
@@ -412,6 +622,7 @@ impl TachyonApp {
             custom_rule_type: "domain".to_string(),
             custom_rule_value: String::new(),
             custom_rule_action: "vpn".to_string(),
+            custom_rule_time_window: String::new(),
             collapsed_countries: HashSet::new(),
             connections: Vec::new(),
             running_apps: Vec::new(),
@@ -424,10 +635,21 @@ impl TachyonApp {
             toast: None,
             update_banner: UpdateBanner::default(),
             last_conns_poll: Instant::now(),
-            focus_handle: cx.focus_handle(),
             live_rtt_ms: None,
             last_auto_ping: Instant::now(),
             auto_ping_busy: None,
+            close_to_tray_flag,
+            desync_probe_domain: "www.youtube.com".to_string(),
+            desync_probe_busy: false,
+            desync_probe_report: None,
+            adaptive_snapshot: core_runtime::outbound::desync::gui_snapshot_learned_domains(),
+            adaptive_l3_scores: core_runtime::outbound::desync::gui_snapshot_l3_scores().to_vec(),
+            traffic_flight_mode: false,
+            flight_entries: Vec::new(),
+            diag_target: "youtube.com".to_string(),
+            diag_busy: false,
+            inspector_report: None,
+            memory_report: None,
         };
 
         // Initial background tasks
@@ -466,6 +688,26 @@ impl TachyonApp {
         self.toast = Some((msg.into(), Instant::now()));
     }
 
+    pub fn quit_app(&mut self) {
+        let v = self.vpn.clone();
+        self.rt.block_on(async move {
+            v.disconnect().await;
+        });
+        crate::tray::shutdown();
+        std::process::exit(0);
+    }
+
+    pub fn refresh_adaptive_brain(&mut self) {
+        self.adaptive_snapshot = core_runtime::outbound::desync::gui_snapshot_learned_domains();
+        self.adaptive_l3_scores = core_runtime::outbound::desync::gui_snapshot_l3_scores().to_vec();
+    }
+
+    fn current_desync_options(&self) -> crate::vpn::DesyncOptions {
+        crate::vpn::ConnectOptions::parse(&self.state.build_connect_payload(None))
+            .map(|c| c.desync)
+            .unwrap_or_default()
+    }
+
     pub fn drain_backend_events(&mut self, cx: &mut Context<Self>) {
         let mut drained = Vec::new();
         if let Ok(mut guard) = self.event_queue.lock() {
@@ -483,7 +725,9 @@ impl TachyonApp {
         }
         if self.vpn_status == "connected" {
             needs_notify = true;
-            if self.tab == Tab::Traffic && self.last_conns_poll.elapsed() >= Duration::from_millis(1800) {
+            if self.tab == Tab::Traffic
+                && self.last_conns_poll.elapsed() >= Duration::from_millis(1800)
+            {
                 self.last_conns_poll = Instant::now();
                 let v = self.vpn.clone();
                 let eq = self.event_queue.clone();
@@ -647,6 +891,10 @@ impl TachyonApp {
                 .or_else(|| msg.strip_prefix("sub:"))
             {
                 self.handle_subscription_result(sub_str);
+            } else if msg == "tray:toggle-vpn" {
+                self.toggle_connection();
+            } else if msg == "tray:exit" {
+                self.quit_app();
             } else if let Some(warp_str) = msg.strip_prefix("warp:result:") {
                 if let Ok(doc) = serde_json::from_str::<Value>(warp_str) {
                     if doc.get("ok").and_then(Value::as_bool) == Some(true) {
@@ -656,7 +904,17 @@ impl TachyonApp {
                                 .and_then(Value::as_str)
                                 .unwrap_or("Cloudflare WARP (AmneziaWG)");
                             self.add_single_server_uri(uri, Some(name));
-                            self.show_toast("Профиль Cloudflare WARP (AWG) создан и выбран");
+                            if let Some(m_uri) = doc
+                                .get("masque_uri")
+                                .and_then(Value::as_str)
+                                .filter(|s| !s.trim().is_empty())
+                            {
+                                self.add_single_server_uri(m_uri, Some("Cloudflare WARP (MASQUE)"));
+                            }
+                            self.show_toast(self.tr(
+                                "Профиль Cloudflare WARP создан и добавлен",
+                                "Cloudflare WARP profile created and added",
+                            ));
                         }
                     } else {
                         let e = doc
@@ -732,14 +990,10 @@ impl TachyonApp {
                                 .or_else(|| item.get("upload"))
                                 .and_then(Value::as_u64)
                                 .unwrap_or(0);
-                            let direct = item
-                                .get("direct")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false);
-                            let desync = item
-                                .get("desync")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false);
+                            let direct =
+                                item.get("direct").and_then(Value::as_bool).unwrap_or(false);
+                            let desync =
+                                item.get("desync").and_then(Value::as_bool).unwrap_or(false);
                             let chain = if direct {
                                 "DIRECT".to_string()
                             } else if desync {
@@ -779,10 +1033,7 @@ impl TachyonApp {
                                         .and_then(Value::as_str)
                                 })
                                 .unwrap_or("");
-                            let port_str = item
-                                .get("port")
-                                .and_then(Value::as_str)
-                                .unwrap_or("");
+                            let port_str = item.get("port").and_then(Value::as_str).unwrap_or("");
                             let ip_port = if !ip_raw.is_empty() && !port_str.is_empty() {
                                 format!("{ip_raw}:{port_str}")
                             } else if !ip_raw.is_empty() {
@@ -813,7 +1064,9 @@ impl TachyonApp {
                                 .filter(|s| !s.is_empty())
                                 .or_else(|| {
                                     item.get("metadata").and_then(|m| {
-                                        m.get("processPath").or_else(|| m.get("process")).and_then(Value::as_str)
+                                        m.get("processPath")
+                                            .or_else(|| m.get("process"))
+                                            .and_then(Value::as_str)
                                     })
                                 })
                                 .unwrap_or("system")
@@ -1018,8 +1271,164 @@ impl TachyonApp {
                     let total = doc.get("total").and_then(Value::as_u64).unwrap_or(0);
                     self.show_toast(format!("Списки маршрутов обновлены ({ok}/{total})"));
                 }
+            } else if let Some(ps) = msg.strip_prefix("probe:stream:") {
+                self.desync_probe_busy = false;
+                self.refresh_adaptive_brain();
+                if let Ok(doc) = serde_json::from_str::<Value>(ps) {
+                    if let Some(err) = doc.get("error").and_then(Value::as_str) {
+                        self.desync_probe_report = Some(format!("HTTPS-поток: {err}"));
+                    } else {
+                        let ok = doc.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                        let v32 = doc
+                            .get("verified_32k")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        let st = doc.get("status").and_then(Value::as_str).unwrap_or("—");
+                        let rtt = doc.get("rtt_ms").and_then(Value::as_u64).unwrap_or(0);
+                        let rx = doc.get("rx_app_bytes").and_then(Value::as_u64).unwrap_or(0);
+                        let reason = doc
+                            .get("block_reason")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let detail = doc.get("detail").and_then(Value::as_str).unwrap_or("");
+                        self.desync_probe_report = Some(format!(
+                            "HTTPS: {} · 32K={} · {st} · {rtt} ms · rx={rx} B{}{}",
+                            if ok { "OK" } else { "FAIL" },
+                            if v32 { "да" } else { "нет" },
+                            if reason.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" · {reason}")
+                            },
+                            if detail.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" ({detail})")
+                            },
+                        ));
+                    }
+                }
+            } else if let Some(pt) = msg.strip_prefix("probe:ttl:") {
+                self.desync_probe_busy = false;
+                if let Ok(doc) = serde_json::from_str::<Value>(pt) {
+                    if let Some(err) = doc.get("error").and_then(Value::as_str) {
+                        self.desync_probe_report = Some(format!("TTL: {err}"));
+                    } else {
+                        let ttl = doc.get("optimal_ttl").and_then(Value::as_u64).unwrap_or(0);
+                        let summary = doc.get("summary").and_then(Value::as_str).unwrap_or("");
+                        self.desync_probe_report = Some(format!("Optimal TTL={ttl} · {summary}"));
+                    }
+                }
+            } else if let Some(dr) = msg.strip_prefix("diag:route:") {
+                self.diag_busy = false;
+                if let Ok(doc) = serde_json::from_str::<Value>(dr) {
+                    if let Some(err) = doc.get("error").and_then(Value::as_str) {
+                        self.inspector_report = Some(format!("Route Check: {err}"));
+                    } else {
+                        let tgt = doc.get("target").and_then(Value::as_str).unwrap_or("—");
+                        let out = doc
+                            .get("effective_outbound")
+                            .or_else(|| doc.get("outbound"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("—");
+                        let rule = doc
+                            .get("matched_rule")
+                            .and_then(Value::as_str)
+                            .unwrap_or("final");
+                        let advice = doc
+                            .pointer("/probe/advice")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        self.inspector_report = Some(format!(
+                            "{tgt} -> {out} ({rule}){}",
+                            if advice.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" · {advice}")
+                            }
+                        ));
+                    }
+                }
+            } else if let Some(dd) = msg.strip_prefix("diag:dns:") {
+                self.diag_busy = false;
+                if let Ok(doc) = serde_json::from_str::<Value>(dd) {
+                    if let Some(err) = doc.get("error").and_then(Value::as_str) {
+                        self.inspector_report = Some(format!("DNS Check: {err}"));
+                    } else {
+                        let dom = doc.get("domain").and_then(Value::as_str).unwrap_or("—");
+                        let st = doc.get("status").and_then(Value::as_str).unwrap_or("—");
+                        let adv = doc.get("advice").and_then(Value::as_str).unwrap_or("");
+                        self.inspector_report = Some(format!("DNS {dom}: {st} ({adv})"));
+                    }
+                }
+            } else if let Some(dl) = msg.strip_prefix("diag:leak:") {
+                self.diag_busy = false;
+                if let Ok(doc) = serde_json::from_str::<Value>(dl) {
+                    if let Some(err) = doc.get("error").and_then(Value::as_str) {
+                        self.inspector_report = Some(format!("Leak Audit: {err}"));
+                    } else {
+                        let st = doc.get("status").and_then(Value::as_str).unwrap_or("—");
+                        let v4 = doc
+                            .pointer("/ipv4/outbound")
+                            .and_then(Value::as_str)
+                            .unwrap_or("—");
+                        let v6 = doc
+                            .pointer("/ipv6/outbound")
+                            .and_then(Value::as_str)
+                            .unwrap_or("—");
+                        let stun = doc
+                            .pointer("/webrtc_stun/outbound")
+                            .and_then(Value::as_str)
+                            .unwrap_or("—");
+                        let dns_ok = doc
+                            .pointer("/dns/engine_enabled")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        self.inspector_report = Some(format!(
+                            "Audit={st} · IPv4:{v4} · IPv6:{v6} · STUN:{stun} · DNS:{}",
+                            if dns_ok { "on" } else { "off" }
+                        ));
+                    }
+                }
+            } else if let Some(dm) = msg.strip_prefix("diag:mem:") {
+                self.diag_busy = false;
+                if let Ok(doc) = serde_json::from_str::<Value>(dm) {
+                    if let Some(err) = doc.get("error").and_then(Value::as_str) {
+                        self.show_toast(format!("Memory: {err}"));
+                    } else {
+                        let rss = doc.get("rss_bytes").and_then(Value::as_u64).unwrap_or(0);
+                        let lvl = doc
+                            .get("pressure_level")
+                            .and_then(Value::as_str)
+                            .unwrap_or("normal");
+                        let conns = doc
+                            .pointer("/connections/active_connections")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        let fk = doc
+                            .pointer("/dns/fakeip_entries")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        self.memory_report = Some(doc.clone());
+                        self.inspector_report = Some(format!(
+                            "RSS: {} · Pressure: {lvl} · Conns: {conns} · FakeIP: {fk}",
+                            format_bytes_human(rss)
+                        ));
+                    }
+                }
+            } else if let Some(fl) = msg.strip_prefix("diag:flight:") {
+                if let Ok(doc) = serde_json::from_str::<Value>(fl) {
+                    if let Some(arr) = doc.get("entries").and_then(Value::as_array) {
+                        self.flight_entries = arr.clone();
+                    }
+                }
+            } else if msg == "diag:flight:cleared" {
+                self.flight_entries.clear();
+                self.show_toast(self.tr("Журнал соединений очищен", "Flight log cleared"));
             }
         }
+
+        crate::tray::update_status(self.vpn_status == "connected", self.is_en());
 
         if needs_notify {
             cx.notify();
@@ -1038,7 +1447,9 @@ impl TachyonApp {
                 self.state.desync_prefs.enabled = true;
                 self.state.vpn_prefs.route = "desync".to_string();
                 self.state.save();
-                self.show_toast("Запуск в режиме прямой пакетной десинхронизации (Desync) без прокси-сервера");
+                self.show_toast(
+                    "Запуск в режиме прямой пакетной десинхронизации (Desync) без прокси-сервера",
+                );
             }
             let payload = self.state.build_connect_payload(None);
             let v = self.vpn.clone();
@@ -1203,8 +1614,9 @@ impl TachyonApp {
 
     pub fn toggle_auto_ping(&mut self) {
         self.state.auto_ping.enabled = !self.state.auto_ping.enabled;
-        self.last_auto_ping =
-            Instant::now().checked_sub(Duration::from_secs(3600)).unwrap_or_else(Instant::now);
+        self.last_auto_ping = Instant::now()
+            .checked_sub(Duration::from_secs(3600))
+            .unwrap_or_else(Instant::now);
         self.state.save();
     }
 
@@ -1424,7 +1836,8 @@ impl TachyonApp {
                     .to_string();
                 if !is_remote_sub && arr.len() == 1 && !handle.is_empty() && handle != "Подписка"
                 {
-                    if name.starts_with("Узел #") || name == "WireGuard" || name == "AmneziaWG" {
+                    if name.starts_with("Узел #") || name == "WireGuard" || name == "AmneziaWG"
+                    {
                         name = handle.clone();
                     }
                 }
@@ -1530,9 +1943,18 @@ impl TachyonApp {
 
     pub fn submit_custom_rule_ui(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let raw = self.custom_rule_input.read(cx).value().to_string();
+        self.custom_rule_time_window = self
+            .custom_rule_tw_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
         if self.apply_custom_rules_raw(&raw) {
             self.custom_rule_value.clear();
+            self.custom_rule_time_window.clear();
             self.custom_rule_input
+                .update(cx, |s, cx| s.set_value("", window, cx));
+            self.custom_rule_tw_input
                 .update(cx, |s, cx| s.set_value("", window, cx));
         }
     }
@@ -1559,6 +1981,7 @@ impl TachyonApp {
                 .find(|r| r.rule_type == rtype && r.value.eq_ignore_ascii_case(&val))
             {
                 existing.action = self.custom_rule_action.clone();
+                existing.time_window = self.custom_rule_time_window.clone();
             } else {
                 let id = format!("rule-{next_num}");
                 next_num += 1;
@@ -1567,6 +1990,7 @@ impl TachyonApp {
                     rule_type: rtype,
                     value: val,
                     action: self.custom_rule_action.clone(),
+                    time_window: self.custom_rule_time_window.clone(),
                 });
             }
         }
@@ -1599,12 +2023,7 @@ impl TachyonApp {
     }
 
     pub fn submit_sub_url_ui(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let url = self
-            .sub_url_input_state
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
+        let url = self.sub_url_input_state.read(cx).value().trim().to_string();
         if !url.is_empty() {
             self.add_single_server_uri(&url, None);
             self.sub_url_input.clear();
@@ -1669,12 +2088,34 @@ fn strip_url_to_host(raw: &str) -> String {
 
 pub fn parse_custom_rule_entries(selected_type: &str, raw: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
+    let sel = selected_type.trim().to_ascii_lowercase();
+    if sel == "domain_regex" || sel == "regex" {
+        for line in raw.lines() {
+            let pat = line.trim();
+            if !pat.is_empty() && regex::Regex::new(pat).is_ok() {
+                out.push(("domain_regex".to_string(), pat.to_string()));
+            }
+        }
+        return out;
+    }
     for part in raw.split([',', ';', '\n']) {
         let token = part.trim();
         if token.is_empty() {
             continue;
         }
-        let sel = selected_type.trim().to_ascii_lowercase();
+        if sel == "port" || sel == "port_range" {
+            let norm = token.replace('-', ":");
+            if let Some((a, b)) = norm.split_once(':') {
+                if a.trim().parse::<u16>().is_ok() && b.trim().parse::<u16>().is_ok() {
+                    out.push(("port".to_string(), format!("{}:{}", a.trim(), b.trim())));
+                }
+            } else if let Ok(p) = token.parse::<u16>()
+                && p > 0
+            {
+                out.push(("port".to_string(), p.to_string()));
+            }
+            continue;
+        }
         if sel == "cidr" || sel == "ip" {
             out.push(("cidr".to_string(), token.to_string()));
             continue;
@@ -1798,75 +2239,83 @@ fn render_flag_badge(cc: &str, size_px: f32, t: Theme) -> AnyElement {
 }
 
 impl TachyonApp {
-    fn render_titlebar(&self, t: Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_titlebar(
+        &self,
+        m: LayoutMetrics,
+        t: Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let app_ver = env!("CARGO_PKG_VERSION");
-        let titlebar_drag = div()
-            .id("titlebar-drag")
-            .flex_1()
-            .h_full()
-            .pl(px(14.0))
-            .pr(px(8.0))
-            .flex()
-            .items_center()
-            .gap(px(10.0))
-            .window_control_area(WindowControlArea::Drag)
-            .child(
-                div()
-                    .w(px(26.0))
-                    .h(px(26.0))
-                    .rounded(px(7.0))
-                    .bg(t.accent_bg)
-                    .border_1()
-                    .border_color(t.accent_border)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        svg()
-                            .path("icons/bolt.svg")
-                            .size(px(14.0))
-                            .text_color(t.accent),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .child(
-                                div()
-                                    .text_size(px(13.0))
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(t.text)
-                                    .child("Tachyon"),
-                            )
-                            .child(
-                                div()
-                                    .px(px(5.0))
-                                    .py(px(1.0))
-                                    .rounded(px(4.0))
-                                    .bg(t.bg_elev)
-                                    .border_1()
-                                    .border_color(t.border)
-                                    .text_size(px(10.0))
-                                    .text_color(t.text_dim)
-                                    .child(app_ver),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.0))
-                            .text_color(t.text_mute)
-                            .child(self.tr(
-                                "Маршрутизация и туннелирование",
-                                "Routing & Tunneling Engine",
-                            )),
-                    ),
-            );
+        let titlebar_drag =
+            div()
+                .id("titlebar-drag")
+                .flex_1()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .h_full()
+                .pl(px(if m.narrow { 10.0 } else { 14.0 }))
+                .pr(px(8.0))
+                .flex()
+                .items_center()
+                .gap(px(if m.narrow { 8.0 } else { 10.0 }))
+                .window_control_area(WindowControlArea::Drag)
+                .child(
+                    div()
+                        .w(px(26.0))
+                        .h(px(26.0))
+                        .rounded(px(7.0))
+                        .bg(t.accent_bg)
+                        .border_1()
+                        .border_color(t.accent_border)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            svg()
+                                .path("icons/bolt.svg")
+                                .size(px(14.0))
+                                .text_color(t.accent),
+                        ),
+                )
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(
+                                    div()
+                                        .text_size(px(13.0))
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(t.text)
+                                        .child("Tachyon"),
+                                )
+                                .child(
+                                    div()
+                                        .px(px(5.0))
+                                        .py(px(1.0))
+                                        .rounded(px(4.0))
+                                        .bg(t.bg_elev)
+                                        .border_1()
+                                        .border_color(t.border)
+                                        .text_size(px(10.0))
+                                        .text_color(t.text_dim)
+                                        .child(app_ver),
+                                ),
+                        )
+                        .when(!m.narrow, |el| {
+                            el.child(div().text_size(px(10.0)).text_color(t.text_mute).child(
+                                self.tr(
+                                    "Маршрутизация и туннелирование",
+                                    "Routing & Tunneling Engine",
+                                ),
+                            ))
+                        }),
+                );
 
         #[cfg(not(target_os = "windows"))]
         let titlebar_drag =
@@ -1890,8 +2339,9 @@ impl TachyonApp {
             .child(titlebar_drag)
             .child(
                 div()
-                    .pr(px(14.0))
+                    .pr(px(if m.narrow { 8.0 } else { 14.0 }))
                     .h_full()
+                    .flex_shrink_0()
                     .occlude()
                     .flex()
                     .items_center()
@@ -1921,6 +2371,10 @@ impl TachyonApp {
                                 };
                                 this.state.save();
                                 this.sync_input_placeholders(window, cx);
+                                crate::tray::update_status(
+                                    this.vpn_status == "connected",
+                                    this.is_en(),
+                                );
                                 cx.notify();
                             }))
                             .child(if self.is_en() { "EN" } else { "RU" }),
@@ -1953,6 +2407,29 @@ impl TachyonApp {
                                     .text_color(t.text_dim),
                             ),
                     )
+                    .when(cfg!(target_os = "windows"), |el| {
+                        el.child(
+                            div()
+                                .id("btn-win-tray")
+                                .w(px(28.0))
+                                .h(px(26.0))
+                                .rounded(px(6.0))
+                                .hover(|s| s.bg(t.bg_hover))
+                                .cursor_pointer()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .on_click(|_, _, _| {
+                                    let _ = crate::tray::hide_to_tray();
+                                })
+                                .child(
+                                    svg()
+                                        .path("icons/tray.svg")
+                                        .size(px(12.0))
+                                        .text_color(t.text_dim),
+                                ),
+                        )
+                    })
                     .child(
                         div()
                             .id("btn-win-min")
@@ -1964,9 +2441,14 @@ impl TachyonApp {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .on_click(|_, window, _| {
+                            .on_click(cx.listener(|this, _, window, _| {
+                                if this.state.vpn_prefs.minimize_to_tray
+                                    && crate::tray::hide_to_tray()
+                                {
+                                    return;
+                                }
                                 window.minimize_window();
-                            })
+                            }))
                             .child(
                                 svg()
                                     .path("icons/min.svg")
@@ -1986,11 +2468,17 @@ impl TachyonApp {
                             .items_center()
                             .justify_center()
                             .on_click(|_, window, _| {
-                                window.zoom_window();
+                                if !crate::tray::toggle_maximize_window() {
+                                    window.zoom_window();
+                                }
                             })
                             .child(
                                 svg()
-                                    .path("icons/max.svg")
+                                    .path(if m.is_maximized {
+                                        "icons/restore.svg"
+                                    } else {
+                                        "icons/max.svg"
+                                    })
                                     .size(px(11.0))
                                     .text_color(t.text_dim),
                             ),
@@ -2007,11 +2495,11 @@ impl TachyonApp {
                             .items_center()
                             .justify_center()
                             .on_click(cx.listener(|this, _, _, _| {
-                                let v = this.vpn.clone();
-                                this.rt.block_on(async move {
-                                    v.disconnect().await;
-                                });
-                                std::process::exit(0);
+                                if this.state.vpn_prefs.close_to_tray && crate::tray::hide_to_tray()
+                                {
+                                    return;
+                                }
+                                this.quit_app();
                             }))
                             .child(
                                 svg()
@@ -2023,7 +2511,12 @@ impl TachyonApp {
             )
     }
 
-    fn render_navbar(&self, t: Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_navbar(
+        &self,
+        m: LayoutMetrics,
+        t: Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let rules_cnt = self.state.active_rules_count();
         let nodes_cnt = self.state.servers.len();
 
@@ -2063,17 +2556,19 @@ impl TachyonApp {
 
         div()
             .w_full()
-            .px(px(16.0))
+            .px(px(if m.narrow { 10.0 } else { 16.0 }))
             .pt(px(8.0))
             .pb(px(6.0))
             .flex()
             .items_center()
-            .child(
-                div()
-                    .flex_1()
-                    .h(px(36.0))
-                    .window_control_area(WindowControlArea::Drag),
-            )
+            .when(m.width >= 920.0, |el| {
+                el.child(
+                    div()
+                        .flex_1()
+                        .h(px(36.0))
+                        .window_control_area(WindowControlArea::Drag),
+                )
+            })
             .child(
                 div()
                     .w_full()
@@ -2084,6 +2579,7 @@ impl TachyonApp {
                     .border_1()
                     .border_color(t.border)
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(4.0))
                     .children(tabs.into_iter().map(|(tab_id, icon, label, badge)| {
@@ -2091,10 +2587,16 @@ impl TachyonApp {
                         div()
                             .id(SharedString::from(format!("nav-{label}")))
                             .flex_1()
-                            .h(px(32.0))
+                            .min_w(px(if m.narrow { 92.0 } else { 108.0 }))
+                            .h(px(if m.narrow { 30.0 } else { 32.0 }))
+                            .px(px(if m.narrow { 6.0 } else { 8.0 }))
                             .rounded(px(8.0))
                             .cursor_pointer()
-                            .bg(if active { t.bg_elev } else { gpui::rgba(0x00000000) })
+                            .bg(if active {
+                                t.bg_elev
+                            } else {
+                                gpui::rgba(0x00000000)
+                            })
                             .border_1()
                             .border_color(if active {
                                 t.border_hi
@@ -2105,7 +2607,7 @@ impl TachyonApp {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .gap(px(6.0))
+                            .gap(px(if m.narrow { 4.0 } else { 6.0 }))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.tab = tab_id;
                                 if tab_id == Tab::Traffic {
@@ -2130,7 +2632,8 @@ impl TachyonApp {
                             }))
                             .child(
                                 div()
-                                    .text_size(px(12.0))
+                                    .whitespace_nowrap()
+                                    .text_size(px(if m.narrow { 11.5 } else { 12.0 }))
                                     .font_weight(if active {
                                         FontWeight::SEMIBOLD
                                     } else {
@@ -2153,15 +2656,22 @@ impl TachyonApp {
                             })
                     })),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .h(px(36.0))
-                    .window_control_area(WindowControlArea::Drag),
-            )
+            .when(m.width >= 920.0, |el| {
+                el.child(
+                    div()
+                        .flex_1()
+                        .h(px(36.0))
+                        .window_control_area(WindowControlArea::Drag),
+                )
+            })
     }
 
-    fn render_footer(&self, t: Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_footer(
+        &self,
+        m: LayoutMetrics,
+        t: Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let core_ver = option_env!("TACHYON_CORE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
         let dns_label = if self.state.vpn_prefs.dns == "custom"
             && !self.state.vpn_prefs.custom_dns.is_empty()
@@ -2172,34 +2682,37 @@ impl TachyonApp {
         };
 
         div()
-            .h(px(30.0))
+            .min_h(px(30.0))
             .w_full()
-            .px(px(16.0))
+            .px(px(if m.narrow { 10.0 } else { 16.0 }))
+            .py(px(4.0))
             .bg(t.bg)
             .border_t_1()
             .border_color(t.border)
             .flex()
+            .flex_wrap()
             .items_center()
             .justify_between()
+            .gap(px(6.0))
             .text_size(px(11.0))
             .text_color(t.text_dim)
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(8.0))
-                    .child(
-                        div()
-                            .w(px(6.0))
-                            .h(px(6.0))
-                            .rounded(px(3.0))
-                            .bg(if self.vpn_status == "connected" {
-                                t.green
-                            } else {
-                                t.text_mute
-                            }),
-                    )
-                    .child(if self.is_en() {
+                    .min_w(px(0.0))
+                    .child(div().w(px(6.0)).h(px(6.0)).rounded(px(3.0)).bg(
+                        if self.vpn_status == "connected" {
+                            t.green
+                        } else {
+                            t.text_mute
+                        },
+                    ))
+                    .child(if m.narrow {
+                        format!("core {core_ver}")
+                    } else if self.is_en() {
                         format!("Core tachyon-core {core_ver}  ·  DNS: {dns_label}")
                     } else {
                         format!("Ядро tachyon-core {core_ver}  ·  DNS: {dns_label}")
@@ -2208,20 +2721,24 @@ impl TachyonApp {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(10.0))
-                    .child(if self.is_en() {
-                        format!(
-                            "Nodes: {}  ·  Rules: {}",
-                            self.state.servers.len(),
-                            self.state.active_rules_count()
-                        )
-                    } else {
-                        format!(
-                            "Узлов: {}  ·  Правил: {}",
-                            self.state.servers.len(),
-                            self.state.active_rules_count()
-                        )
+                    .min_w(px(0.0))
+                    .when(!m.narrow, |el| {
+                        el.child(if self.is_en() {
+                            format!(
+                                "Nodes: {}  ·  Rules: {}",
+                                self.state.servers.len(),
+                                self.state.active_rules_count()
+                            )
+                        } else {
+                            format!(
+                                "Узлов: {}  ·  Правил: {}",
+                                self.state.servers.len(),
+                                self.state.active_rules_count()
+                            )
+                        })
                     })
                     .child(
                         div()
@@ -2239,10 +2756,25 @@ impl TachyonApp {
             )
     }
 
-    fn render_tunnel_tab(&self, t: Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_tunnel_tab(
+        &self,
+        m: LayoutMetrics,
+        t: Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let is_connected = self.vpn_status == "connected";
         let is_connecting = self.vpn_status == "connecting";
         let active_srv = self.state.active_server().cloned();
+        let stack_tunnel = m.compact || m.short;
+        let left_w = if m.width < 1100.0 { 300.0 } else { 360.0 };
+        let right_w = if stack_tunnel {
+            m.avail_w
+        } else {
+            (m.avail_w - left_w - 14.0).max(320.0)
+        };
+        let grid_w = (right_w - 36.0).max(200.0);
+        let srv_card_w = adaptive_card_width(grid_w, 200.0, 5, 6.0);
+        let stack_telemetry = right_w < 540.0;
 
         let status_label = if is_connected {
             self.tr("Защищено", "Protected")
@@ -2276,18 +2808,12 @@ impl TachyonApp {
                 .push(srv.clone());
         }
 
-        div()
-            .size_full()
-            .px(px(16.0))
-            .py(px(8.0))
-            .flex()
-            .gap(px(14.0))
-            .child(
-                // Left Hero Orb Card (390px)
+        let hero_card =
+                // Left Hero Orb Card
                 div()
-                    .w(px(390.0))
-                    .h_full()
-                    .p(px(18.0))
+                    .when(stack_tunnel, |el| el.w_full().flex_none())
+                    .when(!stack_tunnel, |el| el.w(px(left_w)).h_full())
+                    .p(px(if m.narrow { 14.0 } else { 18.0 }))
                     .rounded(px(16.0))
                     .bg(t.bg_card)
                     .border_1()
@@ -2304,8 +2830,10 @@ impl TachyonApp {
                         div()
                             .w_full()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .justify_between()
+                            .gap(px(6.0))
                             .child(
                                 div()
                                     .px(px(10.0))
@@ -2492,29 +3020,139 @@ impl TachyonApp {
                                     }),
                             )
                             .when_some(self.live_balancer.as_ref().filter(|_| is_connected), |el, lb| {
-                                let cur = lb
-                                    .get("selected")
-                                    .and_then(Value::as_str)
-                                    .filter(|s| !s.is_empty())
-                                    .unwrap_or(self.tr("автовыбор", "auto"));
                                 let mode = lb
                                     .get("mode")
                                     .and_then(Value::as_str)
                                     .unwrap_or("stability");
+                                let cur_owned = lb
+                                    .get("now")
+                                    .or_else(|| lb.get("selected"))
+                                    .and_then(Value::as_str)
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or(self.tr("автовыбор", "auto"))
+                                    .to_string();
+                                let members_all: Vec<String> = lb
+                                    .get("all")
+                                    .and_then(Value::as_array)
+                                    .map(|arr| {
+                                        arr.iter()
+                                            .filter_map(Value::as_str)
+                                            .map(str::to_string)
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
                                 el.child(
                                     div()
-                                        .px(px(8.0))
-                                        .py(px(3.0))
-                                        .rounded(px(6.0))
-                                        .bg(t.accent_bg)
-                                        .border_1()
-                                        .border_color(t.accent_border)
-                                        .text_size(px(10.0))
-                                        .text_color(t.accent)
-                                        .child(if self.is_en() {
-                                            format!("Balancer ({mode}) · Node: {cur}")
-                                        } else {
-                                            format!("Балансировщик ({mode}) · Узел: {cur}")
+                                        .w_full()
+                                        .flex()
+                                        .flex_col()
+                                        .items_center()
+                                        .gap(px(5.0))
+                                        .child(
+                                            div()
+                                                .px(px(8.0))
+                                                .py(px(3.0))
+                                                .rounded(px(6.0))
+                                                .bg(t.accent_bg)
+                                                .border_1()
+                                                .border_color(t.accent_border)
+                                                .text_size(px(10.0))
+                                                .text_color(t.accent)
+                                                .child(if self.is_en() {
+                                                    format!("Balancer ({mode}) · Node: {cur_owned}")
+                                                } else {
+                                                    format!(
+                                                        "Балансировщик ({mode}) · Узел: {cur_owned}"
+                                                    )
+                                                }),
+                                        )
+                                        .when(members_all.len() >= 2, |mel| {
+                                            mel.child(
+                                                div()
+                                                    .w_full()
+                                                    .flex()
+                                                    .flex_wrap()
+                                                    .justify_center()
+                                                    .gap(px(4.0))
+                                                    .children(members_all.into_iter().take(8).map(
+                                                        |mem| {
+                                                            let is_now = mem == cur_owned;
+                                                            let mem_click = mem.clone();
+                                                            div()
+                                                                .id(SharedString::from(format!(
+                                                                    "bal-mem-{mem}"
+                                                                )))
+                                                                .px(px(6.0))
+                                                                .py(px(2.0))
+                                                                .rounded(px(5.0))
+                                                                .cursor_pointer()
+                                                                .bg(if is_now {
+                                                                    t.accent_bg
+                                                                } else {
+                                                                    t.bg_elev
+                                                                })
+                                                                .border_1()
+                                                                .border_color(if is_now {
+                                                                    t.accent_border
+                                                                } else {
+                                                                    t.border
+                                                                })
+                                                                .text_size(px(9.5))
+                                                                .text_color(if is_now {
+                                                                    t.accent
+                                                                } else {
+                                                                    t.text_dim
+                                                                })
+                                                                .on_click(cx.listener(
+                                                                    move |this, _, _, cx| {
+                                                                        let v = this.vpn.clone();
+                                                                        let eq =
+                                                                            this.event_queue.clone();
+                                                                        let tgt = mem_click.clone();
+                                                                        let en = this.is_en();
+                                                                        this.rt.spawn(async move {
+                                                                            let ok = v
+                                                                                .select_balancer_member(
+                                                                                    &tgt,
+                                                                                )
+                                                                                .await;
+                                                                            if ok {
+                                                                                let payload = v
+                                                                                    .check_exit_node_info(
+                                                                                    )
+                                                                                    .await;
+                                                                                if let Ok(mut g) =
+                                                                                    eq.lock()
+                                                                                {
+                                                                                    g.push(format!(
+                                                                                        "exit:geo:{payload}"
+                                                                                    ));
+                                                                                }
+                                                                            } else if let Ok(mut g) =
+                                                                                eq.lock()
+                                                                            {
+                                                                                g.push(format!(
+                                                                                    "error:{}",
+                                                                                    if en {
+                                                                                        "Failed to switch balancer node"
+                                                                                    } else {
+                                                                                        "Не удалось переключить узел балансировщика"
+                                                                                    }
+                                                                                ));
+                                                                            }
+                                                                        });
+                                                                        this.show_toast(if this.is_en() {
+                                                                            format!("Switching to {mem_click}")
+                                                                        } else {
+                                                                            format!("Переключение на {mem_click}")
+                                                                        });
+                                                                        cx.notify();
+                                                                    },
+                                                                ))
+                                                                .child(truncate_str(&mem, 14))
+                                                        },
+                                                    )),
+                                            )
                                         }),
                                 )
                             }),
@@ -2530,6 +3168,7 @@ impl TachyonApp {
                                 div()
                                     .id("btn-active-node-card")
                                     .flex_1()
+                                    .min_w(px(0.0))
                                     .p(px(10.0))
                                     .rounded(px(10.0))
                                     .bg(t.bg_elev)
@@ -2540,12 +3179,15 @@ impl TachyonApp {
                                     .flex()
                                     .items_center()
                                     .justify_between()
+                                    .gap(px(6.0))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.tab = Tab::Nodes;
                                         cx.notify();
                                     }))
                                     .child(
                                         div()
+                                            .flex_1()
+                                            .min_w(px(0.0))
                                             .flex()
                                             .items_center()
                                             .gap(px(10.0))
@@ -2559,19 +3201,21 @@ impl TachyonApp {
                                             ))
                                             .child(
                                                 div()
+                                                    .flex_1()
+                                                    .min_w(px(0.0))
                                                     .flex()
                                                     .flex_col()
                                                     .child(
                                                         div()
+                                                            .w_full()
+                                                            .truncate()
                                                             .text_size(px(12.0))
                                                             .font_weight(FontWeight::SEMIBOLD)
                                                             .text_color(t.text)
                                                             .child(
                                                                 active_srv
                                                                     .as_ref()
-                                                                    .map(|s| {
-                                                                        truncate_str(&s.name, 20)
-                                                                    })
+                                                                    .map(|s| s.name.clone())
                                                                     .unwrap_or_else(|| {
                                                                         self.tr(
                                                                             "Прямой Desync (без узла)",
@@ -2583,6 +3227,8 @@ impl TachyonApp {
                                                     )
                                                     .child(
                                                         div()
+                                                            .w_full()
+                                                            .truncate()
                                                             .text_size(px(10.0))
                                                             .text_color(t.text_dim)
                                                             .child(
@@ -2624,6 +3270,7 @@ impl TachyonApp {
                                         |el, ms| {
                                             el.child(
                                                 div()
+                                                    .flex_shrink_0()
                                                     .px(px(6.0))
                                                     .py(px(2.0))
                                                     .rounded(px(5.0))
@@ -2648,6 +3295,7 @@ impl TachyonApp {
                                     .id("btn-fastest-node")
                                     .w(px(38.0))
                                     .h(px(44.0))
+                                    .flex_shrink_0()
                                     .rounded(px(10.0))
                                     .bg(t.bg_elev)
                                     .border_1()
@@ -2668,13 +3316,14 @@ impl TachyonApp {
                                             .text_color(t.accent),
                                     ),
                             ),
-                    ),
-            )
-            .child(
+                    );
+
+        let right_col =
                 // Right column: Telemetry + Mode + Quick toggles + Server list
                 div()
-                    .flex_1()
-                    .h_full()
+                    .min_w(px(0.0))
+                    .when(!stack_tunnel, |el| el.flex_1().h_full())
+                    .when(stack_tunnel, |el| el.w_full().flex_none())
                     .flex()
                     .flex_col()
                     .gap(px(10.0))
@@ -2683,11 +3332,15 @@ impl TachyonApp {
                         div()
                             .w_full()
                             .flex()
+                            .flex_shrink_0()
+                            .when(stack_telemetry, |el| el.flex_col())
                             .gap(px(10.0))
                             .child(
                                 // Exit Node Card
                                 div()
-                                    .flex_1()
+                                    .when(!stack_telemetry, |el| el.flex_1())
+                                    .when(stack_telemetry, |el| el.w_full().flex_none())
+                                    .min_w(px(0.0))
                                     .p(px(12.0))
                                     .rounded(px(12.0))
                                     .bg(t.bg_card)
@@ -2700,8 +3353,10 @@ impl TachyonApp {
                                         div()
                                             .w_full()
                                             .flex()
+                                            .flex_wrap()
                                             .items_center()
                                             .justify_between()
+                                            .gap(px(4.0))
                                             .child(
                                                 div()
                                                     .text_size(px(11.0))
@@ -2780,16 +3435,21 @@ impl TachyonApp {
                             .child(
                                 // Speed Card
                                 div()
-                                    .flex_1()
+                                    .when(!stack_telemetry, |el| el.flex_1())
+                                    .when(stack_telemetry, |el| el.w_full().flex_none())
+                                    .min_w(px(0.0))
                                     .p(px(12.0))
                                     .rounded(px(12.0))
                                     .bg(t.bg_card)
                                     .border_1()
                                     .border_color(t.border)
                                     .flex()
+                                    .flex_wrap()
                                     .justify_between()
+                                    .gap(px(10.0))
                                     .child(
                                         div()
+                                            .min_w(px(95.0))
                                             .flex()
                                             .flex_col()
                                             .gap(px(4.0))
@@ -2823,6 +3483,7 @@ impl TachyonApp {
                                     )
                                     .child(
                                         div()
+                                            .min_w(px(95.0))
                                             .flex()
                                             .flex_col()
                                             .gap(px(4.0))
@@ -2860,6 +3521,7 @@ impl TachyonApp {
                         // Routing Mode Segmented Bar
                         div()
                             .w_full()
+                            .flex_shrink_0()
                             .p(px(10.0))
                             .rounded(px(12.0))
                             .bg(t.bg_card)
@@ -2872,8 +3534,10 @@ impl TachyonApp {
                                 div()
                                     .w_full()
                                     .flex()
+                                    .flex_wrap()
                                     .items_center()
                                     .justify_between()
+                                    .gap(px(6.0))
                                     .child(
                                         div()
                                             .text_size(px(11.0))
@@ -2901,6 +3565,7 @@ impl TachyonApp {
                                     .rounded(px(8.0))
                                     .bg(t.bg_elev)
                                     .flex()
+                                    .flex_wrap()
                                     .gap(px(3.0))
                                     .children(
                                         [
@@ -2915,7 +3580,10 @@ impl TachyonApp {
                                             div()
                                                 .id(SharedString::from(format!("route-seg-{code}")))
                                                 .flex_1()
+                                                .min_w(px(88.0))
                                                 .h(px(26.0))
+                                                .px(px(6.0))
+                                                .whitespace_nowrap()
                                                 .rounded(px(6.0))
                                                 .cursor_pointer()
                                                 .bg(if active {
@@ -2958,11 +3626,14 @@ impl TachyonApp {
                         div()
                             .w_full()
                             .flex()
+                            .flex_shrink_0()
+                            .flex_wrap()
                             .gap(px(10.0))
                             .child(
                                 div()
                                     .id("card-quick-desync")
                                     .flex_1()
+                                    .min_w(px(150.0))
                                     .p(px(10.0))
                                     .rounded(px(10.0))
                                     .bg(t.bg_card)
@@ -2986,6 +3657,7 @@ impl TachyonApp {
                                         svg()
                                             .path("icons/bolt.svg")
                                             .size(px(14.0))
+                                            .flex_shrink_0()
                                             .text_color(if self.state.desync_prefs.enabled {
                                                 t.amber
                                             } else {
@@ -2994,6 +3666,8 @@ impl TachyonApp {
                                     )
                                     .child(
                                         div()
+                                            .flex_1()
+                                            .min_w(px(0.0))
                                             .flex()
                                             .flex_col()
                                             .child(
@@ -3023,6 +3697,7 @@ impl TachyonApp {
                                 div()
                                     .id("card-quick-stack")
                                     .flex_1()
+                                    .min_w(px(150.0))
                                     .p(px(10.0))
                                     .rounded(px(10.0))
                                     .bg(t.bg_card)
@@ -3050,10 +3725,13 @@ impl TachyonApp {
                                         svg()
                                             .path("icons/globe.svg")
                                             .size(px(14.0))
+                                            .flex_shrink_0()
                                             .text_color(t.accent),
                                     )
                                     .child(
                                         div()
+                                            .flex_1()
+                                            .min_w(px(0.0))
                                             .flex()
                                             .flex_col()
                                             .child(
@@ -3079,6 +3757,7 @@ impl TachyonApp {
                                 div()
                                     .id("card-quick-ks")
                                     .flex_1()
+                                    .min_w(px(150.0))
                                     .p(px(10.0))
                                     .rounded(px(10.0))
                                     .bg(t.bg_card)
@@ -3103,6 +3782,7 @@ impl TachyonApp {
                                         svg()
                                             .path("icons/lock.svg")
                                             .size(px(14.0))
+                                            .flex_shrink_0()
                                             .text_color(if self.state.vpn_prefs.kill_switch {
                                                 t.red
                                             } else {
@@ -3111,6 +3791,8 @@ impl TachyonApp {
                                     )
                                     .child(
                                         div()
+                                            .flex_1()
+                                            .min_w(px(0.0))
                                             .flex()
                                             .flex_col()
                                             .child(
@@ -3140,7 +3822,8 @@ impl TachyonApp {
                     .child(
                         // Servers & Locations Card
                         div()
-                            .flex_1()
+                            .when(!stack_tunnel, |el| el.flex_1().min_h(px(200.0)))
+                            .when(stack_tunnel, |el| el.h(px(340.0)).flex_none())
                             .w_full()
                             .p(px(12.0))
                             .rounded(px(12.0))
@@ -3155,6 +3838,7 @@ impl TachyonApp {
                                 div()
                                     .w_full()
                                     .flex()
+                                    .flex_wrap()
                                     .items_center()
                                     .justify_between()
                                     .gap(px(8.0))
@@ -3187,12 +3871,15 @@ impl TachyonApp {
                                     .child(
                                         div()
                                             .flex()
+                                            .flex_wrap()
                                             .items_center()
                                             .gap(px(6.0))
                                             .child(
                                                 div()
                                                     .id("input-srv-search")
-                                                    .w(px(176.0))
+                                                    .flex_1()
+                                                    .min_w(px(120.0))
+                                                    .max_w(px(200.0))
                                                     .h(px(26.0))
                                                     .child(
                                                         styled_input(
@@ -3311,12 +3998,16 @@ impl TachyonApp {
                                 div()
                                     .id("tunnel-servers-scroll")
                                     .flex_1()
+                                    .min_h(px(0.0))
                                     .w_full()
                                     .overflow_y_scroll()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(6.0))
-                                    .children(by_country.into_iter().map(|(cc, list)| {
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(6.0))
+                                            .children(by_country.into_iter().map(|(cc, list)| {
                                         let collapsed = self.collapsed_countries.contains(&cc);
                                         let cc_toggle = cc.clone();
                                         let cc_ping = cc.clone();
@@ -3337,6 +4028,7 @@ impl TachyonApp {
                                                         "country-hdr-{cc}"
                                                     )))
                                                     .w_full()
+                                                    .min_w(px(0.0))
                                                     .h(px(30.0))
                                                     .px(px(10.0))
                                                     .rounded(px(8.0))
@@ -3345,6 +4037,7 @@ impl TachyonApp {
                                                     .flex()
                                                     .items_center()
                                                     .justify_between()
+                                                    .gap(px(6.0))
                                                     .on_click(cx.listener(move |this, _, _, cx| {
                                                         if !this
                                                             .collapsed_countries
@@ -3357,12 +4050,15 @@ impl TachyonApp {
                                                     }))
                                                     .child(
                                                         div()
+                                                            .flex_1()
+                                                            .min_w(px(0.0))
                                                             .flex()
                                                             .items_center()
                                                             .gap(px(8.0))
                                                             .child(render_flag_badge(&cc, 18.0, t))
                                                             .child(
                                                                 div()
+                                                                    .truncate()
                                                                     .text_size(px(11.5))
                                                                     .font_weight(
                                                                         FontWeight::SEMIBOLD,
@@ -3372,6 +4068,7 @@ impl TachyonApp {
                                                             )
                                                             .child(
                                                                 div()
+                                                                    .flex_shrink_0()
                                                                     .px(px(5.0))
                                                                     .rounded(px(4.0))
                                                                     .bg(t.bg_card)
@@ -3382,6 +4079,7 @@ impl TachyonApp {
                                                     )
                                                     .child(
                                                         div()
+                                                            .flex_shrink_0()
                                                             .flex()
                                                             .items_center()
                                                             .gap(px(6.0))
@@ -3485,7 +4183,7 @@ impl TachyonApp {
                                                                     "srv-chip-{}",
                                                                     srv.id
                                                                 )))
-                                                                .w(px(236.0))
+                                                                .w(px(srv_card_w))
                                                                 .p(px(8.0))
                                                                 .rounded(px(8.0))
                                                                 .bg(if is_sel {
@@ -3502,6 +4200,7 @@ impl TachyonApp {
                                                                 .flex()
                                                                 .items_center()
                                                                 .justify_between()
+                                                                .gap(px(4.0))
                                                                 .child(
                                                                     div()
                                                                         .id(SharedString::from(
@@ -3511,6 +4210,7 @@ impl TachyonApp {
                                                                             ),
                                                                         ))
                                                                         .flex_1()
+                                                                        .min_w(px(0.0))
                                                                         .cursor_pointer()
                                                                         .flex()
                                                                         .items_center()
@@ -3531,21 +4231,22 @@ impl TachyonApp {
                                                                         ))
                                                                         .child(
                                                                             div()
+                                                                                .flex_1()
+                                                                                .min_w(px(0.0))
+                                                                                .truncate()
                                                                                 .text_size(px(11.0))
                                                                                 .font_weight(
                                                                                     FontWeight::MEDIUM,
                                                                                 )
                                                                                 .text_color(t.text)
                                                                                 .child(
-                                                                                    truncate_str(
-                                                                                        &srv.name,
-                                                                                        16,
-                                                                                    ),
+                                                                                    srv.name.clone(),
                                                                                 ),
                                                                         ),
                                                                 )
                                                                 .child(
                                                                     div()
+                                                                        .flex_shrink_0()
                                                                         .flex()
                                                                         .items_center()
                                                                         .gap(px(4.0))
@@ -3622,20 +4323,51 @@ impl TachyonApp {
                                                                                                         format!("{ms}мс")
                                                                                                     }
                                                                                                 }
-                                                                                                Some(_) => "×".to_string(),
-                                                                                                None => "⚡".to_string(),
-                                                                                            },
-                                                                                        ),
+                                                                                                                        Some(_) => "×".to_string(),
+                                                                                        None => "—".to_string(),
+                                                                                    },
                                                                                 ),
                                                                         ),
                                                                 )
+                                                            )
                                                         })),
                                                 )
                                             })
                                     })),
+                                    ),
                             ),
-                    ),
-            )
+                    );
+
+        if stack_tunnel {
+            div()
+                .id("tunnel-scroll")
+                .size_full()
+                .overflow_y_scroll()
+                .child(
+                    div()
+                        .w_full()
+                        .px(px(if m.narrow { 10.0 } else { 16.0 }))
+                        .py(px(8.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(10.0))
+                        .child(hero_card)
+                        .child(right_col),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .id("tunnel-scroll")
+                .size_full()
+                .px(px(if m.narrow { 10.0 } else { 16.0 }))
+                .py(px(8.0))
+                .flex()
+                .flex_row()
+                .gap(px(14.0))
+                .child(hero_card)
+                .child(right_col)
+                .into_any_element()
+        }
     }
 }
 
@@ -3649,54 +4381,71 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
 }
 
 impl TachyonApp {
-    fn render_desync_tab(&self, t: Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_desync_tab(
+        &self,
+        m: LayoutMetrics,
+        t: Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let d = &self.state.desync_prefs;
+        let preset_w = adaptive_card_width(m.avail_w - 8.0, 175.0, 5, 8.0);
 
         div()
             .id("desync-scroll")
             .size_full()
-            .px(px(16.0))
-            .py(px(8.0))
             .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .gap(px(10.0))
             .child(
-                // Header card
                 div()
                     .w_full()
-                    .p(px(12.0))
-                    .rounded(px(12.0))
-                    .bg(t.bg_card)
-                    .border_1()
-                    .border_color(if d.enabled { t.amber_border } else { t.border })
+                    .px(px(if m.narrow { 10.0 } else { 16.0 }))
+                    .py(px(8.0))
                     .flex()
-                    .items_center()
-                    .justify_between()
+                    .flex_col()
+                    .gap(px(10.0))
                     .child(
+                        // Header card
                         div()
+                            .w_full()
+                            .p(px(12.0))
+                            .rounded(px(12.0))
+                            .bg(t.bg_card)
+                            .border_1()
+                            .border_color(if d.enabled { t.amber_border } else { t.border })
                             .flex()
+                            .flex_wrap()
                             .items_center()
-                            .gap(px(12.0))
+                            .justify_between()
+                            .gap(px(8.0))
                             .child(
                                 div()
-                                    .w(px(36.0))
-                                    .h(px(36.0))
-                                    .rounded(px(9.0))
-                                    .bg(if d.enabled { t.amber_bg } else { t.bg_elev })
+                                    .flex_1()
+                                    .min_w(px(200.0))
                                     .flex()
                                     .items_center()
-                                    .justify_center()
-                                    .child(svg().path("icons/bolt.svg").size(px(18.0)).text_color(
-                                        if d.enabled { t.amber } else { t.text_dim },
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
+                                    .gap(px(12.0))
                                     .child(
                                         div()
+                                            .w(px(36.0))
+                                            .h(px(36.0))
+                                            .flex_shrink_0()
+                                            .rounded(px(9.0))
+                                            .bg(if d.enabled { t.amber_bg } else { t.bg_elev })
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(svg().path("icons/bolt.svg").size(px(18.0)).text_color(
+                                                if d.enabled { t.amber } else { t.text_dim },
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .flex()
+                                            .flex_col()
+                                    .child(
+                                        div()
+                                            .w_full()
                                             .text_size(px(14.0))
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(t.text)
@@ -3707,6 +4456,7 @@ impl TachyonApp {
                                     )
                                     .child(
                                         div()
+                                            .w_full()
                                             .text_size(px(11.0))
                                             .text_color(t.text_dim)
                                             .child(self.tr(
@@ -3718,7 +4468,9 @@ impl TachyonApp {
                     )
                     .child(
                         div()
+                            .flex_shrink_0()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .gap(px(8.0))
                             .child(
@@ -3777,6 +4529,7 @@ impl TachyonApp {
                 div()
                     .w_full()
                     .flex()
+                    .flex_wrap()
                     .gap(px(8.0))
                     .children(
                         [
@@ -3826,7 +4579,7 @@ impl TachyonApp {
                             let active = d.preset == pid || (pid == "auto" && d.preset == "adaptive");
                             div()
                                 .id(SharedString::from(format!("desync-preset-{pid}")))
-                                .flex_1()
+                                .w(px(preset_w))
                                 .p(px(10.0))
                                 .rounded(px(10.0))
                                 .bg(if active { t.accent_bg } else { t.bg_card })
@@ -3895,6 +4648,7 @@ impl TachyonApp {
                                 }))
                                 .child(
                                     div()
+                                        .w_full()
                                         .text_size(px(11.5))
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(if active { t.accent } else { t.text })
@@ -3902,6 +4656,7 @@ impl TachyonApp {
                                 )
                                 .child(
                                     div()
+                                        .w_full()
                                         .text_size(px(10.0))
                                         .text_color(t.text_dim)
                                         .child(desc),
@@ -3926,11 +4681,15 @@ impl TachyonApp {
                         div()
                             .w_full()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .justify_between()
+                            .gap(px(6.0))
                             .child(
                                 div()
+                                    .min_w(px(0.0))
                                     .flex()
+                                    .flex_wrap()
                                     .items_center()
                                     .gap(px(5.0))
                                     .child(
@@ -3976,7 +4735,9 @@ impl TachyonApp {
                             )
                             .child(
                                 div()
+                                    .min_w(px(0.0))
                                     .flex()
+                                    .flex_wrap()
                                     .items_center()
                                     .gap(px(6.0))
                                     .child(
@@ -4011,11 +4772,14 @@ impl TachyonApp {
                         div()
                             .w_full()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .justify_between()
+                            .gap(px(6.0))
                             .child(
                                 div()
                                     .flex()
+                                    .flex_wrap()
                                     .items_center()
                                     .gap(px(5.0))
                                     .child(
@@ -4061,7 +4825,9 @@ impl TachyonApp {
                             )
                             .child(
                                 div()
+                                    .min_w(px(0.0))
                                     .flex()
+                                    .flex_wrap()
                                     .items_center()
                                     .gap(px(6.0))
                                     .child(
@@ -4096,11 +4862,14 @@ impl TachyonApp {
                         div()
                             .w_full()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .justify_between()
+                            .gap(px(6.0))
                             .child(
                                 div()
                                     .flex()
+                                    .flex_wrap()
                                     .items_center()
                                     .gap(px(6.0))
                                     .child(
@@ -4145,6 +4914,7 @@ impl TachyonApp {
                             .child(
                                 div()
                                     .flex()
+                                    .flex_wrap()
                                     .items_center()
                                     .gap(px(6.0))
                                     .child(
@@ -4173,14 +4943,40 @@ impl TachyonApp {
                                                 .bg(if act { t.accent_bg } else { t.bg_elev })
                                                 .text_size(px(10.0))
                                                 .text_color(if act { t.accent } else { t.text_dim })
-                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                .on_click(cx.listener(move |this, _, window, cx| {
                                                     this.state.desync_prefs.fake_sni = sni.to_string();
+                                                    this.fake_sni_input_state.update(cx, |st, cx| {
+                                                        st.set_value(sni, window, cx);
+                                                    });
+                                                    this.state.save();
                                                     this.reconnect_if_active();
                                                     cx.notify();
                                                 }))
                                                 .child(sni)
                                         }),
                                     ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .text_color(t.text_dim)
+                                    .child(self.tr("Пул SNI (через запятую):", "SNI Pool (comma-sep):")),
+                            )
+                            .child(
+                                div()
+                                    .id("input-fake-sni-pool")
+                                    .flex_1()
+                                    .min_w(px(180.0))
+                                    .h(px(28.0))
+                                    .child(styled_input(&self.fake_sni_input_state, px(28.0), 11.0, t)),
                             ),
                     ),
             )
@@ -4189,11 +4985,14 @@ impl TachyonApp {
                 div()
                     .w_full()
                     .flex()
+                    .when(m.compact, |el| el.flex_col())
                     .gap(px(12.0))
                     .child(
                         // TCP / TLS column
                         div()
-                            .flex_1()
+                            .when(!m.compact, |el| el.flex_1())
+                            .when(m.compact, |el| el.w_full().flex_none())
+                            .min_w(px(0.0))
                             .p(px(14.0))
                             .rounded(px(12.0))
                             .bg(t.bg_card)
@@ -4331,12 +5130,34 @@ impl TachyonApp {
                                     this.reconnect_if_active();
                                     cx.notify();
                                 }),
+                            ))
+                            .child(self.render_toggle_row(
+                                "toggle-host-fake",
+                                self.tr(
+                                    "Перезапись HTTP Host (Host Fake)",
+                                    "HTTP Host Rewrite (Host Fake)",
+                                ),
+                                self.tr(
+                                    "Подмена заголовка Host в фейковом HTTP/TLS-пакете на домен-ловушку",
+                                    "Replace Host header in fake HTTP/TLS packet with decoy domain",
+                                ),
+                                d.host_fake,
+                                t,
+                                cx.listener(|this, _, _, cx| {
+                                    this.state.desync_prefs.host_fake =
+                                        !this.state.desync_prefs.host_fake;
+                                    this.state.save();
+                                    this.reconnect_if_active();
+                                    cx.notify();
+                                }),
                             )),
                     )
                     .child(
                         // UDP / QUIC / Anti-cheat column
                         div()
-                            .flex_1()
+                            .when(!m.compact, |el| el.flex_1())
+                            .when(m.compact, |el| el.w_full().flex_none())
+                            .min_w(px(0.0))
                             .p(px(14.0))
                             .rounded(px(12.0))
                             .bg(t.bg_card)
@@ -4471,15 +5292,542 @@ impl TachyonApp {
                                     this.reconnect_if_active();
                                     cx.notify();
                                 }),
-                            )),
+                            ))
+                            .child(self.render_toggle_row(
+                                "toggle-udp-keep-socket",
+                                self.tr(
+                                    "Общий сокет UDP (UDP Keep Socket)",
+                                    "Reuse Bound UDP Socket",
+                                ),
+                                self.tr(
+                                    "Отправка фейковых UDP-пакетов с того же локального порта, что и рабочий поток",
+                                    "Emit fake UDP datagrams from the same bound socket as payload traffic",
+                                ),
+                                d.udp_keep_socket,
+                                t,
+                                cx.listener(|this, _, _, cx| {
+                                    this.state.desync_prefs.udp_keep_socket =
+                                        !this.state.desync_prefs.udp_keep_socket;
+                                    this.state.save();
+                                    this.reconnect_if_active();
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .pt(px(4.0))
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap(px(8.0))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(120.0))
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(3.0))
+                                            .child(
+                                                div()
+                                                    .text_size(px(10.0))
+                                                    .text_color(t.text_dim)
+                                                    .child("UDP Out Range (1-2)"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("input-udp-out-range")
+                                                    .w_full()
+                                                    .h(px(28.0))
+                                                    .child(styled_input(
+                                                        &self.udp_out_range_input_state,
+                                                        px(28.0),
+                                                        11.0,
+                                                        t,
+                                                    )),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(160.0))
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(3.0))
+                                            .child(
+                                                div()
+                                                    .text_size(px(10.0))
+                                                    .text_color(t.text_dim)
+                                                    .child("UDP Fake Payload (0x...)"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("input-udp-fake-payload")
+                                                    .w_full()
+                                                    .h(px(28.0))
+                                                    .child(styled_input(
+                                                        &self.udp_fake_payload_input_state,
+                                                        px(28.0),
+                                                        11.0,
+                                                        t,
+                                                    )),
+                                            ),
+                                    ),
+                            ),
                     ),
             )
+            .child(
+                // AdaptiveBrain + Live Probes row
+                div()
+                    .w_full()
+                    .flex()
+                    .when(m.compact, |el| el.flex_col())
+                    .gap(px(12.0))
+                    .child(
+                        // AdaptiveBrain card
+                        div()
+                            .when(!m.compact, |el| el.flex_1())
+                            .when(m.compact, |el| el.w_full().flex_none())
+                            .min_w(px(0.0))
+                            .p(px(14.0))
+                            .rounded(px(12.0))
+                            .bg(t.bg_card)
+                            .border_1()
+                            .border_color(t.border)
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap(px(6.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(12.0))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(t.text)
+                                            .child(self.tr(
+                                                "Адаптивная таблица (AdaptiveBrain)",
+                                                "Adaptive Table (AdaptiveBrain)",
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_wrap()
+                                            .gap(px(5.0))
+                                            .child(
+                                                div()
+                                                    .id("btn-ab-refresh")
+                                                    .px(px(8.0))
+                                                    .py(px(4.0))
+                                                    .rounded(px(5.0))
+                                                    .bg(t.bg_elev)
+                                                    .border_1()
+                                                    .border_color(t.border)
+                                                    .cursor_pointer()
+                                                    .hover(|s| s.bg(t.bg_hover))
+                                                    .text_size(px(10.0))
+                                                    .text_color(t.text_soft)
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.refresh_adaptive_brain();
+                                                        cx.notify();
+                                                    }))
+                                                    .child(self.tr("Обновить", "Refresh")),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("btn-ab-sanitize")
+                                                    .px(px(8.0))
+                                                    .py(px(4.0))
+                                                    .rounded(px(5.0))
+                                                    .bg(t.bg_elev)
+                                                    .border_1()
+                                                    .border_color(t.border)
+                                                    .cursor_pointer()
+                                                    .hover(|s| s.bg(t.bg_hover))
+                                                    .text_size(px(10.0))
+                                                    .text_color(t.amber)
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        core_runtime::outbound::desync::gui_sanitize_poisoned_cap_entries();
+                                                        this.refresh_adaptive_brain();
+                                                        this.show_toast(this.tr(
+                                                            "Повреждённые записи очищены",
+                                                            "Corrupted entries sanitized",
+                                                        ));
+                                                        cx.notify();
+                                                    }))
+                                                    .child(self.tr(
+                                                        "Очистить битые",
+                                                        "Sanitize",
+                                                    )),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("btn-ab-reset")
+                                                    .px(px(8.0))
+                                                    .py(px(4.0))
+                                                    .rounded(px(5.0))
+                                                    .bg(t.red_bg)
+                                                    .cursor_pointer()
+                                                    .text_size(px(10.0))
+                                                    .text_color(t.red)
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        core_runtime::outbound::desync::reset_adaptive_state();
+                                                        this.refresh_adaptive_brain();
+                                                        this.show_toast(this.tr(
+                                                            "Адаптивная таблица сброшена",
+                                                            "Adaptive state reset",
+                                                        ));
+                                                        cx.notify();
+                                                    }))
+                                                    .child(self.tr("Сбросить", "Reset")),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(t.text_dim)
+                                    .child(format!(
+                                        "{}: {} · L3: [{}]",
+                                        self.tr("Доменов в памяти", "Learned hosts"),
+                                        self.adaptive_snapshot.len(),
+                                        self.adaptive_l3_scores
+                                            .iter()
+                                            .take(8)
+                                            .map(|n| n.to_string())
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    )),
+                            )
+                            .when(self.adaptive_snapshot.is_empty(), |el| {
+                                el.child(
+                                    div()
+                                        .py(px(6.0))
+                                        .text_size(px(10.5))
+                                        .text_color(t.text_mute)
+                                        .child(self.tr(
+                                            "Домены появятся здесь после активного трафика или пробы.",
+                                            "Domains will appear here after active traffic or probing.",
+                                        )),
+                                )
+                            })
+                            .when(!self.adaptive_snapshot.is_empty(), |el| {
+                                let recipe_len =
+                                    core_runtime::outbound::desync::ADAPTIVE_RECIPES.len().max(1);
+                                el.child(
+                                    div()
+                                        .w_full()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(4.0))
+                                        .children(self.adaptive_snapshot.iter().take(24).enumerate().map(
+                                            |(idx, dom)| {
+                                                let h_pin = dom.host.clone();
+                                                let h_del = dom.host.clone();
+                                                let next_rid =
+                                                    ((dom.recipe_id as usize + 1) % recipe_len) as u8;
+                                                div()
+                                                    .w_full()
+                                                    .px(px(8.0))
+                                                    .py(px(5.0))
+                                                    .rounded(px(6.0))
+                                                    .bg(t.bg_elev)
+                                                    .flex()
+                                                    .flex_wrap()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .gap(px(6.0))
+                                                    .child(
+                                                        div()
+                                                            .min_w(px(0.0))
+                                                            .flex()
+                                                            .flex_wrap()
+                                                            .items_center()
+                                                            .gap(px(6.0))
+                                                            .child(
+                                                                div()
+                                                                    .px(px(4.0))
+                                                                    .py(px(1.0))
+                                                                    .rounded(px(4.0))
+                                                                    .bg(t.bg_card)
+                                                                    .text_size(px(9.5))
+                                                                    .text_color(t.accent)
+                                                                    .child(dom.tier.clone()),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .text_size(px(10.5))
+                                                                    .font_weight(FontWeight::MEDIUM)
+                                                                    .text_color(t.text)
+                                                                    .child(truncate_str(&dom.host, 28)),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .text_size(px(9.5))
+                                                                    .text_color(t.text_dim)
+                                                                    .child(format!(
+                                                                        "#{} {} {}{}",
+                                                                        dom.recipe_id,
+                                                                        dom.mode,
+                                                                        if dom.verified_32k { "· 32K" } else { "" },
+                                                                        if dom.consecutive_fails > 0 {
+                                                                            format!(" · err:{}", dom.consecutive_fails)
+                                                                        } else {
+                                                                            String::new()
+                                                                        }
+                                                                    )),
+                                                            ),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .flex_shrink_0()
+                                                            .flex()
+                                                            .items_center()
+                                                            .gap(px(4.0))
+                                                            .child(
+                                                                div()
+                                                                    .id(SharedString::from(format!(
+                                                                        "ab-pin-{idx}"
+                                                                    )))
+                                                                    .px(px(6.0))
+                                                                    .py(px(2.0))
+                                                                    .rounded(px(4.0))
+                                                                    .bg(t.bg_card)
+                                                                    .border_1()
+                                                                    .border_color(t.border)
+                                                                    .cursor_pointer()
+                                                                    .text_size(px(9.5))
+                                                                    .text_color(t.text_soft)
+                                                                    .on_click(cx.listener(
+                                                                        move |this, _, _, cx| {
+                                                                            core_runtime::outbound::desync::gui_pin_domain_recipe(
+                                                                                &h_pin, next_rid,
+                                                                            );
+                                                                            this.refresh_adaptive_brain();
+                                                                            cx.notify();
+                                                                        },
+                                                                    ))
+                                                                    .child(format!("R#{next_rid}")),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .id(SharedString::from(format!(
+                                                                        "ab-del-{idx}"
+                                                                    )))
+                                                                    .px(px(6.0))
+                                                                    .py(px(2.0))
+                                                                    .rounded(px(4.0))
+                                                                    .bg(t.red_bg)
+                                                                    .cursor_pointer()
+                                                                    .text_size(px(9.5))
+                                                                    .text_color(t.red)
+                                                                    .on_click(cx.listener(
+                                                                        move |this, _, _, cx| {
+                                                                            core_runtime::outbound::desync::gui_remove_learned_domain(
+                                                                                &h_del,
+                                                                            );
+                                                                            this.refresh_adaptive_brain();
+                                                                            cx.notify();
+                                                                        },
+                                                                    ))
+                                                                    .child("×"),
+                                                            ),
+                                                    )
+                                            },
+                                        )),
+                                )
+                            }),
+                    )
+                    .child(
+                        // Live Probes card
+                        div()
+                            .when(!m.compact, |el| el.flex_1())
+                            .when(m.compact, |el| el.w_full().flex_none())
+                            .min_w(px(0.0))
+                            .p(px(14.0))
+                            .rounded(px(12.0))
+                            .bg(t.bg_card)
+                            .border_1()
+                            .border_color(t.border)
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(t.text)
+                                    .child(self.tr("Живая проверка", "Live Probes")),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .child(
+                                        div()
+                                            .id("input-desync-probe-host")
+                                            .flex_1()
+                                            .min_w(px(150.0))
+                                            .h(px(28.0))
+                                            .child(styled_input(
+                                                &self.desync_probe_input_state,
+                                                px(28.0),
+                                                11.0,
+                                                t,
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("btn-probe-stream")
+                                            .px(px(10.0))
+                                            .h(px(28.0))
+                                            .rounded(px(6.0))
+                                            .bg(t.accent_bg)
+                                            .border_1()
+                                            .border_color(t.accent_border)
+                                            .cursor_pointer()
+                                            .flex()
+                                            .items_center()
+                                            .text_size(px(10.5))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(t.accent)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                let dom = this
+                                                    .desync_probe_input_state
+                                                    .read(cx)
+                                                    .value()
+                                                    .trim()
+                                                    .to_string();
+                                                let host = if dom.is_empty() {
+                                                    "www.youtube.com".to_string()
+                                                } else {
+                                                    dom
+                                                };
+                                                let d_opts = this.current_desync_options();
+                                                let v = this.vpn.clone();
+                                                let eq = this.event_queue.clone();
+                                                this.desync_probe_busy = true;
+                                                this.rt.spawn(async move {
+                                                    let msg = match v
+                                                        .run_desync_probe(&host, &d_opts)
+                                                        .await
+                                                    {
+                                                        Ok(s) => format!("probe:stream:{s}"),
+                                                        Err(e) => format!(
+                                                            "probe:stream:{}",
+                                                            json!({ "error": e })
+                                                        ),
+                                                    };
+                                                    if let Ok(mut g) = eq.lock() {
+                                                        g.push(msg);
+                                                    }
+                                                });
+                                                cx.notify();
+                                            }))
+                                            .child(self.tr("HTTPS-поток", "HTTPS Stream")),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("btn-probe-ttl")
+                                            .px(px(10.0))
+                                            .h(px(28.0))
+                                            .rounded(px(6.0))
+                                            .bg(t.bg_elev)
+                                            .border_1()
+                                            .border_color(t.border)
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(t.bg_hover))
+                                            .flex()
+                                            .items_center()
+                                            .text_size(px(10.5))
+                                            .text_color(t.text_soft)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                let dom = this
+                                                    .desync_probe_input_state
+                                                    .read(cx)
+                                                    .value()
+                                                    .trim()
+                                                    .to_string();
+                                                let host = if dom.is_empty() {
+                                                    "www.youtube.com".to_string()
+                                                } else {
+                                                    dom
+                                                };
+                                                let d_opts = this.current_desync_options();
+                                                let v = this.vpn.clone();
+                                                let eq = this.event_queue.clone();
+                                                this.desync_probe_busy = true;
+                                                this.rt.spawn(async move {
+                                                    let msg = match v
+                                                        .run_desync_ttl_calibration(&host, &d_opts)
+                                                        .await
+                                                    {
+                                                        Ok(s) => format!("probe:ttl:{s}"),
+                                                        Err(e) => format!(
+                                                            "probe:ttl:{}",
+                                                            json!({ "error": e })
+                                                        ),
+                                                    };
+                                                    if let Ok(mut g) = eq.lock() {
+                                                        g.push(msg);
+                                                    }
+                                                });
+                                                cx.notify();
+                                            }))
+                                            .child(self.tr("Калибровка TTL", "Calibrate TTL")),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .min_w(px(0.0))
+                                    .p(px(10.0))
+                                    .rounded(px(8.0))
+                                    .bg(t.bg_elev)
+                                    .text_size(px(10.5))
+                                    .text_color(if self.desync_probe_busy {
+                                        t.amber
+                                    } else {
+                                        t.text_soft
+                                    })
+                                    .child(if self.desync_probe_busy {
+                                        self.tr(
+                                            "Выполняется сетевая проба...",
+                                            "Running network probe...",
+                                        )
+                                        .to_string()
+                                    } else {
+                                        self.desync_probe_report.clone().unwrap_or_else(|| {
+                                            self.tr(
+                                                "Введите домен и запустите проверку текущего профиля десинхронизации.",
+                                                "Enter a domain and test the active desync configuration.",
+                                            )
+                                            .to_string()
+                                        })
+                                    }),
+                            ),
+                    ),
+            ),
+        )
     }
 
-    fn render_routes_tab(&self, t: Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_routes_tab(
+        &self,
+        m: LayoutMetrics,
+        t: Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         div()
             .size_full()
-            .px(px(16.0))
+            .px(px(if m.narrow { 10.0 } else { 16.0 }))
             .py(px(8.0))
             .flex()
             .flex_col()
@@ -4488,9 +5836,12 @@ impl TachyonApp {
                 // Sub-navigation bar
                 div()
                     .w_full()
+                    .flex_shrink_0()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .justify_between()
+                    .gap(px(8.0))
                     .child(
                         div()
                             .p(px(3.0))
@@ -4499,6 +5850,7 @@ impl TachyonApp {
                             .border_1()
                             .border_color(t.border)
                             .flex()
+                            .flex_wrap()
                             .gap(px(4.0))
                             .children(
                                 [
@@ -4506,10 +5858,7 @@ impl TachyonApp {
                                         RouteSubTab::Catalog,
                                         self.tr("Каталог сервисов", "Service Catalog"),
                                     ),
-                                    (
-                                        RouteSubTab::Custom,
-                                        self.tr("Свои правила", "Custom Rules"),
-                                    ),
+                                    (RouteSubTab::Custom, self.tr("Свои правила", "Custom Rules")),
                                     (RouteSubTab::Apps, self.tr("Приложения ПК", "PC Apps")),
                                 ]
                                 .into_iter()
@@ -4565,12 +5914,10 @@ impl TachyonApp {
                                 this.rt.spawn(async move {
                                     v.refresh_rulesets(None).await;
                                 });
-                                this.show_toast(
-                                    this.tr(
-                                        "Обновление баз маршрутов...",
-                                        "Updating route databases...",
-                                    ),
-                                );
+                                this.show_toast(this.tr(
+                                    "Обновление баз маршрутов...",
+                                    "Updating route databases...",
+                                ));
                                 cx.notify();
                             }))
                             .child(
@@ -4588,13 +5935,19 @@ impl TachyonApp {
                     ),
             )
             .child(match self.route_subtab {
-                RouteSubTab::Catalog => self.render_routes_catalog(t, cx).into_any_element(),
-                RouteSubTab::Custom => self.render_routes_custom(t, cx).into_any_element(),
-                RouteSubTab::Apps => self.render_routes_apps(t, cx).into_any_element(),
+                RouteSubTab::Catalog => self.render_routes_catalog(m, t, cx).into_any_element(),
+                RouteSubTab::Custom => self.render_routes_custom(m, t, cx).into_any_element(),
+                RouteSubTab::Apps => self.render_routes_apps(m, t, cx).into_any_element(),
             })
     }
 
-    fn render_routes_catalog(&self, t: Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_routes_catalog(
+        &self,
+        m: LayoutMetrics,
+        t: Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let cat_w = adaptive_card_width(m.avail_w - 12.0, 255.0, 4, 8.0);
         let q = self.route_search.trim().to_lowercase();
         let filtered: Vec<_> = ROUTE_CATALOG
             .iter()
@@ -4609,6 +5962,7 @@ impl TachyonApp {
 
         div()
             .flex_1()
+            .min_h(px(0.0))
             .w_full()
             .flex()
             .flex_col()
@@ -4618,13 +5972,16 @@ impl TachyonApp {
                 // Quick scenarios + Search bar
                 div()
                     .w_full()
+                    .flex_shrink_0()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .justify_between()
                     .gap(px(8.0))
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .gap(px(6.0))
                             .children(
@@ -4730,7 +6087,8 @@ impl TachyonApp {
                     .child(
                         div()
                             .id("input-route-search")
-                            .w(px(230.0))
+                            .when(m.narrow, |el| el.w_full())
+                            .when(!m.narrow, |el| el.w(px(230.0)))
                             .h(px(28.0))
                             .child(
                                 styled_input(&self.route_search_input, px(28.0), 11.0, t)
@@ -4748,138 +6106,162 @@ impl TachyonApp {
                 div()
                     .id("routes-catalog-scroll")
                     .flex_1()
+                    .min_h(px(0.0))
                     .w_full()
                     .overflow_y_scroll()
-                    .flex()
-                    .flex_wrap()
-                    .gap(px(8.0))
-                    .children(filtered.into_iter().map(|entry| {
-                        let current_mode = self
-                            .state
-                            .list_modes
-                            .get(entry.id)
-                            .map(String::as_str)
-                            .unwrap_or("off");
-                        let eid = entry.id;
-
+                    .child(
                         div()
-                            .w(px(345.0))
-                            .p(px(10.0))
-                            .rounded(px(10.0))
-                            .bg(t.bg_card)
-                            .border_1()
-                            .border_color(match current_mode {
-                                "vpn" => t.accent_border,
-                                "desync" => t.amber_border,
-                                "direct" => t.green_border,
-                                "block" => t.red_border,
-                                _ => t.border,
-                            })
+                            .w_full()
                             .flex()
-                            .flex_col()
+                            .flex_wrap()
                             .gap(px(8.0))
-                            .child(
+                            .children(filtered.into_iter().map(|entry| {
+                                let current_mode = self
+                                    .state
+                                    .list_modes
+                                    .get(entry.id)
+                                    .map(String::as_str)
+                                    .unwrap_or("off");
+                                let eid = entry.id;
+
                                 div()
-                                    .w_full()
+                                    .w(px(cat_w))
+                                    .p(px(10.0))
+                                    .rounded(px(10.0))
+                                    .bg(t.bg_card)
+                                    .border_1()
+                                    .border_color(match current_mode {
+                                        "vpn" => t.accent_border,
+                                        "desync" => t.amber_border,
+                                        "direct" => t.green_border,
+                                        "block" => t.red_border,
+                                        _ => t.border,
+                                    })
                                     .flex()
-                                    .items_center()
-                                    .justify_between()
+                                    .flex_col()
+                                    .gap(px(8.0))
                                     .child(
                                         div()
-                                            .text_size(px(12.0))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(t.text)
-                                            .child(entry.name),
+                                            .w_full()
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .gap(px(6.0))
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w(px(0.0))
+                                                    .truncate()
+                                                    .text_size(px(12.0))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(t.text)
+                                                    .child(entry.name),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .text_size(px(10.0))
+                                                    .text_color(t.text_mute)
+                                                    .child(entry.group),
+                                            ),
                                     )
                                     .child(
                                         div()
-                                            .text_size(px(10.0))
-                                            .text_color(t.text_mute)
-                                            .child(entry.group),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(10.5))
-                                    .text_color(t.text_dim)
-                                    .child(entry.desc),
-                            )
-                            .child(
-                                div()
-                                    .w_full()
-                                    .p(px(2.0))
-                                    .rounded(px(6.0))
-                                    .bg(t.bg_elev)
-                                    .flex()
-                                    .gap(px(2.0))
-                                    .children(
-                                        [
-                                            ("off", self.tr("Выкл", "Off")),
-                                            ("vpn", self.tr("Туннель", "Tunnel")),
-                                            ("desync", "Desync"),
-                                            ("direct", self.tr("Прямой", "Direct")),
-                                            ("block", self.tr("Блок", "Block")),
-                                        ]
-                                        .into_iter()
-                                        .map(|(mcode, mlabel)| {
-                                            let active = current_mode == mcode;
-                                            div()
-                                                .id(SharedString::from(format!(
-                                                    "cat-{eid}-{mcode}"
-                                                )))
-                                                .flex_1()
-                                                .h(px(22.0))
-                                                .rounded(px(4.0))
-                                                .cursor_pointer()
-                                                .bg(if active {
-                                                    match mcode {
-                                                        "vpn" => t.accent_bg,
-                                                        "desync" => t.amber_bg,
-                                                        "direct" => t.green_bg,
-                                                        "block" => t.red_bg,
-                                                        _ => t.bg_card,
-                                                    }
-                                                } else {
-                                                    gpui::rgba(0x00000000)
-                                                })
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .text_size(px(10.0))
-                                                .font_weight(if active {
-                                                    FontWeight::SEMIBOLD
-                                                } else {
-                                                    FontWeight::NORMAL
-                                                })
-                                                .text_color(if active {
-                                                    match mcode {
-                                                        "vpn" => t.accent,
-                                                        "desync" => t.amber,
-                                                        "direct" => t.green,
-                                                        "block" => t.red,
-                                                        _ => t.text,
-                                                    }
-                                                } else {
-                                                    t.text_dim
-                                                })
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.state
-                                                        .list_modes
-                                                        .insert(eid.to_string(), mcode.to_string());
-                                                    this.reconnect_if_active();
-                                                    cx.notify();
-                                                }))
-                                                .child(mlabel)
-                                        }),
-                                    ),
-                            )
-                    })),
+                                            .w_full()
+                                            .text_size(px(10.5))
+                                            .text_color(t.text_dim)
+                                            .child(entry.desc),
+                                    )
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .p(px(2.0))
+                                            .rounded(px(6.0))
+                                            .bg(t.bg_elev)
+                                            .flex()
+                                            .flex_wrap()
+                                            .gap(px(2.0))
+                                            .children(
+                                                [
+                                                    ("off", self.tr("Выкл", "Off")),
+                                                    ("vpn", self.tr("Туннель", "Tunnel")),
+                                                    ("desync", "Desync"),
+                                                    ("direct", self.tr("Прямой", "Direct")),
+                                                    ("block", self.tr("Блок", "Block")),
+                                                ]
+                                                .into_iter()
+                                                .map(|(mcode, mlabel)| {
+                                                    let active = current_mode == mcode;
+                                                    div()
+                                                        .id(SharedString::from(format!(
+                                                            "cat-{eid}-{mcode}"
+                                                        )))
+                                                        .flex_1()
+                                                        .min_w(px(44.0))
+                                                        .px(px(4.0))
+                                                        .h(px(22.0))
+                                                        .rounded(px(4.0))
+                                                        .cursor_pointer()
+                                                        .bg(if active {
+                                                            match mcode {
+                                                                "vpn" => t.accent_bg,
+                                                                "desync" => t.amber_bg,
+                                                                "direct" => t.green_bg,
+                                                                "block" => t.red_bg,
+                                                                _ => t.bg_card,
+                                                            }
+                                                        } else {
+                                                            gpui::rgba(0x00000000)
+                                                        })
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .text_size(px(10.0))
+                                                        .font_weight(if active {
+                                                            FontWeight::SEMIBOLD
+                                                        } else {
+                                                            FontWeight::NORMAL
+                                                        })
+                                                        .text_color(if active {
+                                                            match mcode {
+                                                                "vpn" => t.accent,
+                                                                "desync" => t.amber,
+                                                                "direct" => t.green,
+                                                                "block" => t.red,
+                                                                _ => t.text,
+                                                            }
+                                                        } else {
+                                                            t.text_dim
+                                                        })
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.state.list_modes.insert(
+                                                                    eid.to_string(),
+                                                                    mcode.to_string(),
+                                                                );
+                                                                this.reconnect_if_active();
+                                                                cx.notify();
+                                                            },
+                                                        ))
+                                                        .child(mlabel)
+                                                }),
+                                            ),
+                                    )
+                            })),
+                    ),
             )
     }
 
-    fn render_routes_custom(&self, t: Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_routes_custom(
+        &self,
+        m: LayoutMetrics,
+        t: Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let _ = m.narrow;
         div()
             .flex_1()
+            .min_h(px(0.0))
             .w_full()
             .flex()
             .flex_col()
@@ -4888,18 +6270,22 @@ impl TachyonApp {
                 // Add custom rule bar
                 div()
                     .w_full()
+                    .flex_shrink_0()
                     .p(px(10.0))
                     .rounded(px(10.0))
                     .bg(t.bg_card)
                     .border_1()
                     .border_color(t.border)
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(8.0))
                     .children(
                         [
                             ("domain", self.tr("Домен", "Domain")),
+                            ("domain_regex", "Regex"),
                             ("cidr", "IP / CIDR"),
+                            ("port", self.tr("Порт", "Port")),
                             ("process", self.tr("Процесс", "Process")),
                         ]
                         .into_iter()
@@ -4925,8 +6311,17 @@ impl TachyonApp {
                         div()
                             .id("input-custom-rule")
                             .flex_1()
+                            .min_w(px(180.0))
                             .h(px(30.0))
                             .child(styled_input(&self.custom_rule_input, px(30.0), 11.5, t)),
+                    )
+                    .child(
+                        div()
+                            .id("input-custom-rule-tw")
+                            .when(m.narrow, |el| el.w_full())
+                            .when(!m.narrow, |el| el.w(px(176.0)))
+                            .h(px(30.0))
+                            .child(styled_input(&self.custom_rule_tw_input, px(30.0), 10.5, t)),
                     )
                     .children(
                         [
@@ -4981,93 +6376,122 @@ impl TachyonApp {
                 div()
                     .id("custom-rules-scroll")
                     .flex_1()
+                    .min_h(px(0.0))
                     .w_full()
                     .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.0))
-                    .children(self.state.custom_rules.iter().map(|rule| {
-                        let rid = rule.id.clone();
-                        div()
-                            .w_full()
-                            .p(px(10.0))
-                            .rounded(px(8.0))
-                            .bg(t.bg_card)
-                            .border_1()
-                            .border_color(t.border)
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(8.0))
-                                    .child(
-                                        div()
-                                            .px(px(6.0))
-                                            .py(px(2.0))
-                                            .rounded(px(4.0))
-                                            .bg(t.bg_elev)
-                                            .text_size(px(10.0))
-                                            .text_color(t.text_dim)
-                                            .child(rule.rule_type.to_uppercase()),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(12.0))
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(t.text)
-                                            .child(rule.value.clone()),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(8.0))
-                                    .child(
-                                        div()
-                                            .px(px(8.0))
-                                            .py(px(2.0))
-                                            .rounded(px(4.0))
-                                            .bg(t.accent_bg)
-                                            .text_size(px(10.5))
-                                            .text_color(t.accent)
-                                            .child(rule.action.to_uppercase()),
-                                    )
-                                    .child(
-                                        div()
-                                            .id(SharedString::from(format!("del-rule-{rid}")))
-                                            .w(px(24.0))
-                                            .h(px(24.0))
-                                            .rounded(px(6.0))
-                                            .cursor_pointer()
-                                            .hover(|s| s.bg(t.red_bg))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.state.custom_rules.retain(|r| r.id != rid);
-                                                this.state.save();
-                                                this.reconnect_if_active();
-                                                cx.notify();
-                                            }))
-                                            .child(
-                                                svg()
-                                                    .path("icons/trash.svg")
-                                                    .size(px(12.0))
-                                                    .text_color(t.red),
-                                            ),
-                                    ),
-                            )
-                    })),
+                    .child(div().w_full().flex().flex_col().gap(px(6.0)).children(
+                        self.state.custom_rules.iter().map(|rule| {
+                            let rid = rule.id.clone();
+                            let tw = rule.time_window.trim().to_string();
+                            div()
+                                .w_full()
+                                .p(px(10.0))
+                                .rounded(px(8.0))
+                                .bg(t.bg_card)
+                                .border_1()
+                                .border_color(t.border)
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(6.0))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(160.0))
+                                        .flex()
+                                        .flex_wrap()
+                                        .items_center()
+                                        .gap(px(8.0))
+                                        .child(
+                                            div()
+                                                .px(px(6.0))
+                                                .py(px(2.0))
+                                                .rounded(px(4.0))
+                                                .bg(t.bg_elev)
+                                                .text_size(px(10.0))
+                                                .text_color(t.text_dim)
+                                                .child(rule.rule_type.to_uppercase()),
+                                        )
+                                        .child(
+                                            div()
+                                                .min_w(px(0.0))
+                                                .text_size(px(12.0))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(t.text)
+                                                .child(rule.value.clone()),
+                                        )
+                                        .when(!tw.is_empty(), |el| {
+                                            el.child(
+                                                div()
+                                                    .px(px(6.0))
+                                                    .py(px(2.0))
+                                                    .rounded(px(4.0))
+                                                    .bg(t.bg_elev)
+                                                    .border_1()
+                                                    .border_color(t.border)
+                                                    .text_size(px(9.5))
+                                                    .text_color(t.text_dim)
+                                                    .child(tw),
+                                            )
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.0))
+                                        .child(
+                                            div()
+                                                .px(px(8.0))
+                                                .py(px(2.0))
+                                                .rounded(px(4.0))
+                                                .bg(t.accent_bg)
+                                                .text_size(px(10.5))
+                                                .text_color(t.accent)
+                                                .child(rule.action.to_uppercase()),
+                                        )
+                                        .child(
+                                            div()
+                                                .id(SharedString::from(format!("del-rule-{rid}")))
+                                                .w(px(24.0))
+                                                .h(px(24.0))
+                                                .rounded(px(6.0))
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(t.red_bg))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.state.custom_rules.retain(|r| r.id != rid);
+                                                    this.state.save();
+                                                    this.reconnect_if_active();
+                                                    cx.notify();
+                                                }))
+                                                .child(
+                                                    svg()
+                                                        .path("icons/trash.svg")
+                                                        .size(px(12.0))
+                                                        .text_color(t.red),
+                                                ),
+                                        ),
+                                )
+                        }),
+                    )),
             )
     }
 
-    fn render_routes_apps(&self, t: Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_routes_apps(
+        &self,
+        m: LayoutMetrics,
+        t: Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let app_w = adaptive_card_width(m.avail_w - 12.0, 220.0, 5, 8.0);
         div()
             .flex_1()
+            .min_h(px(0.0))
             .w_full()
             .flex()
             .flex_col()
@@ -5076,30 +6500,31 @@ impl TachyonApp {
             .child(
                 div()
                     .w_full()
+                    .flex_shrink_0()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .justify_between()
+                    .gap(px(8.0))
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .gap(px(8.0))
-                            .child(
-                                div()
-                                    .text_size(px(11.5))
-                                    .text_color(t.text_soft)
-                                    .child(if self.is_en() {
-                                        format!(
-                                            "Selected apps for tunneling: {}",
-                                            self.state.routed_apps.len()
-                                        )
-                                    } else {
-                                        format!(
-                                            "Выбрано приложений для туннелирования: {}",
-                                            self.state.routed_apps.len()
-                                        )
-                                    }),
-                            )
+                            .child(div().text_size(px(11.5)).text_color(t.text_soft).child(
+                                if self.is_en() {
+                                    format!(
+                                        "Selected apps for tunneling: {}",
+                                        self.state.routed_apps.len()
+                                    )
+                                } else {
+                                    format!(
+                                        "Выбрано приложений для туннелирования: {}",
+                                        self.state.routed_apps.len()
+                                    )
+                                },
+                            ))
                             .when(!self.state.routed_apps.is_empty(), |el| {
                                 el.child(
                                     div()
@@ -5154,115 +6579,118 @@ impl TachyonApp {
                                     .size(px(11.0))
                                     .text_color(t.accent),
                             )
-                            .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .text_color(t.text_soft)
-                                    .child(self.tr(
-                                        "Обновить список процессов",
-                                        "Refresh Process List",
-                                    )),
-                            ),
+                            .child(div().text_size(px(11.0)).text_color(t.text_soft).child(
+                                self.tr("Обновить список процессов", "Refresh Process List"),
+                            )),
                     ),
             )
             .child(
                 div()
                     .id("routes-apps-scroll")
                     .flex_1()
+                    .min_h(px(0.0))
                     .w_full()
                     .overflow_y_scroll()
-                    .flex()
-                    .flex_wrap()
-                    .gap(px(8.0))
-                    .children(self.running_apps.iter().map(|app| {
-                        let proc_name = app.proc.clone();
-                        let selected = self
-                            .state
-                            .routed_apps
-                            .iter()
-                            .any(|p| p.eq_ignore_ascii_case(&proc_name));
+                    .child(div().w_full().flex().flex_wrap().gap(px(8.0)).children(
+                        self.running_apps.iter().map(|app| {
+                            let proc_name = app.proc.clone();
+                            let selected = self
+                                .state
+                                .routed_apps
+                                .iter()
+                                .any(|p| p.eq_ignore_ascii_case(&proc_name));
 
-                        div()
-                            .id(SharedString::from(format!("app-chip-{}", app.proc)))
-                            .w(px(260.0))
-                            .p(px(10.0))
-                            .rounded(px(8.0))
-                            .bg(if selected { t.accent_bg } else { t.bg_card })
-                            .border_1()
-                            .border_color(if selected { t.accent_border } else { t.border })
-                            .cursor_pointer()
-                            .hover(|s| s.bg(t.bg_hover))
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(pos) = this
-                                    .state
-                                    .routed_apps
-                                    .iter()
-                                    .position(|p| p.eq_ignore_ascii_case(&proc_name))
-                                {
-                                    this.state.routed_apps.remove(pos);
-                                } else {
-                                    this.state.routed_apps.push(proc_name.clone());
-                                }
-                                this.reconnect_if_active();
-                                cx.notify();
-                            }))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .child(
-                                        div()
-                                            .text_size(px(11.5))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(t.text)
-                                            .child(truncate_str(&app.name, 22)),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(10.0))
-                                            .text_color(t.text_dim)
-                                            .child(app.proc.clone()),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .px(px(6.0))
-                                    .py(px(2.0))
-                                    .rounded(px(4.0))
-                                    .bg(if selected { t.accent } else { t.bg_elev })
-                                    .text_size(px(10.0))
-                                    .text_color(if selected {
-                                        gpui::rgb(0x0B0B0D)
+                            div()
+                                .id(SharedString::from(format!("app-chip-{}", app.proc)))
+                                .w(px(app_w))
+                                .p(px(10.0))
+                                .rounded(px(8.0))
+                                .bg(if selected { t.accent_bg } else { t.bg_card })
+                                .border_1()
+                                .border_color(if selected { t.accent_border } else { t.border })
+                                .cursor_pointer()
+                                .hover(|s| s.bg(t.bg_hover))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(6.0))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(pos) = this
+                                        .state
+                                        .routed_apps
+                                        .iter()
+                                        .position(|p| p.eq_ignore_ascii_case(&proc_name))
+                                    {
+                                        this.state.routed_apps.remove(pos);
                                     } else {
-                                        t.text_dim
-                                    })
-                                    .child(if selected {
-                                        self.tr("Туннель", "Tunnel")
-                                    } else {
-                                        self.tr("Прямой", "Direct")
-                                    }),
-                            )
-                    })),
+                                        this.state.routed_apps.push(proc_name.clone());
+                                    }
+                                    this.reconnect_if_active();
+                                    cx.notify();
+                                }))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .flex()
+                                        .flex_col()
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .truncate()
+                                                .text_size(px(11.5))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(t.text)
+                                                .child(app.name.clone()),
+                                        )
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .truncate()
+                                                .text_size(px(10.0))
+                                                .text_color(t.text_dim)
+                                                .child(app.proc.clone()),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .px(px(6.0))
+                                        .py(px(2.0))
+                                        .rounded(px(4.0))
+                                        .bg(if selected { t.accent } else { t.bg_elev })
+                                        .text_size(px(10.0))
+                                        .text_color(if selected {
+                                            gpui::rgb(0x0B0B0D)
+                                        } else {
+                                            t.text_dim
+                                        })
+                                        .child(if selected {
+                                            self.tr("Туннель", "Tunnel")
+                                        } else {
+                                            self.tr("Прямой", "Direct")
+                                        }),
+                                )
+                        }),
+                    )),
             )
     }
 }
 
 impl TachyonApp {
-    fn render_nodes_tab(&self, t: Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .px(px(16.0))
-            .py(px(8.0))
-            .flex()
-            .flex_col()
-            .gap(px(10.0))
-            .child(
+    fn render_nodes_tab(
+        &self,
+        m: LayoutMetrics,
+        t: Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let scroll_outer = m.compact || m.short;
+
+        let import_card =
                 // Import & Actions Card
                 div()
                     .w_full()
+                    .flex_shrink_0()
                     .p(px(12.0))
                     .rounded(px(12.0))
                     .bg(t.bg_card)
@@ -5275,10 +6703,14 @@ impl TachyonApp {
                         div()
                             .w_full()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .justify_between()
+                            .gap(px(8.0))
                             .child(
                                 div()
+                                    .flex_1()
+                                    .min_w(px(200.0))
                                     .text_size(px(12.0))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(t.text)
@@ -5289,7 +6721,9 @@ impl TachyonApp {
                             )
                             .child(
                                 div()
+                                    .flex_shrink_0()
                                     .flex()
+                                    .flex_wrap()
                                     .items_center()
                                     .gap(px(6.0))
                                     .child(
@@ -5412,6 +6846,7 @@ impl TachyonApp {
                         div()
                             .w_full()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .gap(px(8.0))
                             .child({
@@ -5420,6 +6855,7 @@ impl TachyonApp {
                                 div()
                                     .id("input-node-uri")
                                     .flex_1()
+                                    .min_w(px(180.0))
                                     .h(px(32.0))
                                     .child(
                                         styled_input(&self.node_uri_input_state, px(32.0), 11.5, t)
@@ -5452,7 +6888,8 @@ impl TachyonApp {
                             .child(
                                 div()
                                     .id("input-node-name")
-                                    .w(px(170.0))
+                                    .when(m.narrow, |el| el.w_full())
+                                    .when(!m.narrow, |el| el.w(px(170.0)))
                                     .h(px(32.0))
                                     .child(styled_input(
                                         &self.node_name_input_state,
@@ -5481,12 +6918,13 @@ impl TachyonApp {
                                     }))
                                     .child(self.tr("Добавить", "Add")),
                             ),
-                    ),
-            )
-            .child(
+                    );
+
+        let balancer_card =
                 // Balancer & Cascade Settings Card (all 12 engine strategies + parameters)
                 div()
                     .w_full()
+                    .flex_shrink_0()
                     .p(px(10.0))
                     .rounded(px(10.0))
                     .bg(t.bg_card)
@@ -5499,10 +6937,14 @@ impl TachyonApp {
                         div()
                             .w_full()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .justify_between()
+                            .gap(px(6.0))
                             .child(
                                 div()
+                                    .flex_1()
+                                    .min_w(px(200.0))
                                     .flex()
                                     .items_center()
                                     .flex_wrap()
@@ -5557,7 +6999,9 @@ impl TachyonApp {
                             )
                             .child(
                                 div()
+                                    .flex_shrink_0()
                                     .flex()
+                                    .flex_wrap()
                                     .items_center()
                                     .gap(px(6.0))
                                     .child(
@@ -5616,11 +7060,14 @@ impl TachyonApp {
                         div()
                             .w_full()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .justify_between()
+                            .gap(px(6.0))
                             .child(
                                 div()
                                     .flex()
+                                    .flex_wrap()
                                     .items_center()
                                     .gap(px(5.0))
                                     .child(
@@ -5676,6 +7123,7 @@ impl TachyonApp {
                             .child(
                                 div()
                                     .flex()
+                                    .flex_wrap()
                                     .items_center()
                                     .gap(px(5.0))
                                     .child(
@@ -5735,18 +7183,23 @@ impl TachyonApp {
                                             .child(qlabel)
                                     })),
                             ),
-                    ),
-            )
-            .child(
+                    );
+
+        let filter_bar =
                 // Protocol filter & cleanup bar
                 div()
                     .w_full()
+                    .flex_shrink_0()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .justify_between()
+                    .gap(px(6.0))
                     .child(
                         div()
+                            .min_w(px(0.0))
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .gap(px(5.0))
                             .children(
@@ -5807,9 +7260,91 @@ impl TachyonApp {
                     )
                     .child(
                         div()
+                            .min_w(px(0.0))
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .gap(px(6.0))
+                            .child(
+                                div()
+                                    .id("btn-nodes-autoping-toggle")
+                                    .px(px(8.0))
+                                    .py(px(4.0))
+                                    .rounded(px(6.0))
+                                    .bg(if self.state.auto_ping.enabled {
+                                        t.green_bg
+                                    } else {
+                                        t.bg_card
+                                    })
+                                    .border_1()
+                                    .border_color(if self.state.auto_ping.enabled {
+                                        t.green_border
+                                    } else {
+                                        t.border
+                                    })
+                                    .cursor_pointer()
+                                    .text_size(px(10.5))
+                                    .text_color(if self.state.auto_ping.enabled {
+                                        t.green
+                                    } else {
+                                        t.text_dim
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toggle_auto_ping();
+                                        cx.notify();
+                                    }))
+                                    .child(if self.state.auto_ping.enabled {
+                                        self.tr("Автопинг: Вкл", "Auto-Ping: On")
+                                    } else {
+                                        self.tr("Автопинг: Выкл", "Auto-Ping: Off")
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .id("btn-nodes-autoping-iv")
+                                    .px(px(7.0))
+                                    .py(px(4.0))
+                                    .rounded(px(6.0))
+                                    .bg(t.bg_card)
+                                    .border_1()
+                                    .border_color(t.border)
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(t.bg_hover))
+                                    .text_size(px(10.5))
+                                    .text_color(t.text_soft)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.cycle_auto_ping_interval();
+                                        cx.notify();
+                                    }))
+                                    .child(if self.is_en() {
+                                        format!("{}s", self.state.auto_ping.interval_s)
+                                    } else {
+                                        format!("{}с", self.state.auto_ping.interval_s)
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .id("btn-nodes-autoping-scope")
+                                    .px(px(7.0))
+                                    .py(px(4.0))
+                                    .rounded(px(6.0))
+                                    .bg(t.bg_card)
+                                    .border_1()
+                                    .border_color(t.border)
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(t.bg_hover))
+                                    .text_size(px(10.5))
+                                    .text_color(t.text_dim)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toggle_auto_ping_all();
+                                        cx.notify();
+                                    }))
+                                    .child(if self.state.auto_ping.all {
+                                        self.tr("Все узлы", "All Nodes")
+                                    } else {
+                                        self.tr("Выбранные", "Selected")
+                                    }),
+                            )
                             .child(
                                 div()
                                     .id("btn-nodes-ping-all")
@@ -5871,19 +7406,23 @@ impl TachyonApp {
                                     }))
                                     .child(self.tr("Очистить недоступные", "Prune Dead")),
                             ),
-                    ),
-            )
-            .child(
+                    );
+
+        let nodes_list =
                 // Full server table
                 div()
                     .id("nodes-full-scroll")
-                    .flex_1()
+                    .when(!scroll_outer, |el| el.flex_1().min_h(px(0.0)))
+                    .when(scroll_outer, |el| el.h(px(340.0)).flex_none())
                     .w_full()
                     .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.0))
-                    .children(
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.0))
+                            .children(
                         self.state
                             .servers
                             .iter()
@@ -5926,6 +7465,10 @@ impl TachyonApp {
                                 let sid_ping = srv.id.clone();
                                 let sid_del = srv.id.clone();
                                 let sid_relay = srv.id.clone();
+                                let sid_ap = srv.id.clone();
+                                let is_ap_sel = !srv.is_balancer
+                                    && (self.state.auto_ping.all
+                                        || self.state.auto_ping.ids.contains(&srv.id));
                                 let srv_uri = srv.vless.clone();
                                 let proto = detect_protocol_badge(&srv.vless);
 
@@ -5938,12 +7481,15 @@ impl TachyonApp {
                                     .border_1()
                                     .border_color(if is_sel { t.accent_border } else { t.border })
                                     .flex()
+                                    .flex_wrap()
                                     .items_center()
                                     .justify_between()
+                                    .gap(px(8.0))
                                     .child(
                                         div()
                                             .id(SharedString::from(format!("node-sel-{}", srv.id)))
                                             .flex_1()
+                                            .min_w(px(160.0))
                                             .cursor_pointer()
                                             .flex()
                                             .items_center()
@@ -5956,10 +7502,14 @@ impl TachyonApp {
                                             .child(render_flag_badge(&srv.country, 22.0, t))
                                             .child(
                                                 div()
+                                                    .flex_1()
+                                                    .min_w(px(0.0))
                                                     .flex()
                                                     .flex_col()
                                                     .child(
                                                         div()
+                                                            .w_full()
+                                                            .truncate()
                                                             .text_size(px(12.0))
                                                             .font_weight(FontWeight::SEMIBOLD)
                                                             .text_color(t.text)
@@ -5967,6 +7517,8 @@ impl TachyonApp {
                                                     )
                                                     .child(
                                                         div()
+                                                            .w_full()
+                                                            .truncate()
                                                             .text_size(px(10.0))
                                                             .text_color(t.text_dim)
                                                             .child(format!(
@@ -5980,8 +7532,48 @@ impl TachyonApp {
                                     .child(
                                         div()
                                             .flex()
+                                            .flex_wrap()
                                             .items_center()
                                             .gap(px(6.0))
+                                            .when(!srv.is_balancer, |el| {
+                                                el.child(
+                                                    div()
+                                                        .id(SharedString::from(format!(
+                                                            "chk-autoping-{}",
+                                                            srv.id
+                                                        )))
+                                                        .w(px(22.0))
+                                                        .h(px(22.0))
+                                                        .rounded(px(5.0))
+                                                        .bg(if is_ap_sel {
+                                                            t.green_bg
+                                                        } else {
+                                                            t.bg_elev
+                                                        })
+                                                        .border_1()
+                                                        .border_color(if is_ap_sel {
+                                                            t.green_border
+                                                        } else {
+                                                            t.border
+                                                        })
+                                                        .cursor_pointer()
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                                            this.toggle_ping_selected(&sid_ap);
+                                                            cx.notify();
+                                                        }))
+                                                        .when(is_ap_sel, |cel| {
+                                                            cel.child(
+                                                                svg()
+                                                                    .path("icons/check.svg")
+                                                                    .size(px(11.0))
+                                                                    .text_color(t.green),
+                                                            )
+                                                        }),
+                                                )
+                                            })
                                             .child(
                                                 div()
                                                     .id(SharedString::from(format!(
@@ -6152,31 +7744,77 @@ impl TachyonApp {
                                             ),
                                     )
                             }),
-                    ),
-            )
+                        ),
+                    );
+
+        if scroll_outer {
+            div()
+                .id("nodes-tab-scroll")
+                .size_full()
+                .overflow_y_scroll()
+                .child(
+                    div()
+                        .w_full()
+                        .px(px(if m.narrow { 10.0 } else { 16.0 }))
+                        .py(px(8.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(10.0))
+                        .child(import_card)
+                        .child(balancer_card)
+                        .child(filter_bar)
+                        .child(nodes_list),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .id("nodes-tab-scroll")
+                .size_full()
+                .px(px(if m.narrow { 10.0 } else { 16.0 }))
+                .py(px(8.0))
+                .flex()
+                .flex_col()
+                .gap(px(10.0))
+                .child(import_card)
+                .child(balancer_card)
+                .child(filter_bar)
+                .child(nodes_list)
+                .into_any_element()
+        }
     }
 
-    fn render_traffic_tab(&self, t: Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_traffic_tab(
+        &self,
+        m: LayoutMetrics,
+        t: Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         div()
             .id("traffic-scroll")
             .size_full()
-            .px(px(16.0))
-            .py(px(8.0))
             .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .gap(px(10.0))
             .child(
-                // Top row: Speedtest + Diagnostics Matrix
                 div()
                     .w_full()
+                    .px(px(if m.narrow { 10.0 } else { 16.0 }))
+                    .py(px(8.0))
                     .flex()
+                    .flex_col()
                     .gap(px(10.0))
                     .child(
-                        // Speedtest card
+                        // Top row: Speedtest + Diagnostics Matrix
                         div()
-                            .flex_1()
-                            .p(px(12.0))
+                            .w_full()
+                            .flex()
+                            .when(m.compact, |el| el.flex_col())
+                            .gap(px(10.0))
+                            .child(
+                                // Speedtest card
+                                div()
+                                    .when(!m.compact, |el| el.flex_1())
+                                    .when(m.compact, |el| el.w_full().flex_none())
+                                    .min_w(px(0.0))
+                                    .p(px(12.0))
                             .rounded(px(12.0))
                             .bg(t.bg_card)
                             .border_1()
@@ -6188,8 +7826,10 @@ impl TachyonApp {
                                 div()
                                     .w_full()
                                     .flex()
+                                    .flex_wrap()
                                     .items_center()
                                     .justify_between()
+                                    .gap(px(6.0))
                                     .child(
                                         div()
                                             .text_size(px(12.0))
@@ -6203,6 +7843,7 @@ impl TachyonApp {
                                     .child(
                                         div()
                                             .flex()
+                                            .flex_wrap()
                                             .items_center()
                                             .gap(px(4.0))
                                             .children([25u32, 100, 500].into_iter().map(|sz| {
@@ -6290,8 +7931,10 @@ impl TachyonApp {
                                 div()
                                     .w_full()
                                     .flex()
+                                    .flex_wrap()
                                     .items_center()
                                     .justify_between()
+                                    .gap(px(6.0))
                                     .child(
                                         div()
                                             .text_size(px(20.0))
@@ -6330,7 +7973,9 @@ impl TachyonApp {
                     .child(
                         // Connectivity Matrix card
                         div()
-                            .flex_1()
+                            .when(!m.compact, |el| el.flex_1())
+                            .when(m.compact, |el| el.w_full().flex_none())
+                            .min_w(px(0.0))
                             .p(px(12.0))
                             .rounded(px(12.0))
                             .bg(t.bg_card)
@@ -6343,10 +7988,13 @@ impl TachyonApp {
                                 div()
                                     .w_full()
                                     .flex()
+                                    .flex_wrap()
                                     .items_center()
                                     .justify_between()
+                                    .gap(px(6.0))
                                     .child(
                                         div()
+                                            .min_w(px(0.0))
                                             .text_size(px(12.0))
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(t.text)
@@ -6358,6 +8006,7 @@ impl TachyonApp {
                                     .child(
                                         div()
                                             .flex()
+                                            .flex_wrap()
                                             .gap(px(6.0))
                                             .child(
                                                 div()
@@ -6463,9 +8112,8 @@ impl TachyonApp {
                     ),
             )
             .child(
-                // Active Connections Card
+                // Kernel Inspector Card
                 div()
-                    .flex_1()
                     .w_full()
                     .p(px(12.0))
                     .rounded(px(12.0))
@@ -6479,60 +8127,387 @@ impl TachyonApp {
                         div()
                             .w_full()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .justify_between()
+                            .gap(px(8.0))
                             .child(
                                 div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(8.0))
-                                    .child(
-                                        div()
-                                            .text_size(px(12.0))
-                                            .font_weight(FontWeight::BOLD)
-                                            .text_color(t.text)
-                                            .child(if self.is_en() {
-                                                format!(
-                                                    "Active Sessions ({})",
-                                                    self.connections.len()
-                                                )
-                                            } else {
-                                                format!(
-                                                    "Активные сессии ({})",
-                                                    self.connections.len()
-                                                )
-                                            }),
-                                    )
-                                    .children(
-                                        [
-                                            ("all", self.tr("Все", "All")),
-                                            ("PROXY", self.tr("Туннель", "Tunnel")),
-                                            ("DESYNC", "Desync"),
-                                            ("DIRECT", self.tr("Прямые", "Direct")),
-                                        ]
-                                        .into_iter()
-                                        .map(|(cf, clabel)| {
-                                            let act = self.conn_filter == cf;
-                                            div()
-                                                .id(SharedString::from(format!("cf-chip-{cf}")))
-                                                .px(px(7.0))
-                                                .py(px(2.0))
-                                                .rounded(px(5.0))
-                                                .cursor_pointer()
-                                                .bg(if act { t.accent_bg } else { t.bg_elev })
-                                                .text_size(px(10.0))
-                                                .text_color(if act { t.accent } else { t.text_dim })
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.conn_filter = cf.to_string();
-                                                    cx.notify();
-                                                }))
-                                                .child(clabel)
-                                        }),
-                                    ),
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(t.text)
+                                    .child(self.tr("Инспектор ядра", "Kernel Inspector")),
                             )
                             .child(
                                 div()
                                     .flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .child(
+                                        div()
+                                            .id("input-diag-target")
+                                            .w(px(if m.narrow { 150.0 } else { 200.0 }))
+                                            .h(px(28.0))
+                                            .child(styled_input(
+                                                &self.diag_target_input_state,
+                                                px(28.0),
+                                                11.0,
+                                                t,
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("btn-insp-route")
+                                            .px(px(8.0))
+                                            .py(px(5.0))
+                                            .rounded(px(6.0))
+                                            .bg(t.accent_bg)
+                                            .border_1()
+                                            .border_color(t.accent_border)
+                                            .cursor_pointer()
+                                            .text_size(px(10.5))
+                                            .text_color(t.accent)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                let tgt = this
+                                                    .diag_target_input_state
+                                                    .read(cx)
+                                                    .value()
+                                                    .trim()
+                                                    .to_string();
+                                                let target = if tgt.is_empty() {
+                                                    "youtube.com".to_string()
+                                                } else {
+                                                    tgt
+                                                };
+                                                let v = this.vpn.clone();
+                                                let eq = this.event_queue.clone();
+                                                this.diag_busy = true;
+                                                this.rt.spawn(async move {
+                                                    let msg = match v.route_check(&target, true).await {
+                                                        Ok(s) => format!("diag:route:{s}"),
+                                                        Err(e) => {
+                                                            format!("diag:route:{}", json!({ "error": e }))
+                                                        }
+                                                    };
+                                                    if let Ok(mut g) = eq.lock() {
+                                                        g.push(msg);
+                                                    }
+                                                });
+                                                cx.notify();
+                                            }))
+                                            .child(self.tr("Маршрут", "Route")),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("btn-insp-dns")
+                                            .px(px(8.0))
+                                            .py(px(5.0))
+                                            .rounded(px(6.0))
+                                            .bg(t.bg_elev)
+                                            .border_1()
+                                            .border_color(t.border)
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(t.bg_hover))
+                                            .text_size(px(10.5))
+                                            .text_color(t.text_soft)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                let tgt = this
+                                                    .diag_target_input_state
+                                                    .read(cx)
+                                                    .value()
+                                                    .trim()
+                                                    .to_string();
+                                                let host = if tgt.is_empty() {
+                                                    "example.com".to_string()
+                                                } else {
+                                                    tgt
+                                                };
+                                                let v = this.vpn.clone();
+                                                let eq = this.event_queue.clone();
+                                                this.diag_busy = true;
+                                                this.rt.spawn(async move {
+                                                    let msg = match v.dns_check(&host).await {
+                                                        Ok(s) => format!("diag:dns:{s}"),
+                                                        Err(e) => {
+                                                            format!("diag:dns:{}", json!({ "error": e }))
+                                                        }
+                                                    };
+                                                    if let Ok(mut g) = eq.lock() {
+                                                        g.push(msg);
+                                                    }
+                                                });
+                                                cx.notify();
+                                            }))
+                                            .child("DNS"),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("btn-insp-leak")
+                                            .px(px(8.0))
+                                            .py(px(5.0))
+                                            .rounded(px(6.0))
+                                            .bg(t.bg_elev)
+                                            .border_1()
+                                            .border_color(t.border)
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(t.bg_hover))
+                                            .text_size(px(10.5))
+                                            .text_color(t.text_soft)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                let v = this.vpn.clone();
+                                                let eq = this.event_queue.clone();
+                                                this.diag_busy = true;
+                                                this.rt.spawn(async move {
+                                                    let msg = match v.leak_audit().await {
+                                                        Ok(s) => format!("diag:leak:{s}"),
+                                                        Err(e) => {
+                                                            format!("diag:leak:{}", json!({ "error": e }))
+                                                        }
+                                                    };
+                                                    if let Ok(mut g) = eq.lock() {
+                                                        g.push(msg);
+                                                    }
+                                                });
+                                                cx.notify();
+                                            }))
+                                            .child(self.tr("Аудит утечек", "Leak Audit")),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("btn-insp-mem")
+                                            .px(px(8.0))
+                                            .py(px(5.0))
+                                            .rounded(px(6.0))
+                                            .bg(t.bg_elev)
+                                            .border_1()
+                                            .border_color(t.border)
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(t.bg_hover))
+                                            .text_size(px(10.5))
+                                            .text_color(t.text_soft)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                let v = this.vpn.clone();
+                                                let eq = this.event_queue.clone();
+                                                this.diag_busy = true;
+                                                this.rt.spawn(async move {
+                                                    let msg = match v.memory_stats().await {
+                                                        Ok(s) => format!("diag:mem:{s}"),
+                                                        Err(e) => {
+                                                            format!("diag:mem:{}", json!({ "error": e }))
+                                                        }
+                                                    };
+                                                    if let Ok(mut g) = eq.lock() {
+                                                        g.push(msg);
+                                                    }
+                                                });
+                                                cx.notify();
+                                            }))
+                                            .child(self.tr("Память", "Memory")),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("btn-insp-trim")
+                                            .px(px(8.0))
+                                            .py(px(5.0))
+                                            .rounded(px(6.0))
+                                            .bg(t.bg_elev)
+                                            .border_1()
+                                            .border_color(t.border)
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(t.bg_hover))
+                                            .text_size(px(10.5))
+                                            .text_color(t.amber)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                let v = this.vpn.clone();
+                                                let eq = this.event_queue.clone();
+                                                this.diag_busy = true;
+                                                this.rt.spawn(async move {
+                                                    let msg = match v.memory_trim().await {
+                                                        Ok(s) => format!("diag:mem:{s}"),
+                                                        Err(e) => {
+                                                            format!("diag:mem:{}", json!({ "error": e }))
+                                                        }
+                                                    };
+                                                    if let Ok(mut g) = eq.lock() {
+                                                        g.push(msg);
+                                                    }
+                                                });
+                                                cx.notify();
+                                            }))
+                                            .child(self.tr("Сжать кэш", "Trim Cache")),
+                                    ),
+                            ),
+                    )
+                    .when(self.diag_busy || self.inspector_report.is_some(), |el| {
+                        el.child(
+                            div()
+                                .w_full()
+                                .min_w(px(0.0))
+                                .px(px(10.0))
+                                .py(px(6.0))
+                                .rounded(px(6.0))
+                                .bg(t.bg_elev)
+                                .text_size(px(10.5))
+                                .text_color(if self.diag_busy { t.amber } else { t.text_soft })
+                                .child(if self.diag_busy {
+                                    self.tr("Запрос к API ядра...", "Querying core API...")
+                                        .to_string()
+                                } else {
+                                    self.inspector_report.clone().unwrap_or_default()
+                                }),
+                        )
+                    }),
+            )
+            .child(
+                // Active Connections Card
+                div()
+                    .w_full()
+                    .min_h(px(280.0))
+                    .p(px(12.0))
+                    .rounded(px(12.0))
+                    .bg(t.bg_card)
+                    .border_1()
+                    .border_color(t.border)
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .child(
+                                        div()
+                                            .id("btn-conns-mode-live")
+                                            .px(px(8.0))
+                                            .py(px(3.0))
+                                            .rounded(px(6.0))
+                                            .cursor_pointer()
+                                            .bg(if !self.traffic_flight_mode {
+                                                t.accent_bg
+                                            } else {
+                                                t.bg_elev
+                                            })
+                                            .border_1()
+                                            .border_color(if !self.traffic_flight_mode {
+                                                t.accent_border
+                                            } else {
+                                                t.border
+                                            })
+                                            .text_size(px(11.0))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(if !self.traffic_flight_mode {
+                                                t.accent
+                                            } else {
+                                                t.text_soft
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.traffic_flight_mode = false;
+                                                cx.notify();
+                                            }))
+                                            .child(if self.is_en() {
+                                                format!("Active ({})", self.connections.len())
+                                            } else {
+                                                format!("Активные ({})", self.connections.len())
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("btn-conns-mode-flight")
+                                            .px(px(8.0))
+                                            .py(px(3.0))
+                                            .rounded(px(6.0))
+                                            .cursor_pointer()
+                                            .bg(if self.traffic_flight_mode {
+                                                t.accent_bg
+                                            } else {
+                                                t.bg_elev
+                                            })
+                                            .border_1()
+                                            .border_color(if self.traffic_flight_mode {
+                                                t.accent_border
+                                            } else {
+                                                t.border
+                                            })
+                                            .text_size(px(11.0))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(if self.traffic_flight_mode {
+                                                t.accent
+                                            } else {
+                                                t.text_soft
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.traffic_flight_mode = true;
+                                                let v = this.vpn.clone();
+                                                let eq = this.event_queue.clone();
+                                                this.rt.spawn(async move {
+                                                    if let Ok(s) = v.get_flight_recorder().await
+                                                        && let Ok(mut g) = eq.lock()
+                                                    {
+                                                        g.push(format!("diag:flight:{s}"));
+                                                    }
+                                                });
+                                                cx.notify();
+                                            }))
+                                            .child(if self.is_en() {
+                                                format!(
+                                                    "Flight Log ({})",
+                                                    self.flight_entries.len()
+                                                )
+                                            } else {
+                                                format!(
+                                                    "Журнал ({})",
+                                                    self.flight_entries.len()
+                                                )
+                                            }),
+                                    )
+                                    .when(!self.traffic_flight_mode, |el| {
+                                        el.children(
+                                            [
+                                                ("all", self.tr("Все", "All")),
+                                                ("PROXY", self.tr("Туннель", "Tunnel")),
+                                                ("DESYNC", "Desync"),
+                                                ("DIRECT", self.tr("Прямые", "Direct")),
+                                            ]
+                                            .into_iter()
+                                            .map(|(cf, clabel)| {
+                                                let act = self.conn_filter == cf;
+                                                div()
+                                                    .id(SharedString::from(format!("cf-chip-{cf}")))
+                                                    .px(px(7.0))
+                                                    .py(px(2.0))
+                                                    .rounded(px(5.0))
+                                                    .cursor_pointer()
+                                                    .bg(if act { t.accent_bg } else { t.bg_elev })
+                                                    .text_size(px(10.0))
+                                                    .text_color(if act {
+                                                        t.accent
+                                                    } else {
+                                                        t.text_dim
+                                                    })
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.conn_filter = cf.to_string();
+                                                        cx.notify();
+                                                    }))
+                                                    .child(clabel)
+                                            }),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
                                     .gap(px(6.0))
                                     .child(
                                         div()
@@ -6547,50 +8522,215 @@ impl TachyonApp {
                                             .on_click(cx.listener(|this, _, _, _| {
                                                 let v = this.vpn.clone();
                                                 let eq = this.event_queue.clone();
+                                                let flight = this.traffic_flight_mode;
                                                 this.rt.spawn(async move {
-                                                    let data = v.get_connections_json().await;
-                                                    if let Ok(mut g) = eq.lock() {
-                                                        g.push(format!("conn:data:{data}"));
+                                                    if flight {
+                                                        if let Ok(s) = v.get_flight_recorder().await
+                                                            && let Ok(mut g) = eq.lock()
+                                                        {
+                                                            g.push(format!("diag:flight:{s}"));
+                                                        }
+                                                    } else {
+                                                        let data = v.get_connections_json().await;
+                                                        if let Ok(mut g) = eq.lock() {
+                                                            g.push(format!("conn:data:{data}"));
+                                                        }
                                                     }
                                                 });
                                             }))
                                             .child(self.tr("Обновить", "Refresh")),
                                     )
-                                    .child(
-                                        div()
-                                            .id("btn-close-all-conns")
-                                            .px(px(8.0))
-                                            .py(px(4.0))
-                                            .rounded(px(6.0))
-                                            .bg(t.red_bg)
-                                            .cursor_pointer()
-                                            .text_size(px(11.0))
-                                            .text_color(t.red)
-                                            .on_click(cx.listener(|this, _, _, _| {
-                                                let v = this.vpn.clone();
-                                                let eq = this.event_queue.clone();
-                                                this.rt.spawn(async move {
-                                                    v.close_connection(None).await;
-                                                    let data = v.get_connections_json().await;
-                                                    if let Ok(mut g) = eq.lock() {
-                                                        g.push(format!("conn:data:{data}"));
-                                                    }
-                                                });
-                                            }))
-                                            .child(self.tr("Сбросить все", "Close All")),
-                                    ),
+                                    .when(!self.traffic_flight_mode, |el| {
+                                        el.child(
+                                            div()
+                                                .id("btn-close-all-conns")
+                                                .px(px(8.0))
+                                                .py(px(4.0))
+                                                .rounded(px(6.0))
+                                                .bg(t.red_bg)
+                                                .cursor_pointer()
+                                                .text_size(px(11.0))
+                                                .text_color(t.red)
+                                                .on_click(cx.listener(|this, _, _, _| {
+                                                    let v = this.vpn.clone();
+                                                    let eq = this.event_queue.clone();
+                                                    this.rt.spawn(async move {
+                                                        v.close_connection(None).await;
+                                                        let data = v.get_connections_json().await;
+                                                        if let Ok(mut g) = eq.lock() {
+                                                            g.push(format!("conn:data:{data}"));
+                                                        }
+                                                    });
+                                                }))
+                                                .child(self.tr("Сбросить все", "Close All")),
+                                        )
+                                    })
+                                    .when(self.traffic_flight_mode, |el| {
+                                        el.child(
+                                            div()
+                                                .id("btn-clear-flight")
+                                                .px(px(8.0))
+                                                .py(px(4.0))
+                                                .rounded(px(6.0))
+                                                .bg(t.red_bg)
+                                                .cursor_pointer()
+                                                .text_size(px(11.0))
+                                                .text_color(t.red)
+                                                .on_click(cx.listener(|this, _, _, _| {
+                                                    let v = this.vpn.clone();
+                                                    let eq = this.event_queue.clone();
+                                                    this.rt.spawn(async move {
+                                                        if v.clear_flight_recorder().await.is_ok()
+                                                            && let Ok(mut g) = eq.lock()
+                                                        {
+                                                            g.push(
+                                                                "diag:flight:cleared".to_string(),
+                                                            );
+                                                        }
+                                                    });
+                                                }))
+                                                .child(self.tr("Очистить журнал", "Clear Log")),
+                                        )
+                                    }),
                             ),
                     )
-                    .child(
+                    .when(self.traffic_flight_mode, |el| {
+                        el.child(
+                            div()
+                                .id("flight-list-scroll")
+                                .w_full()
+                                .min_h(px(180.0))
+                                .max_h(px(460.0))
+                                .overflow_y_scroll()
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(4.0))
+                                        .when(self.flight_entries.is_empty(), |fel| {
+                                            fel.child(
+                                                div()
+                                                    .py(px(12.0))
+                                                    .text_size(px(11.0))
+                                                    .text_color(t.text_mute)
+                                                    .child(self.tr(
+                                                        "Записей в журнале пока нет.",
+                                                        "No flight recorder entries yet.",
+                                                    )),
+                                            )
+                                        })
+                                        .children(self.flight_entries.iter().rev().take(80).map(|entry| {
+                                            let net = entry
+                                                .get("network")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("tcp")
+                                                .to_ascii_uppercase();
+                                            let host = entry
+                                                .get("host")
+                                                .and_then(Value::as_str)
+                                                .filter(|s| !s.is_empty())
+                                                .or_else(|| entry.get("destination").and_then(Value::as_str))
+                                                .unwrap_or("—");
+                                            let out = entry
+                                                .get("outbound")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("—");
+                                            let rule = entry
+                                                .get("rule")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("final");
+                                            let status = entry
+                                                .get("status")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("");
+                                            let dur = entry
+                                                .get("duration_ms")
+                                                .and_then(Value::as_u64)
+                                                .unwrap_or(0);
+                                            let dl = entry
+                                                .get("download")
+                                                .and_then(Value::as_u64)
+                                                .unwrap_or(0);
+                                            let ul = entry
+                                                .get("upload")
+                                                .and_then(Value::as_u64)
+                                                .unwrap_or(0);
+                                            div()
+                                                .w_full()
+                                                .px(px(8.0))
+                                                .py(px(6.0))
+                                                .rounded(px(6.0))
+                                                .bg(t.bg_elev)
+                                                .flex()
+                                                .flex_wrap()
+                                                .items_center()
+                                                .justify_between()
+                                                .gap(px(6.0))
+                                                .text_size(px(10.5))
+                                                .child(
+                                                    div()
+                                                        .min_w(px(0.0))
+                                                        .flex()
+                                                        .flex_wrap()
+                                                        .items_center()
+                                                        .gap(px(6.0))
+                                                        .child(
+                                                            div()
+                                                                .px(px(5.0))
+                                                                .rounded(px(4.0))
+                                                                .bg(t.bg_card)
+                                                                .text_size(px(9.5))
+                                                                .text_color(t.accent)
+                                                                .child(net),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .font_weight(FontWeight::SEMIBOLD)
+                                                                .text_color(t.text)
+                                                                .child(truncate_str(host, 40)),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .px(px(5.0))
+                                                                .rounded(px(4.0))
+                                                                .bg(t.bg_card)
+                                                                .text_size(px(9.5))
+                                                                .text_color(t.text_dim)
+                                                                .child(format!("{out} · {rule}")),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap(px(8.0))
+                                                        .text_color(t.text_dim)
+                                                        .child(format!(
+                                                            "{status} · {dur} ms · ↓{} ↑{}",
+                                                            format_bytes_human(dl),
+                                                            format_bytes_human(ul),
+                                                        )),
+                                                )
+                                        })),
+                                ),
+                        )
+                    })
+                    .when(!self.traffic_flight_mode, |el| {
+                        el.child(
                         div()
                             .id("conns-list-scroll")
-                            .flex_1()
                             .w_full()
+                            .min_h(px(180.0))
+                            .max_h(px(460.0))
                             .overflow_y_scroll()
-                            .flex()
-                            .flex_col()
-                            .gap(px(4.0))
-                            .children(
+                            .child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.0))
+                                    .children(
                                 self.connections
                                     .iter()
                                     .filter(|c| {
@@ -6625,12 +8765,16 @@ impl TachyonApp {
                                             .flex()
                                             .items_center()
                                             .justify_between()
+                                            .flex_wrap()
+                                            .gap(px(6.0))
                                             .text_size(px(11.0))
                                             .child(
                                                 div()
                                                     .flex()
                                                     .items_center()
+                                                    .flex_wrap()
                                                     .gap(px(8.0))
+                                                    .min_w(px(0.0))
                                                     .child(
                                                         div()
                                                             .px(px(5.0))
@@ -6667,7 +8811,9 @@ impl TachyonApp {
                                             )
                                             .child(
                                                 div()
+                                                    .min_w(px(0.0))
                                                     .flex()
+                                                    .flex_wrap()
                                                     .items_center()
                                                     .gap(px(8.0))
                                                     .child(
@@ -6716,6 +8862,8 @@ impl TachyonApp {
                                                                                         .clone(),
                                                                                 action: "vpn"
                                                                                     .to_string(),
+                                                                                time_window:
+                                                                                    String::new(),
                                                                             });
                                                                         this.show_toast(
                                                                             if this.is_en() {
@@ -6737,27 +8885,42 @@ impl TachyonApp {
                                                     ),
                                             )
                                     }),
-                            ),
-                    ),
-            )
+                            )
+                        )
+                        )
+                    }),
+            ),
+        )
     }
 
-    fn render_options_tab(&self, t: Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_options_tab(
+        &self,
+        m: LayoutMetrics,
+        t: Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let p = &self.state.vpn_prefs;
 
         div()
             .id("options-scroll")
             .size_full()
-            .px(px(16.0))
-            .py(px(8.0))
             .overflow_y_scroll()
-            .flex()
-            .gap(px(12.0))
             .child(
-                // Left column: Network & DNS
                 div()
-                    .flex_1()
-                    .p(px(14.0))
+                    .w_full()
+                    .px(px(if m.narrow { 10.0 } else { 16.0 }))
+                    .py(px(8.0))
+                    .flex()
+                    .when(m.compact, |el| el.flex_col())
+                    .items_start()
+                    .gap(px(12.0))
+                    .child(
+                        // Left column: Network & DNS
+                        div()
+                            .when(!m.compact, |el| el.flex_1())
+                            .when(m.compact, |el| el.w_full().flex_none())
+                            .min_w(px(0.0))
+                            .p(px(14.0))
                     .rounded(px(12.0))
                     .bg(t.bg_card)
                     .border_1()
@@ -6771,6 +8934,8 @@ impl TachyonApp {
                             .flex()
                             .items_center()
                             .justify_between()
+                            .flex_wrap()
+                            .gap(px(6.0))
                             .child(
                                 div()
                                     .text_size(px(13.0))
@@ -6877,7 +9042,7 @@ impl TachyonApp {
                                     div()
                                         .id("input-custom-dns")
                                         .w_full()
-                                        .max_w(px(420.0))
+                                        .max_w(px(m.avail_w.min(420.0)))
                                         .h(px(30.0))
                                         .child(styled_input(
                                             &self.custom_dns_input_state,
@@ -6887,6 +9052,56 @@ impl TachyonApp {
                                         )),
                                 )
                             })
+                            .child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .items_center()
+                                    .flex_wrap()
+                                    .gap(px(5.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(10.5))
+                                            .text_color(t.text_dim)
+                                            .child(self.tr("Транспорт DNS:", "DNS Transport:")),
+                                    )
+                                    .children(
+                                        [
+                                            ("https", "DoH (HTTPS)"),
+                                            ("h3", "DoH3 (H3)"),
+                                            ("quic", "DoQ (QUIC)"),
+                                            ("tls", "DoT (TLS)"),
+                                            ("udp", "UDP"),
+                                        ]
+                                        .into_iter()
+                                        .map(|(dt, dl)| {
+                                            let act = p.dns_transport == dt;
+                                            div()
+                                                .id(SharedString::from(format!("opt-dns-tr-{dt}")))
+                                                .px(px(6.0))
+                                                .py(px(3.0))
+                                                .rounded(px(5.0))
+                                                .cursor_pointer()
+                                                .bg(if act { t.accent_bg } else { t.bg_elev })
+                                                .border_1()
+                                                .border_color(if act {
+                                                    t.accent_border
+                                                } else {
+                                                    t.border
+                                                })
+                                                .text_size(px(10.0))
+                                                .text_color(if act { t.accent } else { t.text_dim })
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.state.vpn_prefs.dns_transport =
+                                                        dt.to_string();
+                                                    this.state.save();
+                                                    this.reconnect_if_active();
+                                                    cx.notify();
+                                                }))
+                                                .child(dl)
+                                        }),
+                                    ),
+                            )
                             .when(!self.dns_bench.is_empty(), |el| {
                                 el.child(
                                     div()
@@ -6919,10 +9134,13 @@ impl TachyonApp {
                             .flex()
                             .items_center()
                             .justify_between()
+                            .flex_wrap()
+                            .gap(px(6.0))
                             .child(
                                 div()
                                     .flex()
                                     .items_center()
+                                    .flex_wrap()
                                     .gap(px(5.0))
                                     .child(
                                         div()
@@ -6962,6 +9180,7 @@ impl TachyonApp {
                                 div()
                                     .flex()
                                     .items_center()
+                                    .flex_wrap()
                                     .gap(px(4.0))
                                     .child(
                                         div()
@@ -6998,10 +9217,13 @@ impl TachyonApp {
                             .flex()
                             .items_center()
                             .justify_between()
+                            .flex_wrap()
+                            .gap(px(6.0))
                             .child(
                                 div()
                                     .flex()
                                     .items_center()
+                                    .flex_wrap()
                                     .gap(px(5.0))
                                     .child(
                                         div()
@@ -7041,6 +9263,7 @@ impl TachyonApp {
                                 div()
                                     .flex()
                                     .items_center()
+                                    .flex_wrap()
                                     .gap(px(4.0))
                                     .child(
                                         div()
@@ -7167,12 +9390,81 @@ impl TachyonApp {
                             this.reconnect_if_active();
                             cx.notify();
                         }),
-                    )),
+                    ))
+                    .child(self.render_toggle_row(
+                        "opt-ipv6",
+                        self.tr(
+                            "Поддержка IPv6 (TUN + FakeIPv6)",
+                            "IPv6 Support (TUN + FakeIPv6)",
+                        ),
+                        self.tr(
+                            "Включить двойной стек IPv6 в адаптере TUN и пуле FakeIPv6 (fc00::/18)",
+                            "Enable dual-stack IPv6 in TUN interface and FakeIPv6 pool (fc00::/18)",
+                        ),
+                        p.ipv6_enabled,
+                        t,
+                        cx.listener(|this, _, _, cx| {
+                            this.state.vpn_prefs.ipv6_enabled = !this.state.vpn_prefs.ipv6_enabled;
+                            this.state.save();
+                            this.reconnect_if_active();
+                            cx.notify();
+                        }),
+                    ))
+                    .child(self.render_toggle_row(
+                        "opt-ntp",
+                        self.tr(
+                            "Синхронизация времени NTP",
+                            "NTP Time Synchronization",
+                        ),
+                        self.tr(
+                            "Точное системное время для проверки TLS-сертификатов и токенов сессий",
+                            "Accurate clock synchronization for TLS certificates and session validation",
+                        ),
+                        p.ntp_enabled,
+                        t,
+                        cx.listener(|this, _, _, cx| {
+                            this.state.vpn_prefs.ntp_enabled = !this.state.vpn_prefs.ntp_enabled;
+                            this.state.save();
+                            this.reconnect_if_active();
+                            cx.notify();
+                        }),
+                    ))
+                    .when(p.ntp_enabled, |el| {
+                        el.child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .flex_wrap()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .text_size(px(10.5))
+                                        .text_color(t.text_dim)
+                                        .child(self.tr("Сервер NTP:", "NTP Server:")),
+                                )
+                                .child(
+                                    div()
+                                        .id("input-ntp-server")
+                                        .w_full()
+                                        .max_w(px(m.avail_w.min(300.0)))
+                                        .h(px(30.0))
+                                        .child(styled_input(
+                                            &self.ntp_server_input_state,
+                                            px(30.0),
+                                            11.5,
+                                            t,
+                                        )),
+                                ),
+                        )
+                    }),
             )
             .child(
                 // Right column: Engine, Language, System & Updates
                 div()
-                    .flex_1()
+                    .when(!m.compact, |el| el.flex_1())
+                    .when(m.compact, |el| el.w_full().flex_none())
+                    .min_w(px(0.0))
                     .p(px(14.0))
                     .rounded(px(12.0))
                     .bg(t.bg_card)
@@ -7187,6 +9479,8 @@ impl TachyonApp {
                             .flex()
                             .items_center()
                             .justify_between()
+                            .flex_wrap()
+                            .gap(px(6.0))
                             .child(
                                 div()
                                     .text_size(px(13.0))
@@ -7201,6 +9495,7 @@ impl TachyonApp {
                                 div()
                                     .flex()
                                     .items_center()
+                                    .flex_wrap()
                                     .gap(px(6.0))
                                     .child(
                                         // Language selector in options
@@ -7244,6 +9539,11 @@ impl TachyonApp {
                                                                     this.state.save();
                                                                     this.sync_input_placeholders(
                                                                         window, cx,
+                                                                    );
+                                                                    crate::tray::update_status(
+                                                                        this.vpn_status
+                                                                            == "connected",
+                                                                        this.is_en(),
                                                                     );
                                                                     cx.notify();
                                                                 },
@@ -7422,6 +9722,46 @@ impl TachyonApp {
                             cx.notify();
                         }),
                     ))
+                    .child(self.render_toggle_row(
+                        "opt-close-to-tray",
+                        self.tr(
+                            "Сворачивать в трей при закрытии",
+                            "Close Window to System Tray",
+                        ),
+                        self.tr(
+                            "Кнопка закрытия окна скрывает клиент в область уведомлений вместо выхода",
+                            "Clicking close hides the window to system tray instead of exiting",
+                        ),
+                        p.close_to_tray,
+                        t,
+                        cx.listener(|this, _, _, cx| {
+                            let next = !this.state.vpn_prefs.close_to_tray;
+                            this.state.vpn_prefs.close_to_tray = next;
+                            this.close_to_tray_flag
+                                .store(next, std::sync::atomic::Ordering::Relaxed);
+                            this.state.save();
+                            cx.notify();
+                        }),
+                    ))
+                    .child(self.render_toggle_row(
+                        "opt-minimize-to-tray",
+                        self.tr(
+                            "Сворачивать в трей при минимизации",
+                            "Minimize Window to System Tray",
+                        ),
+                        self.tr(
+                            "Кнопка сворачивания скрывает окно в область уведомлений",
+                            "Minimize button hides the window into the system tray",
+                        ),
+                        p.minimize_to_tray,
+                        t,
+                        cx.listener(|this, _, _, cx| {
+                            this.state.vpn_prefs.minimize_to_tray =
+                                !this.state.vpn_prefs.minimize_to_tray;
+                            this.state.save();
+                            cx.notify();
+                        }),
+                    ))
                     .child(
                         div()
                             .w_full()
@@ -7429,10 +9769,13 @@ impl TachyonApp {
                             .flex()
                             .items_center()
                             .justify_between()
+                            .flex_wrap()
+                            .gap(px(8.0))
                             .child(
                                 div()
                                     .flex()
                                     .items_center()
+                                    .flex_wrap()
                                     .gap(px(8.0))
                                     .child(
                                         div()
@@ -7463,46 +9806,27 @@ impl TachyonApp {
                                                 "Check for Updates",
                                             )),
                                     )
-                                    .children({
-                                        #[cfg(target_os = "windows")]
-                                        {
-                                            Some(
-                                                div()
-                                                    .id("btn-open-installer")
-                                                    .px(px(12.0))
-                                                    .py(px(6.0))
-                                                    .rounded(px(8.0))
-                                                    .bg(t.bg_elev)
-                                                    .border_1()
-                                                    .border_color(t.border)
-                                                    .cursor_pointer()
-                                                    .hover(|s| s.bg(t.bg_hover))
-                                                    .text_size(px(11.5))
-                                                    .text_color(t.text_soft)
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        if let Ok(exe) = std::env::current_exe() {
-                                                            let _ = Command::new(exe)
-                                                                .arg("--install")
-                                                                .spawn();
-                                                            this.show_toast(this.tr(
-                                                                "Запуск мастера установки Tachyon...",
-                                                                "Launching Tachyon Setup...",
-                                                            ));
-                                                            cx.notify();
-                                                        }
-                                                    }))
-                                                    .child(self.tr(
-                                                        "Установить в систему",
-                                                        "Install to System",
-                                                    ))
-                                                    .into_any_element(),
-                                            )
-                                        }
-                                        #[cfg(not(target_os = "windows"))]
-                                        {
-                                            None::<AnyElement>
-                                        }
-                                    }),
+                                    .child(
+                                        div()
+                                            .id("btn-quit-app")
+                                            .px(px(12.0))
+                                            .py(px(6.0))
+                                            .rounded(px(8.0))
+                                            .bg(t.red_bg)
+                                            .border_1()
+                                            .border_color(t.red)
+                                            .cursor_pointer()
+                                            .hover(|s| s.opacity(0.9))
+                                            .text_size(px(11.5))
+                                            .text_color(t.red)
+                                            .on_click(cx.listener(|this, _, _, _| {
+                                                this.quit_app();
+                                            }))
+                                            .child(self.tr(
+                                                "Выйти из Tachyon",
+                                                "Quit Tachyon",
+                                            )),
+                                    ),
                             )
                             .when(self.update_banner.available, |el| {
                                 el.child(
@@ -7530,6 +9854,7 @@ impl TachyonApp {
                                 )
                             }),
                     ),
+                ),
             )
     }
 
@@ -7548,6 +9873,7 @@ impl TachyonApp {
         div()
             .id(id)
             .w_full()
+            .flex_shrink_0()
             .p(px(10.0))
             .rounded(px(8.0))
             .bg(t.bg_elev)
@@ -7562,22 +9888,31 @@ impl TachyonApp {
             .child(
                 div()
                     .flex_1()
+                    .min_w(px(0.0))
                     .flex()
                     .flex_col()
                     .gap(px(2.0))
                     .child(
                         div()
+                            .w_full()
                             .text_size(px(11.5))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(t.text)
                             .child(title),
                     )
-                    .child(div().text_size(px(10.0)).text_color(t.text_dim).child(subtitle)),
+                    .child(
+                        div()
+                            .w_full()
+                            .text_size(px(10.0))
+                            .text_color(t.text_dim)
+                            .child(subtitle),
+                    ),
             )
             .child(
                 div()
                     .w(px(34.0))
                     .h(px(18.0))
+                    .flex_shrink_0()
                     .p(px(2.0))
                     .rounded(px(9.0))
                     .bg(if checked { t.accent } else { t.bg_card })
@@ -7599,7 +9934,13 @@ impl TachyonApp {
             )
     }
 
-    fn render_modal_overlay(&self, t: Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_modal_overlay(
+        &self,
+        m: LayoutMetrics,
+        t: Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let modal_max_h = (m.height - 48.0).max(260.0);
         match self.modal {
             ModalKind::None => None,
             ModalKind::Subscriptions => Some(
@@ -7609,6 +9950,7 @@ impl TachyonApp {
                     .top_0()
                     .left_0()
                     .size_full()
+                    .p(px(12.0))
                     .occlude()
                     .bg(gpui::rgba(0x000000A6))
                     .flex()
@@ -7616,8 +9958,8 @@ impl TachyonApp {
                     .justify_center()
                     .child(
                         div()
-                            .w(px(620.0))
-                            .max_h(px(520.0))
+                            .w(px((m.width - 32.0).clamp(300.0, 620.0)))
+                            .max_h(px(modal_max_h.min(520.0)))
                             .p(px(16.0))
                             .rounded(px(14.0))
                             .bg(t.bg_card)
@@ -7629,9 +9971,12 @@ impl TachyonApp {
                             .child(
                                 div()
                                     .w_full()
+                                    .flex_shrink_0()
                                     .flex()
                                     .items_center()
                                     .justify_between()
+                                    .flex_wrap()
+                                    .gap(px(6.0))
                                     .child(
                                         div()
                                             .text_size(px(14.0))
@@ -7668,20 +10013,12 @@ impl TachyonApp {
                             .child(
                                 div()
                                     .w_full()
+                                    .flex_shrink_0()
                                     .flex()
                                     .gap(px(8.0))
-                                    .child(
-                                        div()
-                                            .id("input-sub-url")
-                                            .flex_1()
-                                            .h(px(32.0))
-                                            .child(styled_input(
-                                                &self.sub_url_input_state,
-                                                px(32.0),
-                                                11.5,
-                                                t,
-                                            )),
-                                    )
+                                    .child(div().id("input-sub-url").flex_1().h(px(32.0)).child(
+                                        styled_input(&self.sub_url_input_state, px(32.0), 11.5, t),
+                                    ))
                                     .child(
                                         div()
                                             .id("btn-add-sub-submit")
@@ -7707,108 +10044,124 @@ impl TachyonApp {
                                 div()
                                     .id("subs-modal-scroll")
                                     .flex_1()
+                                    .min_h(px(0.0))
                                     .w_full()
                                     .overflow_y_scroll()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(6.0))
-                                    .children(self.state.subscriptions.iter().map(|sub| {
-                                        let sub_url = sub.url.clone();
-                                        let sub_handle = sub.handle.clone();
-                                        let sid = sub.id.clone();
-                                        div()
-                                            .w_full()
-                                            .p(px(10.0))
-                                            .rounded(px(8.0))
-                                            .bg(t.bg_elev)
-                                            .border_1()
-                                            .border_color(t.border)
-                                            .flex()
-                                            .items_center()
-                                            .justify_between()
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .flex_col()
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(12.0))
-                                                            .font_weight(FontWeight::BOLD)
-                                                            .text_color(t.text)
-                                                            .child(sub.handle.clone()),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(10.5))
-                                                            .text_color(t.text_dim)
-                                                            .child(format!(
-                                                                "{}: {} · {}",
-                                                                self.tr("Узлов", "Nodes"),
-                                                                sub.count,
-                                                                truncate_str(&sub.url, 44)
-                                                            )),
-                                                    ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .gap(px(6.0))
-                                                    .child(
-                                                        div()
-                                                            .id(SharedString::from(format!(
-                                                                "refresh-sub-{sid}"
-                                                            )))
-                                                            .px(px(8.0))
-                                                            .py(px(4.0))
-                                                            .rounded(px(6.0))
-                                                            .bg(t.bg_card)
-                                                            .cursor_pointer()
-                                                            .text_size(px(10.5))
-                                                            .text_color(t.accent)
-                                                            .on_click(cx.listener(
-                                                                move |this, _, _, cx| {
-                                                                    this.add_single_server_uri(
-                                                                        &sub_url,
-                                                                        Some(&sub_handle),
-                                                                    );
-                                                                    cx.notify();
-                                                                },
-                                                            ))
-                                                            .child(self.tr("Обновить", "Update")),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .id(SharedString::from(format!(
-                                                                "del-sub-{sid}"
-                                                            )))
-                                                            .px(px(8.0))
-                                                            .py(px(4.0))
-                                                            .rounded(px(6.0))
-                                                            .bg(t.red_bg)
-                                                            .cursor_pointer()
-                                                            .text_size(px(10.5))
-                                                            .text_color(t.red)
-                                                            .on_click(cx.listener(
-                                                                move |this, _, _, cx| {
-                                                                    this.state
-                                                                        .subscriptions
-                                                                        .retain(|s| s.id != sid);
-                                                                    this.state.servers.retain(
-                                                                        |s| {
-                                                                            s.sub_id.as_deref()
-                                                                                != Some(
-                                                                                    sid.as_str(),
-                                                                                )
-                                                                        },
-                                                                    );
-                                                                    this.state.save();
-                                                                    cx.notify();
-                                                                },
-                                                            ))
-                                                            .child(self.tr("Удалить", "Delete")),
-                                                    ),
-                                            )
-                                    })),
+                                    .child(div().w_full().flex().flex_col().gap(px(6.0)).children(
+                                        self.state.subscriptions.iter().map(|sub| {
+                                            let sub_url = sub.url.clone();
+                                            let sub_handle = sub.handle.clone();
+                                            let sid = sub.id.clone();
+                                            div()
+                                                .w_full()
+                                                .p(px(10.0))
+                                                .rounded(px(8.0))
+                                                .bg(t.bg_elev)
+                                                .border_1()
+                                                .border_color(t.border)
+                                                .flex()
+                                                .flex_wrap()
+                                                .items_center()
+                                                .justify_between()
+                                                .gap(px(6.0))
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w(px(0.0))
+                                                        .flex()
+                                                        .flex_col()
+                                                        .child(
+                                                            div()
+                                                                .w_full()
+                                                                .truncate()
+                                                                .text_size(px(12.0))
+                                                                .font_weight(FontWeight::BOLD)
+                                                                .text_color(t.text)
+                                                                .child(sub.handle.clone()),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .w_full()
+                                                                .truncate()
+                                                                .text_size(px(10.5))
+                                                                .text_color(t.text_dim)
+                                                                .child(format!(
+                                                                    "{}: {} · {}",
+                                                                    self.tr("Узлов", "Nodes"),
+                                                                    sub.count,
+                                                                    truncate_str(&sub.url, 44)
+                                                                )),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_shrink_0()
+                                                        .flex()
+                                                        .gap(px(6.0))
+                                                        .child(
+                                                            div()
+                                                                .id(SharedString::from(format!(
+                                                                    "refresh-sub-{sid}"
+                                                                )))
+                                                                .px(px(8.0))
+                                                                .py(px(4.0))
+                                                                .rounded(px(6.0))
+                                                                .bg(t.bg_card)
+                                                                .cursor_pointer()
+                                                                .text_size(px(10.5))
+                                                                .text_color(t.accent)
+                                                                .on_click(cx.listener(
+                                                                    move |this, _, _, cx| {
+                                                                        this.add_single_server_uri(
+                                                                            &sub_url,
+                                                                            Some(&sub_handle),
+                                                                        );
+                                                                        cx.notify();
+                                                                    },
+                                                                ))
+                                                                .child(
+                                                                    self.tr("Обновить", "Update"),
+                                                                ),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .id(SharedString::from(format!(
+                                                                    "del-sub-{sid}"
+                                                                )))
+                                                                .px(px(8.0))
+                                                                .py(px(4.0))
+                                                                .rounded(px(6.0))
+                                                                .bg(t.red_bg)
+                                                                .cursor_pointer()
+                                                                .text_size(px(10.5))
+                                                                .text_color(t.red)
+                                                                .on_click(cx.listener(
+                                                                    move |this, _, _, cx| {
+                                                                        this.state
+                                                                            .subscriptions
+                                                                            .retain(|s| {
+                                                                                s.id != sid
+                                                                            });
+                                                                        this.state.servers.retain(
+                                                                            |s| {
+                                                                                s.sub_id.as_deref()
+                                                                                    != Some(
+                                                                                        sid.as_str(
+                                                                                        ),
+                                                                                    )
+                                                                            },
+                                                                        );
+                                                                        this.state.save();
+                                                                        cx.notify();
+                                                                    },
+                                                                ))
+                                                                .child(
+                                                                    self.tr("Удалить", "Delete"),
+                                                                ),
+                                                        ),
+                                                )
+                                        }),
+                                    )),
                             ),
                     )
                     .into_any_element(),
@@ -7820,14 +10173,15 @@ impl TachyonApp {
                     .top_0()
                     .left_0()
                     .size_full()
+                    .p(px(12.0))
                     .bg(gpui::rgba(0x000000A6))
                     .flex()
                     .items_center()
                     .justify_center()
                     .child(
                         div()
-                            .w(px(760.0))
-                            .h(px(480.0))
+                            .w(px((m.width - 32.0).clamp(300.0, 760.0)))
+                            .h(px(modal_max_h.min(480.0)))
                             .p(px(16.0))
                             .rounded(px(14.0))
                             .bg(t.bg_card)
@@ -7839,9 +10193,12 @@ impl TachyonApp {
                             .child(
                                 div()
                                     .w_full()
+                                    .flex_shrink_0()
                                     .flex()
                                     .items_center()
                                     .justify_between()
+                                    .flex_wrap()
+                                    .gap(px(6.0))
                                     .child(
                                         div()
                                             .text_size(px(14.0))
@@ -7855,6 +10212,7 @@ impl TachyonApp {
                                     .child(
                                         div()
                                             .flex()
+                                            .flex_wrap()
                                             .gap(px(6.0))
                                             .child(
                                                 div()
@@ -7888,10 +10246,9 @@ impl TachyonApp {
                                                                 this.log_tail.clone(),
                                                             ),
                                                         );
-                                                        this.show_toast(this.tr(
-                                                            "Лог скопирован",
-                                                            "Log copied",
-                                                        ));
+                                                        this.show_toast(
+                                                            this.tr("Лог скопирован", "Log copied"),
+                                                        );
                                                         cx.notify();
                                                     }))
                                                     .child(self.tr("Копировать", "Copy")),
@@ -7924,6 +10281,7 @@ impl TachyonApp {
                                 div()
                                     .id("log-modal-scroll")
                                     .flex_1()
+                                    .min_h(px(0.0))
                                     .w_full()
                                     .p(px(10.0))
                                     .rounded(px(8.0))
@@ -7949,36 +10307,48 @@ impl TachyonApp {
 impl Render for TachyonApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = Theme::for_mode(self.state.light_theme);
-
-        // Устанавливаем фокус на корневой элемент, чтобы input-поля получали клавиатурные события
-        window.focus(&self.focus_handle, cx);
+        let vp = window.viewport_size();
+        let width = f32::from(vp.width);
+        let height = f32::from(vp.height);
+        let narrow = width < 640.0;
+        let m = LayoutMetrics {
+            width,
+            height,
+            avail_w: (width - if narrow { 20.0 } else { 32.0 } - 8.0).max(260.0),
+            narrow,
+            compact: width < 960.0,
+            short: height < 640.0,
+            wide: width >= 1200.0,
+            is_maximized: window.is_maximized(),
+        };
 
         div()
             .id("tachyon-root")
-            .track_focus(&self.focus_handle)
             .size_full()
+            .overflow_hidden()
             .bg(t.bg)
             .text_color(t.text)
             .relative()
             .flex()
             .flex_col()
-            .child(self.render_titlebar(t, cx))
-            .child(self.render_navbar(t, cx))
+            .child(self.render_titlebar(m, t, cx))
+            .child(self.render_navbar(m, t, cx))
             .child(
                 div()
                     .flex_1()
+                    .min_h(px(0.0))
                     .w_full()
                     .overflow_hidden()
                     .child(match self.tab {
-                        Tab::Tunnel => self.render_tunnel_tab(t, cx).into_any_element(),
-                        Tab::Desync => self.render_desync_tab(t, cx).into_any_element(),
-                        Tab::Routes => self.render_routes_tab(t, cx).into_any_element(),
-                        Tab::Nodes => self.render_nodes_tab(t, cx).into_any_element(),
-                        Tab::Traffic => self.render_traffic_tab(t, cx).into_any_element(),
-                        Tab::Options => self.render_options_tab(t, cx).into_any_element(),
+                        Tab::Tunnel => self.render_tunnel_tab(m, t, cx).into_any_element(),
+                        Tab::Desync => self.render_desync_tab(m, t, cx).into_any_element(),
+                        Tab::Routes => self.render_routes_tab(m, t, cx).into_any_element(),
+                        Tab::Nodes => self.render_nodes_tab(m, t, cx).into_any_element(),
+                        Tab::Traffic => self.render_traffic_tab(m, t, cx).into_any_element(),
+                        Tab::Options => self.render_options_tab(m, t, cx).into_any_element(),
                     }),
             )
-            .child(self.render_footer(t, cx))
+            .child(self.render_footer(m, t, cx))
             .when_some(self.toast.as_ref(), |el, (msg, _)| {
                 el.child(
                     div()
@@ -7999,13 +10369,7 @@ impl Render for TachyonApp {
                                 .flex()
                                 .items_center()
                                 .gap(px(8.0))
-                                .child(
-                                    div()
-                                        .w(px(7.0))
-                                        .h(px(7.0))
-                                        .rounded(px(4.0))
-                                        .bg(t.green),
-                                )
+                                .child(div().w(px(7.0)).h(px(7.0)).rounded(px(4.0)).bg(t.green))
                                 .child(
                                     div()
                                         .text_size(px(11.5))
@@ -8016,7 +10380,7 @@ impl Render for TachyonApp {
                         ),
                 )
             })
-            .children(self.render_modal_overlay(t, cx))
+            .children(self.render_modal_overlay(m, t, cx))
     }
 }
 
@@ -8025,7 +10389,7 @@ fn pick_conf_files_native() -> Vec<PathBuf> {
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let ps = r#"Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.OpenFileDialog; $d.Filter = 'WireGuard / AmneziaWG (*.conf;*.json;*.txt)|*.conf;*.json;*.txt|All files (*.*)|*.*'; $d.Multiselect = $true; if ($d.ShowDialog() -eq 'OK') { $d.FileNames -join "`n" }"#;
+        let ps = r#"Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.OpenFileDialog; $d.Filter = 'Tachyon Profiles (*.conf;*.ovpn;*.json;*.txt)|*.conf;*.ovpn;*.json;*.txt|All files (*.*)|*.*'; $d.Multiselect = $true; if ($d.ShowDialog() -eq 'OK') { $d.FileNames -join "`n" }"#;
         if let Ok(out) = Command::new("powershell")
             .args(["-NoProfile", "-Sta", "-Command", ps])
             .creation_flags(CREATE_NO_WINDOW)
@@ -8073,7 +10437,31 @@ fn pick_conf_files_native() -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_custom_rule_entries;
+    use super::{adaptive_card_width, parse_custom_rule_entries};
+
+    #[test]
+    fn test_adaptive_card_width_fits_all_viewports() {
+        let gap = 8.0_f32;
+        for vp_w in [460.0_f32, 620.0, 800.0, 940.0, 1120.0, 1440.0, 1920.0] {
+            let narrow = vp_w < 640.0;
+            let avail = (vp_w - if narrow { 20.0 } else { 32.0 } - 8.0).max(260.0);
+            for (min_card, max_cols) in [(175.0_f32, 5usize), (255.0, 4), (220.0, 5)] {
+                let card_w = adaptive_card_width(avail - 8.0, min_card, max_cols, gap);
+                let inner_avail = (avail - 8.0).max(200.0);
+                let cols = if inner_avail <= min_card + 20.0 {
+                    1usize
+                } else {
+                    (((inner_avail + gap) / (min_card + gap)).floor() as usize).clamp(1, max_cols)
+                };
+                assert!(cols >= 1);
+                let total_row_w = (cols as f32) * card_w + ((cols.saturating_sub(1)) as f32) * gap;
+                assert!(
+                    total_row_w <= inner_avail + 0.01,
+                    "overflow at vp={vp_w}, avail={inner_avail}: cols={cols}, card_w={card_w}, row={total_row_w}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_parse_custom_rule_entries() {

@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util"
+     xmlns:fw="http://wixtoolset.org/schemas/v4/wxs/firewall">
+
+  <Package Name="Tachyon"
+           Manufacturer="Tachyon"
+           Version="$(var.ProductVersion)"
+           UpgradeCode="{9E4B6C2A-7D31-4F8B-A156-3C8F4B92E701}"
+           Scope="perMachine"
+           Language="1049"
+           Codepage="1251">
+
+    <MajorUpgrade DowngradeErrorMessage="!(loc.DowngradeError)" Schedule="afterInstallInitialize" />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Icon Id="TachyonIcon.ico" SourceFile="$(var.IconPath)" />
+    <Property Id="ARPPRODUCTICON" Value="TachyonIcon.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/Dushnilin/tachyon-desktop" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/Dushnilin/tachyon-desktop/issues" />
+    <Property Id="ARPNOREPAIR" Value="yes" />
+
+    <!-- Опции установки по умолчанию -->
+    <Property Id="INSTALLDESKTOPSHORTCUT" Value="1" Secure="yes" />
+    <Property Id="INSTALLAUTOSTART" Secure="yes" />
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="!(loc.LaunchAfterInstall)" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <Property Id="WixShellExecTarget" Value="[#TachyonExe]" />
+
+    <!-- Закрываем работающий процесс Tachyon перед обновлением и удалением -->
+    <util:CloseApplication Id="CloseTachyonExe"
+                           Target="Tachyon.exe"
+                           CloseMessage="yes"
+                           RebootPrompt="no" />
+
+    <!-- Запуск приложения после установки при включённом чекбоксе -->
+    <CustomAction Id="LaunchApplication"
+                  DllEntry="WixShellExec"
+                  Impersonate="yes"
+                  BinaryRef="Wix4UtilCA_X64" />
+
+    <Feature Id="MainFeature"
+             Title="!(loc.FeatureMainTitle)"
+             Description="!(loc.FeatureMainDescription)"
+             Level="1">
+      <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="DesktopShortcut" />
+      <ComponentRef Id="AutostartRegistry" />
+    </Feature>
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Tachyon">
+        <Component Id="MainExecutable" Guid="{4F61C8E2-3B19-4C7A-9E12-8D4A71F0C311}">
+          <File Id="TachyonExe"
+                Name="Tachyon.exe"
+                Source="$(var.BinaryPath)"
+                KeyPath="yes" />
+
+          <!-- Исключения брандмауэра Windows для входящих и исходящих соединений -->
+          <fw:FirewallException Id="TachyonFirewallTcp"
+                                Name="Tachyon (TCP)"
+                                Program="[#TachyonExe]"
+                                Protocol="tcp"
+                                Scope="any"
+                                Profile="all"
+                                IgnoreFailure="yes" />
+          <fw:FirewallException Id="TachyonFirewallUdp"
+                                Name="Tachyon (UDP)"
+                                Program="[#TachyonExe]"
+                                Protocol="udp"
+                                Scope="any"
+                                Profile="all"
+                                IgnoreFailure="yes" />
+
+          <!-- Регистрация схемы ссылок tachyon:// -->
+          <RegistryKey Root="HKLM" Key="Software\Classes\tachyon">
+            <RegistryValue Type="string" Value="URL:Tachyon Protocol" />
+            <RegistryValue Name="URL Protocol" Type="string" Value="" />
+            <RegistryKey Key="DefaultIcon">
+              <RegistryValue Type="string" Value="&quot;[#TachyonExe]&quot;,0" />
+            </RegistryKey>
+            <RegistryKey Key="shell\open\command">
+              <RegistryValue Type="string" Value="&quot;[#TachyonExe]&quot; &quot;%1&quot;" />
+            </RegistryKey>
+          </RegistryKey>
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="AppMenuFolder" Name="Tachyon">
+        <Component Id="StartMenuShortcut" Guid="{7A18E30D-5C4B-4E91-8A74-2F9D10B5C622}">
+          <Shortcut Id="StartMenuTachyonShortcut"
+                    Name="Tachyon"
+                    Description="!(loc.AppDescription)"
+                    Target="[INSTALLFOLDER]Tachyon.exe"
+                    WorkingDirectory="INSTALLFOLDER"
+                    Icon="TachyonIcon.ico" />
+          <RemoveFolder Id="RemoveAppMenuFolder" On="uninstall" />
+          <RegistryValue Root="HKCU"
+                         Key="Software\Tachyon\Installer"
+                         Name="StartMenuShortcut"
+                         Type="integer"
+                         Value="1"
+                         KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="DesktopFolder">
+      <Component Id="DesktopShortcut"
+                 Guid="{2C85F19A-6E14-4B3D-9D08-6A3E7F11B433}"
+                 Condition="INSTALLDESKTOPSHORTCUT = 1">
+        <Shortcut Id="DesktopTachyonShortcut"
+                  Name="Tachyon"
+                  Description="!(loc.AppDescription)"
+                  Target="[INSTALLFOLDER]Tachyon.exe"
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="TachyonIcon.ico" />
+        <RegistryValue Root="HKCU"
+                       Key="Software\Tachyon\Installer"
+                       Name="DesktopShortcut"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <Component Id="AutostartRegistry"
+               Directory="INSTALLFOLDER"
+               Guid="{8D39A471-1F20-4E8C-B512-9C7A3E02D844}"
+               Condition="INSTALLAUTOSTART = 1">
+      <RegistryValue Root="HKCU"
+                     Key="Software\Microsoft\Windows\CurrentVersion\Run"
+                     Name="Tachyon"
+                     Type="string"
+                     Value="&quot;[INSTALLFOLDER]Tachyon.exe&quot;"
+                     KeyPath="yes" />
+    </Component>
+
+    <UIRef Id="TachyonUI" />
+  </Package>
+</Wix>

@@ -1,5 +1,5 @@
 ﻿param(
-    [string]$Version = "0.3.9"
+    [string]$Version = "0.4.0"
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,41 +26,94 @@ New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
 $PlainExe = Join-Path $DistDir "Tachyon.exe"
 $PortableExe = Join-Path $DistDir "Tachyon-windows-x86_64.exe"
 $PortableZip = Join-Path $DistDir "Tachyon-windows-x86_64.zip"
-$SetupExe = Join-Path $DistDir "Tachyon-Setup-x86_64.exe"
+$MsiOut = Join-Path $DistDir "Tachyon-$Version-x86_64.msi"
 
 Copy-Item -LiteralPath $TargetExe -Destination $PlainExe -Force
 Copy-Item -LiteralPath $TargetExe -Destination $PortableExe -Force
 Compress-Archive -Path $PortableExe -DestinationPath $PortableZip -Force
 
-# Формируем одиночный установщик дописыванием 8-байтового маркера TCHYINST в конец PE-файла
-Copy-Item -LiteralPath $PortableExe -Destination $SetupExe -Force
-$MagicBytes = [System.Text.Encoding]::ASCII.GetBytes("TCHYINST")
-$Stream = [System.IO.File]::Open($SetupExe, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write)
-try {
-    $Stream.Write($MagicBytes, 0, $MagicBytes.Length)
-} finally {
-    $Stream.Dispose()
+# Удаляем устаревший артефакт самописного установщика при пересборке
+$LegacySetup = Join-Path $DistDir "Tachyon-Setup-x86_64.exe"
+if (Test-Path -LiteralPath $LegacySetup) {
+    Remove-Item -LiteralPath $LegacySetup -Force
 }
 
-# Проверяем наличие маркера TCHYINST в хвосте установщика
-$VerifyStream = [System.IO.File]::OpenRead($SetupExe)
-try {
-    if ($VerifyStream.Length -lt $MagicBytes.Length) {
-        throw "Setup executable is unexpectedly small"
+$WixDir = Join-Path $ProjectDir "wix"
+$WixProj = Join-Path $WixDir "Tachyon.wixproj"
+$IconPath = Join-Path $RootDir "src\app.ico"
+$BannerBmp = Join-Path $WixDir "banner.bmp"
+$DialogBmp = Join-Path $WixDir "dialog.bmp"
+
+if ((-not (Test-Path -LiteralPath $BannerBmp)) -or (-not (Test-Path -LiteralPath $DialogBmp))) {
+    $GenScript = Join-Path $WixDir "generate-branding.ps1"
+    & powershell -ExecutionPolicy Bypass -File $GenScript -OutDir $WixDir
+}
+
+# Windows Installer требует числовую версию Major.Minor.Patch[.Build]
+if ($Version -match '^(\d+\.\d+\.\d+)') {
+    $MsiVersion = $Matches[1]
+} else {
+    $MsiVersion = "0.4.0"
+}
+
+Write-Host "==> Building Windows Installer MSI (v$MsiVersion)..."
+$MsiBuildOut = Join-Path $WixDir "bin\Release\ru-RU"
+dotnet build $WixProj -c Release `
+    "-p:ProductVersion=$MsiVersion" `
+    "-p:BinaryPath=$TargetExe" `
+    "-p:IconPath=$IconPath" `
+    "-p:BannerBmp=$BannerBmp" `
+    "-p:DialogBmp=$DialogBmp"
+if ($LASTEXITCODE -ne 0) {
+    throw "dotnet build for MSI failed with exit code $LASTEXITCODE"
+}
+
+$BuiltMsi = Join-Path $MsiBuildOut "Tachyon.msi"
+if (-not (Test-Path -LiteralPath $BuiltMsi)) {
+    throw "Built MSI not found at $BuiltMsi"
+}
+Copy-Item -LiteralPath $BuiltMsi -Destination $MsiOut -Force
+
+$MsiInfo = Get-Item -LiteralPath $MsiOut
+if ($MsiInfo.Length -le 0) {
+    throw "Packaged MSI is empty at $MsiOut"
+}
+
+# Проверяем метаданные собранного MSI через WindowsInstaller COM API
+if ($PSVersionTable.PSEdition -eq "Core") {
+    $env:TACHYON_MSI_OUT = $MsiOut
+    $env:TACHYON_MSI_VER = $MsiVersion
+    try {
+        $PropsJson = & powershell.exe -NoProfile -NonInteractive -Command '$ErrorActionPreference="Stop"; $Wi=New-Object -ComObject WindowsInstaller.Installer; $Db=$Wi.OpenDatabase($env:TACHYON_MSI_OUT,0); $View=$Db.OpenView("SELECT Property, Value FROM Property WHERE Property=''ProductName'' OR Property=''ProductVersion'' OR Property=''UpgradeCode''"); $View.Execute(); $Props=@{}; while($Row=$View.Fetch()){ $Props[$Row.StringData(1)]=$Row.StringData(2) }; $View.Close(); if($Props["ProductName"] -ne "Tachyon" -or $Props["ProductVersion"] -ne $env:TACHYON_MSI_VER){ throw "Unexpected MSI metadata: ProductName=$($Props[''ProductName'']), ProductVersion=$($Props[''ProductVersion''])" }; $Props | ConvertTo-Json -Compress'
+        if ($LASTEXITCODE -ne 0) {
+            throw "MSI metadata check failed in powershell.exe with exit code $LASTEXITCODE"
+        }
+        $Parsed = ($PropsJson | Out-String) | ConvertFrom-Json
+        $Props = @{
+            "ProductName"    = $Parsed.ProductName
+            "ProductVersion" = $Parsed.ProductVersion
+            "UpgradeCode"    = $Parsed.UpgradeCode
+        }
+    } finally {
+        Remove-Item Env:TACHYON_MSI_OUT, Env:TACHYON_MSI_VER -ErrorAction SilentlyContinue
     }
-    $VerifyStream.Seek(-$MagicBytes.Length, [System.IO.SeekOrigin]::End) | Out-Null
-    $Tail = New-Object byte[] $MagicBytes.Length
-    $Read = $VerifyStream.Read($Tail, 0, $Tail.Length)
-    $TailText = [System.Text.Encoding]::ASCII.GetString($Tail, 0, $Read)
-    if ($TailText -ne "TCHYINST") {
-        throw "Failed to verify TCHYINST trailer on $SetupExe"
+} else {
+    $Wi = New-Object -ComObject WindowsInstaller.Installer
+    $Db = $Wi.OpenDatabase($MsiOut, 0)
+    $View = $Db.OpenView("SELECT Property, Value FROM Property WHERE Property='ProductName' OR Property='ProductVersion' OR Property='UpgradeCode'")
+    $View.Execute()
+    $Props = @{}
+    while ($Row = $View.Fetch()) {
+        $Props[$Row.StringData(1)] = $Row.StringData(2)
     }
-} finally {
-    $VerifyStream.Dispose()
+    $View.Close()
+}
+if ($Props["ProductName"] -ne "Tachyon" -or $Props["ProductVersion"] -ne $MsiVersion) {
+    throw "Unexpected MSI metadata: ProductName=$($Props['ProductName']), ProductVersion=$($Props['ProductVersion'])"
 }
 
 Write-Host "==> Packaged Windows artifacts in ${DistDir}:"
 Write-Host "    - $PlainExe"
 Write-Host "    - $PortableExe"
 Write-Host "    - $PortableZip"
-Write-Host "    - $SetupExe"
+Write-Host "    - $MsiOut ($($MsiInfo.Length) bytes, ProductVersion=$($Props['ProductVersion']), UpgradeCode=$($Props['UpgradeCode']))"

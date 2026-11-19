@@ -31,7 +31,11 @@ impl HttpResponse {
     }
 }
 
-async fn connect_stream(url: &Url, proxy_port: Option<u16>, timeout: Duration) -> io::Result<AnyStream> {
+async fn connect_stream(
+    url: &Url,
+    proxy_port: Option<u16>,
+    timeout: Duration,
+) -> io::Result<AnyStream> {
     if let Some(pport) = proxy_port {
         let mut tcp = tokio::time::timeout(timeout, TcpStream::connect(("127.0.0.1", pport)))
             .await
@@ -60,7 +64,8 @@ async fn connect_stream(url: &Url, proxy_port: Option<u16>, timeout: Duration) -
                 }
             }
             let status_line = String::from_utf8_lossy(&hdr_buf);
-            if !status_line.starts_with("HTTP/1.1 200") && !status_line.starts_with("HTTP/1.0 200") {
+            if !status_line.starts_with("HTTP/1.1 200") && !status_line.starts_with("HTTP/1.0 200")
+            {
                 return Err(io::Error::other(format!(
                     "proxy CONNECT failed: {}",
                     status_line.lines().next().unwrap_or("bad status")
@@ -87,7 +92,9 @@ async fn connect_stream(url: &Url, proxy_port: Option<u16>, timeout: Duration) -
     }
 }
 
-async fn read_http_head(stream: &mut AnyStream) -> io::Result<(u16, Vec<(String, String)>, Vec<u8>)> {
+async fn read_http_head(
+    stream: &mut AnyStream,
+) -> io::Result<(u16, Vec<(String, String)>, Vec<u8>)> {
     let mut buf = Vec::with_capacity(2048);
     let mut temp = [0u8; 1024];
     let header_end = loop {
@@ -189,7 +196,16 @@ pub async fn fetch_url(
     proxy_port: Option<u16>,
     timeout: Duration,
 ) -> io::Result<HttpResponse> {
-    fetch_url_with_progress(raw_url, method, extra_headers, body, proxy_port, timeout, |_, _| {}).await
+    fetch_url_with_progress(
+        raw_url,
+        method,
+        extra_headers,
+        body,
+        proxy_port,
+        timeout,
+        |_, _| {},
+    )
+    .await
 }
 
 pub async fn fetch_url_with_progress<F>(
@@ -249,9 +265,12 @@ where
         }
         stream.flush().await?;
 
-        let (status, headers, mut leftover) = tokio::time::timeout(timeout, read_http_head(&mut stream))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTP header read timeout"))??;
+        let (status, headers, mut leftover) =
+            tokio::time::timeout(timeout, read_http_head(&mut stream))
+                .await
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "HTTP header read timeout")
+                })??;
 
         if matches!(status, 301 | 302 | 303 | 307 | 308) {
             if let Some((_, loc)) = headers.iter().find(|(k, _)| k == "location") {
@@ -274,12 +293,11 @@ where
 
         let max_bytes = 96 * 1024 * 1024;
         let raw_body = if is_chunked {
-            tokio::time::timeout(
-                timeout,
-                read_chunked_body(&mut stream, leftover, max_bytes),
-            )
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTP chunked read timeout"))??
+            tokio::time::timeout(timeout, read_chunked_body(&mut stream, leftover, max_bytes))
+                .await
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "HTTP chunked read timeout")
+                })??
         } else if let Some(len) = content_len {
             if len > max_bytes {
                 return Err(io::Error::other("HTTP body too large"));
@@ -291,7 +309,9 @@ where
                 let to_read = (len - leftover.len()).min(tmp.len());
                 let n = tokio::time::timeout(timeout, stream.read(&mut tmp[..to_read]))
                     .await
-                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTP body read timeout"))??;
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "HTTP body read timeout")
+                    })??;
                 if n == 0 {
                     break;
                 }
@@ -404,7 +424,9 @@ pub async fn clash_api_request(
         leftover.truncate(len);
     } else {
         let mut tmp = [0u8; 4096];
-        while let Ok(Ok(n)) = tokio::time::timeout(Duration::from_millis(500), boxed.read(&mut tmp)).await {
+        while let Ok(Ok(n)) =
+            tokio::time::timeout(Duration::from_millis(500), boxed.read(&mut tmp)).await
+        {
             if n == 0 {
                 break;
             }
@@ -445,7 +467,10 @@ where
 
     for (raw_url, label) in candidates {
         if *cancel_rx.borrow() {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "Тест остановлен"));
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Тест остановлен",
+            ));
         }
         let Ok(mut cur_url) = Url::parse(raw_url) else {
             continue;
@@ -454,7 +479,8 @@ where
         let mut ok_conn = None;
 
         for _ in 0..4 {
-            let Ok(mut st) = connect_stream(&cur_url, proxy_port, Duration::from_secs(6)).await else {
+            let Ok(mut st) = connect_stream(&cur_url, proxy_port, Duration::from_secs(6)).await
+            else {
                 break;
             };
             let req_path = if proxy_port.is_some() && !cur_url.secure {
@@ -581,12 +607,20 @@ where
             let elapsed_ms = dl_sw.elapsed().as_millis() as u64;
             if elapsed_ms.saturating_sub(last_report_ms) >= 200 {
                 let sec_total = dl_sw.elapsed().as_secs_f64().max(0.05);
-                let cur_mbps = (((total_bytes as f64) * 8.0) / (sec_total * 1_000_000.0) * 10.0).round() / 10.0;
-                let cur_mbs = (((total_bytes as f64) / (1024.0 * 1024.0)) / sec_total * 100.0).round() / 100.0;
+                let cur_mbps = (((total_bytes as f64) * 8.0) / (sec_total * 1_000_000.0) * 10.0)
+                    .round()
+                    / 10.0;
+                let cur_mbs = (((total_bytes as f64) / (1024.0 * 1024.0)) / sec_total * 100.0)
+                    .round()
+                    / 100.0;
 
                 let win_dt = elapsed_ms.saturating_sub(window_start_ms);
                 if win_dt >= 250 {
-                    let inst_mbps = (((window_bytes as f64) * 8.0) / ((win_dt as f64 / 1000.0) * 1_000_000.0) * 10.0).round() / 10.0;
+                    let inst_mbps = (((window_bytes as f64) * 8.0)
+                        / ((win_dt as f64 / 1000.0) * 1_000_000.0)
+                        * 10.0)
+                        .round()
+                        / 10.0;
                     if inst_mbps > peak_mbps {
                         peak_mbps = inst_mbps;
                     }

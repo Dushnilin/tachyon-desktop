@@ -1,0 +1,19 @@
+<Project Sdk="WixToolset.Sdk/5.0.2">
+  <PropertyGroup>
+    <InstallerPlatform>x64</InstallerPlatform>
+    <OutputName>Tachyon</OutputName>
+    <Cultures>ru-RU</Cultures>
+    <ProductVersion Condition="'$(ProductVersion)' == ''">0.4.0</ProductVersion>
+    <BinaryPath Condition="'$(BinaryPath)' == ''">$(MSBuildThisFileDirectory)..\target\release\tachyon.exe</BinaryPath>
+    <IconPath Condition="'$(IconPath)' == ''">$(MSBuildThisFileDirectory)..\..\src\app.ico</IconPath>
+    <BannerBmp Condition="'$(BannerBmp)' == ''">$(MSBuildThisFileDirectory)banner.bmp</BannerBmp>
+    <DialogBmp Condition="'$(DialogBmp)' == ''">$(MSBuildThisFileDirectory)dialog.bmp</DialogBmp>
+    <DefineConstants>ProductVersion=$(ProductVersion);BinaryPath=$(BinaryPath);IconPath=$(IconPath);BannerBmp=$(BannerBmp);DialogBmp=$(DialogBmp)</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="WixToolset.UI.wixext" Version="5.0.2" />
+    <PackageReference Include="WixToolset.Util.wixext" Version="5.0.2" />
+    <PackageReference Include="WixToolset.Firewall.wixext" Version="5.0.2" />
+  </ItemGroup>
+</Project>
