@@ -20,9 +20,9 @@
 
 | Платформа | Файл в релизе | Особенности запуска и установки |
 | :--- | :--- | :--- |
-| **Windows 10 / 11** (`x86_64`) | `Tachyon-0.4.0-x86_64.msi`<br/>`Tachyon-windows-x86_64.exe`<br/>`Tachyon-windows-x86_64.zip` | Установщик Windows Installer `Tachyon-0.4.0-x86_64.msi` (ярлыки, исключения брандмауэра, URI `tachyon://`, тихая установка `msiexec /i Tachyon-0.4.0-x86_64.msi /qn`) или портативный одиночный `.exe` без внешних `.dll`. |
-| **Linux** (`x86_64` / `amd64`) | `tachyon_0.4.0_amd64.deb`<br/>`tachyon-linux-amd64.tar.gz` | Пакет `.deb` для Ubuntu/Debian/Mint или архив с `install.sh` для Arch/Fedora. Автоматически выставляет `cap_net_admin,cap_net_raw+eip` через `setcap`. |
-| **macOS 11+** (`Universal`) | `Tachyon-0.4.0-macOS.dmg` | Универсальный образ (`Apple Silicon M1–M4 + Intel x86_64`). Перетащите `Tachyon.app` в `Applications`. |
+| **Windows 10 / 11** (`x86_64`) | `Tachyon-0.4.1-x86_64.msi`<br/>`Tachyon-windows-x86_64.exe`<br/>`Tachyon-windows-x86_64.zip` | Установщик Windows Installer `Tachyon-0.4.1-x86_64.msi` (ярлыки, исключения брандмауэра, URI `tachyon://`, тихая установка `msiexec /i Tachyon-0.4.1-x86_64.msi /qn`) или портативный одиночный `.exe` без внешних `.dll`. |
+| **Linux** (`x86_64` / `amd64`) | `tachyon_0.4.1_amd64.deb`<br/>`tachyon-linux-amd64.tar.gz` | Пакет `.deb` для Ubuntu/Debian/Mint или архив с `install.sh` для Arch/Fedora. Автоматически выставляет `cap_net_admin,cap_net_raw+eip` через `setcap`. |
+| **macOS 11+** (`Universal`) | `Tachyon-0.4.1-macOS.dmg` | Универсальный образ (`Apple Silicon M1–M4 + Intel x86_64`). Перетащите `Tachyon.app` в `Applications`. |
 
 > **Автообновление из клиента:** в разделе **Опции → Движок и обновления** встроена прямая проверка релизов `Dushnilin/tachyon-desktop` через GitHub Releases API с загрузкой свежего бинарного файла под текущую ОС и атомарной заменой на лету.
 
@@ -98,8 +98,8 @@ cd tachyon-desktop
 ### Windows (`x86_64`)
 
 ```powershell
-# Сборка портативного .exe, .zip и MSI-установщика Tachyon-0.4.0-x86_64.msi в папку ./dist/
-powershell -ExecutionPolicy Bypass -File .\desktop-rs\scripts\package-windows.ps1 0.4.0
+# Сборка портативного .exe, .zip и MSI-установщика Tachyon-0.4.1-x86_64.msi в папку ./dist/
+powershell -ExecutionPolicy Bypass -File .\desktop-rs\scripts\package-windows.ps1 0.4.1
 ```
 
 ### Linux (`Ubuntu / Debian / Arch / Fedora`)
@@ -110,7 +110,7 @@ sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicat
 
 # Сборка .deb и портативного .tar.gz в папку ./dist/
 chmod +x desktop-rs/scripts/package-linux.sh
-./desktop-rs/scripts/package-linux.sh 0.4.0
+./desktop-rs/scripts/package-linux.sh 0.4.1
 ```
 
 ### macOS (`Universal: Apple Silicon + Intel`)
@@ -118,8 +118,8 @@ chmod +x desktop-rs/scripts/package-linux.sh
 ```bash
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
 chmod +x desktop-rs/scripts/package-macos.sh
-./desktop-rs/scripts/package-macos.sh --universal 0.4.0
-# Готовый образ: ./dist/Tachyon-0.4.0-macOS.dmg
+./desktop-rs/scripts/package-macos.sh --universal 0.4.1
+# Готовый образ: ./dist/Tachyon-0.4.1-macOS.dmg
 ```
 
 ---

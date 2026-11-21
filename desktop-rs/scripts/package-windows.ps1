@@ -1,5 +1,5 @@
 ﻿param(
-    [string]$Version = "0.4.0"
+    [string]$Version = "0.4.1"
 )
 
 $ErrorActionPreference = "Stop"
@@ -53,7 +53,7 @@ if ((-not (Test-Path -LiteralPath $BannerBmp)) -or (-not (Test-Path -LiteralPath
 if ($Version -match '^(\d+\.\d+\.\d+)') {
     $MsiVersion = $Matches[1]
 } else {
-    $MsiVersion = "0.4.0"
+    $MsiVersion = "0.4.1"
 }
 
 Write-Host "==> Building Windows Installer MSI (v$MsiVersion)..."
