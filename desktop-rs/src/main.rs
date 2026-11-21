@@ -21,19 +21,45 @@ use gpui::{
 
 use crate::icons::TachyonAssetSource;
 use crate::ui::TachyonApp;
-use crate::vpn::{VpnManager, app_data_dir, cleanup_stale_state_on_startup, flush_os_dns};
+use crate::vpn::{
+    VpnManager, app_data_dir, cleanup_stale_state_on_startup, detect_passive_tun_error,
+    flush_os_dns,
+};
 
-fn has_tun_inbound(root: &serde_json::Value) -> bool {
-    root.get("inbounds")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|arr| {
-            arr.iter()
-                .any(|ib| ib.get("type").and_then(serde_json::Value::as_str) == Some("tun"))
-        })
+#[cfg(unix)]
+fn raise_nofile_limit() {
+    let mut rl = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 {
+        return;
+    }
+    let max_allowed = if rl.rlim_max == libc::RLIM_INFINITY {
+        65536
+    } else {
+        rl.rlim_max
+    };
+    for target in [65536u64, 32768, 16384, 10240, 4096] {
+        let clamped = (target as libc::rlim_t).min(max_allowed);
+        if clamped <= rl.rlim_cur {
+            break;
+        }
+        let next = libc::rlimit {
+            rlim_cur: clamped,
+            rlim_max: rl.rlim_max,
+        };
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &next) } == 0 {
+            break;
+        }
+    }
 }
 
 fn run_core_worker_mode(cfg_path: &str) -> i32 {
-    let data_dir = app_data_dir();
+    let data_dir = std::path::Path::new(cfg_path)
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(app_data_dir);
     let pid_file = data_dir.join("core.pid");
     let err_file = data_dir.join("core.err");
     let stop_file = data_dir.join("config.stop");
@@ -71,12 +97,7 @@ fn run_core_worker_mode(cfg_path: &str) -> i32 {
             }
         };
 
-        #[cfg(target_os = "windows")]
-        if has_tun_inbound(&root)
-            && core_runtime::inbound::tun::active_win_outbound_if_index().is_none()
-        {
-            let msg = "Не удалось открыть виртуальный адаптер Wintun (ошибка драйвера или прав)"
-                .to_string();
+        if let Some(msg) = detect_passive_tun_error(&root) {
             eprintln!("run-core: {msg}");
             let _ = fs::write(&err_file, &msg);
             bx.shutdown_wait().await;
@@ -105,6 +126,9 @@ fn run_core_worker_mode(cfg_path: &str) -> i32 {
 }
 
 fn main() {
+    #[cfg(unix)]
+    raise_nofile_limit();
+
     std::panic::set_hook(Box::new(|info| {
         let msg = format!("PANIC: {info}\n");
         let _ = fs::write(app_data_dir().join("startup.log"), msg);
@@ -114,11 +138,19 @@ fn main() {
     if args.len() >= 3 && args[1] == "--run-core" {
         std::process::exit(run_core_worker_mode(&args[2]));
     }
+    #[cfg(target_os = "macos")]
+    if args.len() >= 2 && args[1] == "--macos-helper" {
+        std::process::exit(crate::vpn::run_macos_helper_daemon());
+    }
     if args.len() >= 2 && (args[1] == "--version" || args[1] == "version" || args[1] == "-v") {
         println!(
             "tachyon-core {}",
             option_env!("TACHYON_CORE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
         );
+        return;
+    }
+
+    if !crate::tray::acquire_single_instance_or_focus_existing() {
         return;
     }
 

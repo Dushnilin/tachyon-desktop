@@ -272,15 +272,15 @@ where
                     io::Error::new(io::ErrorKind::TimedOut, "HTTP header read timeout")
                 })??;
 
-        if matches!(status, 301 | 302 | 303 | 307 | 308) {
-            if let Some((_, loc)) = headers.iter().find(|(k, _)| k == "location") {
-                current = current.join(loc)?;
-                if status == 303 || (status == 302 && cur_method == "POST") {
-                    cur_method = "GET".to_string();
-                    cur_body = None;
-                }
-                continue;
+        if matches!(status, 301 | 302 | 303 | 307 | 308)
+            && let Some((_, loc)) = headers.iter().find(|(k, _)| k == "location")
+        {
+            current = current.join(loc)?;
+            if status == 303 || (status == 302 && cur_method == "POST") {
+                cur_method = "GET".to_string();
+                cur_body = None;
             }
+            continue;
         }
 
         let is_chunked = headers
@@ -502,11 +502,11 @@ where
                 break;
             };
             if matches!(status, 301 | 302 | 303 | 307 | 308) {
-                if let Some((_, loc)) = headers.iter().find(|(k, _)| k == "location") {
-                    if let Ok(next_u) = cur_url.join(loc) {
-                        cur_url = next_u;
-                        continue;
-                    }
+                if let Some((_, loc)) = headers.iter().find(|(k, _)| k == "location")
+                    && let Ok(next_u) = cur_url.join(loc)
+                {
+                    cur_url = next_u;
+                    continue;
                 }
                 break;
             }

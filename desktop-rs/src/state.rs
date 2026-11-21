@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
+#[allow(dead_code)]
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -21,6 +22,8 @@ pub struct ServerNode {
     pub member_count: Option<usize>,
     #[serde(default)]
     pub ping_ms: Option<i64>,
+    #[serde(default)]
+    pub ping_at: Option<u64>,
     #[serde(default)]
     pub alive: Option<bool>,
 }
@@ -56,6 +59,7 @@ pub struct SubscriptionItem {
     pub meta: Option<SubscriptionMeta>,
 }
 
+#[allow(dead_code)]
 pub type SubscriptionEntry = SubscriptionItem;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -132,6 +136,32 @@ pub struct VpnPrefs {
     pub balancer_quota_mib: u32,
     #[serde(default = "default_balancer_interval")]
     pub balancer_interval: String,
+    /// URL проверочного запроса (URL-Test) для измерения задержки узлов.
+    #[serde(default = "default_balancer_url")]
+    pub balancer_url: String,
+    /// Поля консистентного хеширования для режима `sticky`:
+    /// `domain`, `dest_ip`, `dest_port`, `source_ip`, `process`.
+    #[serde(default = "default_balancer_sticky_hash")]
+    pub balancer_sticky_hash: Vec<String>,
+    /// Исключённые страны / ключевые слова (`RU`, `KZ`, `реклама`, ...).
+    #[serde(default)]
+    pub balancer_excluded_countries: Vec<String>,
+    /// Исключённые протоколы (`vmess`, `shadowsocks`, ...).
+    #[serde(default)]
+    pub balancer_excluded_protocols: Vec<String>,
+    /// Оставить только серверы, подходящие под RegExp (или подстроку).
+    #[serde(default)]
+    pub balancer_include_regex: String,
+    /// Скрыть серверы, подходящие под RegExp (или подстроку).
+    #[serde(default)]
+    pub balancer_exclude_regex: String,
+    /// Мульти-URL балансировщик: отдельный пул `urltest` под каждый сервис.
+    #[serde(default)]
+    pub balancer_multi_service: bool,
+    /// Сервисы мульти-URL балансировщика (`youtube`, `telegram`, `discord`,
+    /// `instagram`, `openai`, `https`).
+    #[serde(default = "default_balancer_multi_services")]
+    pub balancer_multi_services: Vec<String>,
     #[serde(default = "default_dns_strategy")]
     pub dns_strategy: String, // "prefer_ipv4" | "prefer_ipv6" | "ipv4_only" | "ipv6_only"
     #[serde(default = "default_true")]
@@ -204,6 +234,29 @@ fn default_balancer_quota() -> u32 {
 fn default_balancer_interval() -> String {
     "3m".to_string()
 }
+fn default_balancer_url() -> String {
+    "https://www.gstatic.com/generate_204".to_string()
+}
+fn default_balancer_sticky_hash() -> Vec<String> {
+    vec![
+        "domain".to_string(),
+        "dest_ip".to_string(),
+        "process".to_string(),
+    ]
+}
+fn default_balancer_multi_services() -> Vec<String> {
+    [
+        "youtube",
+        "telegram",
+        "discord",
+        "instagram",
+        "openai",
+        "https",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
 fn default_dns_strategy() -> String {
     "prefer_ipv4".to_string()
 }
@@ -246,6 +299,14 @@ impl Default for VpnPrefs {
             balancer_tolerance: default_balancer_tolerance(),
             balancer_quota_mib: default_balancer_quota(),
             balancer_interval: default_balancer_interval(),
+            balancer_url: default_balancer_url(),
+            balancer_sticky_hash: default_balancer_sticky_hash(),
+            balancer_excluded_countries: Vec::new(),
+            balancer_excluded_protocols: Vec::new(),
+            balancer_include_regex: String::new(),
+            balancer_exclude_regex: String::new(),
+            balancer_multi_service: false,
+            balancer_multi_services: default_balancer_multi_services(),
             dns_strategy: default_dns_strategy(),
             dns_reverse_mapping: true,
             route_find_process: true,
@@ -839,7 +900,7 @@ pub const ROUTE_CATALOG: &[RouteCatalogItem] = &[
 /// Настройки автоматического пинга узлов.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AutoPingPrefs {
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// true — пинговать все узлы, false — только отмеченные в `ids`.
     #[serde(default = "default_ap_all")]
@@ -854,15 +915,15 @@ fn default_ap_all() -> bool {
     true
 }
 fn default_ap_interval() -> u64 {
-    15
+    60
 }
 
 impl Default for AutoPingPrefs {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             all: true,
-            interval_s: 15,
+            interval_s: 60,
             ids: Vec::new(),
         }
     }
@@ -962,30 +1023,30 @@ impl PersistedState {
 
     pub fn load() -> Self {
         let path = Self::state_file_path();
-        if let Ok(raw) = fs::read_to_string(&path) {
-            if let Ok(mut parsed) = serde_json::from_str::<Self>(&raw) {
-                for item in ROUTE_CATALOG {
-                    parsed
-                        .list_modes
-                        .entry(item.id.to_string())
-                        .or_insert_with(|| item.default_action.to_string());
-                }
-                if parsed.active_id.is_empty() && !parsed.servers.is_empty() {
-                    parsed.active_id = parsed.servers[0].id.clone();
-                }
-                let normalized = parsed.normalize_servers();
-                if !parsed.servers.is_empty() || !parsed.subscriptions.is_empty() {
-                    if normalized {
-                        parsed.save();
-                    }
-                    return parsed;
-                }
-                if migrate_from_webview_localstorage(&mut parsed) {
-                    parsed.normalize_servers();
+        if let Ok(raw) = fs::read_to_string(&path)
+            && let Ok(mut parsed) = serde_json::from_str::<Self>(&raw)
+        {
+            for item in ROUTE_CATALOG {
+                parsed
+                    .list_modes
+                    .entry(item.id.to_string())
+                    .or_insert_with(|| item.default_action.to_string());
+            }
+            if parsed.active_id.is_empty() && !parsed.servers.is_empty() {
+                parsed.active_id = parsed.servers[0].id.clone();
+            }
+            let normalized = parsed.normalize_servers();
+            if !parsed.servers.is_empty() || !parsed.subscriptions.is_empty() {
+                if normalized {
                     parsed.save();
                 }
                 return parsed;
             }
+            if migrate_from_webview_localstorage(&mut parsed) {
+                parsed.normalize_servers();
+                parsed.save();
+            }
+            return parsed;
         }
         let mut state = Self::default();
         if migrate_from_webview_localstorage(&mut state) {
@@ -1003,10 +1064,10 @@ impl PersistedState {
     }
 
     pub fn active_server(&self) -> Option<&ServerNode> {
-        if !self.active_id.is_empty() {
-            if let Some(s) = self.servers.iter().find(|s| s.id == self.active_id) {
-                return Some(s);
-            }
+        if !self.active_id.is_empty()
+            && let Some(s) = self.servers.iter().find(|s| s.id == self.active_id)
+        {
+            return Some(s);
         }
         self.servers.first()
     }
@@ -1047,20 +1108,77 @@ impl PersistedState {
             String::new()
         };
 
+        // Мульти-URL работает только когда активен балансировщик (urltest-группа):
+        // для каждого выбранного сервиса его `.trs`-список направляется в отдельный
+        // пул `urltest-svc-<id>` со своим проверочным URL.
+        let active_is_balancer = {
+            let v = active_vless.trim_start();
+            v.starts_with("tachyon-balancer://") || v.starts_with("balancer://")
+        };
+        let multi_services_active =
+            self.vpn_prefs.balancer_multi_service && active_is_balancer && !is_desync_only;
+        let multi_services: Vec<String> = if multi_services_active {
+            self.vpn_prefs
+                .balancer_multi_services
+                .iter()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // Map community lists in `{ "name": id, "action": action }` format expected by vpn.rs
         let mut community_lists: Vec<serde_json::Value> = Vec::new();
         let mut seen_lists = std::collections::HashSet::new();
+
+        // Соответствие сервисов мульти-URL и каталога `.trs`-списков (Instagram живёт в `meta`).
+        let multi_svc_list = |svc: &str| -> Option<&'static str> {
+            match svc {
+                "youtube" => Some("youtube"),
+                "telegram" => Some("telegram"),
+                "discord" => Some("discord"),
+                "instagram" => Some("meta"),
+                "openai" => Some("openai"),
+                _ => None,
+            }
+        };
 
         for (id, action) in &self.list_modes {
             let act = action.trim();
             if act.is_empty() || act == "off" {
                 continue;
             }
+            // Явное действие пользователя (direct / block / desync / NODE_*) важнее мульти-URL;
+            // действие `vpn` заменяется на выделенный пул сервиса.
+            let svc_override = multi_services.iter().find(|svc| {
+                multi_svc_list(svc.as_str()) == Some(id.as_str())
+                    && (act.eq_ignore_ascii_case("vpn") || act.eq_ignore_ascii_case("proxy"))
+            });
             seen_lists.insert(id.clone());
+            if let Some(svc) = svc_override {
+                community_lists.push(serde_json::json!({
+                    "name": id,
+                    "action": format!("urltest-svc-{svc}"),
+                }));
+                continue;
+            }
             community_lists.push(serde_json::json!({
                 "name": id,
                 "action": act,
             }));
+        }
+
+        for svc in &multi_services {
+            let Some(list_id) = multi_svc_list(svc.as_str()) else {
+                continue;
+            };
+            if seen_lists.insert(list_id.to_string()) {
+                community_lists.push(serde_json::json!({
+                    "name": list_id,
+                    "action": format!("urltest-svc-{svc}"),
+                }));
+            }
         }
 
         if self.vpn_prefs.ru_bypass {
@@ -1119,15 +1237,14 @@ impl PersistedState {
                     .filter_map(|v| v.get("action").and_then(|a| a.as_str())),
             );
         for act in referenced_actions {
-            if let Some(srv_id) = act.strip_prefix("NODE_") {
-                if let Some(srv) = self.servers.iter().find(|s| s.id == srv_id) {
-                    if seen_extra_tags.insert(act.to_string()) {
-                        extra_nodes.push(serde_json::json!({
-                            "tag": act,
-                            "vless": srv.vless,
-                        }));
-                    }
-                }
+            if let Some(srv_id) = act.strip_prefix("NODE_")
+                && let Some(srv) = self.servers.iter().find(|s| s.id == srv_id)
+                && seen_extra_tags.insert(act.to_string())
+            {
+                extra_nodes.push(serde_json::json!({
+                    "tag": act,
+                    "vless": srv.vless,
+                }));
             }
         }
 
@@ -1165,11 +1282,19 @@ impl PersistedState {
         let balancer_json = serde_json::json!({
             "mode": self.vpn_prefs.balancer_mode,
             "pool": self.vpn_prefs.balancer_pool,
+            // Один и тот же допуск задаёт гистерезис переключения и порог входа в Top-N пул
+            // (как в Android-версии), а не жёстко зашитые 50 мс.
             "poolTolerance": self.vpn_prefs.balancer_tolerance,
-            "tolerance": 50,
+            "tolerance": self.vpn_prefs.balancer_tolerance,
             "quotaMib": self.vpn_prefs.balancer_quota_mib,
             "interval": self.vpn_prefs.balancer_interval,
-            "stickyHash": ["domain", "dest_ip", "process"]
+            "url": self.vpn_prefs.balancer_url,
+            "stickyHash": self.vpn_prefs.balancer_sticky_hash,
+            "excludedCountries": self.vpn_prefs.balancer_excluded_countries,
+            "excludedProtocols": self.vpn_prefs.balancer_excluded_protocols,
+            "includeRegex": self.vpn_prefs.balancer_include_regex.trim(),
+            "excludeRegex": self.vpn_prefs.balancer_exclude_regex.trim(),
+            "multiServices": multi_services
         });
 
         let desync_json = serde_json::json!({
@@ -1811,32 +1936,32 @@ fn extract_legacy_webview_state(dir: &std::path::Path, state: &mut PersistedStat
     }
 
     let mut migrated = false;
-    if let Some(srvs) = found_servers {
-        if !srvs.is_empty() {
-            state.servers = srvs;
-            migrated = true;
-        }
+    if let Some(srvs) = found_servers
+        && !srvs.is_empty()
+    {
+        state.servers = srvs;
+        migrated = true;
     }
-    if let Some(subs) = found_subs {
-        if !subs.is_empty() {
-            state.subscriptions = subs;
-            migrated = true;
-        }
+    if let Some(subs) = found_subs
+        && !subs.is_empty()
+    {
+        state.subscriptions = subs;
+        migrated = true;
     }
-    if let Some(aid) = found_active_id {
-        if state.servers.iter().any(|s| s.id == aid) {
-            state.active_id = aid;
-        }
+    if let Some(aid) = found_active_id
+        && state.servers.iter().any(|s| s.id == aid)
+    {
+        state.active_id = aid;
     }
     if let Some(lists) = found_lists {
         for (k, v) in lists {
             state.list_modes.insert(k, v);
         }
     }
-    if let Some(rules) = found_custom_rules {
-        if !rules.is_empty() {
-            state.custom_rules = rules;
-        }
+    if let Some(rules) = found_custom_rules
+        && !rules.is_empty()
+    {
+        state.custom_rules = rules;
     }
     if state.active_id.is_empty() && !state.servers.is_empty() {
         state.active_id = state.servers[0].id.clone();
@@ -1863,110 +1988,108 @@ fn scan_leveldb_bytes(
 
             let window_end = (hit + 256 * 1024).min(bytes.len());
             let slice = &bytes[hit..window_end];
-            if let Some(arr_start) = slice.iter().position(|&b| b == b'[') {
-                if let Some(json_str) = extract_balanced_json_array(&slice[arr_start..]) {
-                    if needle == b"tachyon.servers" {
-                        if let Ok(vals) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str)
-                        {
-                            let mut parsed = Vec::new();
-                            for v in vals {
-                                let id = v
-                                    .get("id")
-                                    .and_then(|x| x.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let vless = v
-                                    .get("vless")
-                                    .and_then(|x| x.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                if id.is_empty() || vless.is_empty() {
-                                    continue;
-                                }
-                                let name = v
-                                    .get("name")
-                                    .and_then(|x| x.as_str())
-                                    .unwrap_or("Узел")
-                                    .to_string();
-                                let country = v
-                                    .get("country")
-                                    .and_then(|x| x.as_str())
-                                    .unwrap_or("xx")
-                                    .to_string();
-                                let sub_id = v
-                                    .get("subId")
-                                    .or_else(|| v.get("sub_id"))
-                                    .and_then(|x| x.as_str())
-                                    .map(|s| s.to_string());
-                                let is_balancer = v
-                                    .get("isBalancer")
-                                    .and_then(|x| x.as_bool())
-                                    .unwrap_or(false);
-                                let balancer_mode = v
-                                    .get("balancerMode")
-                                    .and_then(|x| x.as_str())
-                                    .map(|s| s.to_string());
-                                let member_count = v
-                                    .get("memberCount")
-                                    .and_then(|x| x.as_u64())
-                                    .map(|n| n as usize);
-                                let ping_ms = v.get("ping").and_then(|x| x.as_i64());
-                                let alive = v.get("alive").and_then(|x| x.as_bool());
-                                parsed.push(ServerNode {
-                                    id,
-                                    name,
-                                    country,
-                                    vless,
-                                    sub_id,
-                                    is_balancer,
-                                    balancer_mode,
-                                    member_count,
-                                    ping_ms,
-                                    alive,
-                                });
+            if let Some(arr_start) = slice.iter().position(|&b| b == b'[')
+                && let Some(json_str) = extract_balanced_json_array(&slice[arr_start..])
+            {
+                if needle == b"tachyon.servers" {
+                    if let Ok(vals) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
+                        let mut parsed = Vec::new();
+                        for v in vals {
+                            let id = v
+                                .get("id")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let vless = v
+                                .get("vless")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            if id.is_empty() || vless.is_empty() {
+                                continue;
                             }
-                            if !parsed.is_empty() {
-                                *found_servers = Some(parsed);
-                            }
+                            let name = v
+                                .get("name")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("Узел")
+                                .to_string();
+                            let country = v
+                                .get("country")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("xx")
+                                .to_string();
+                            let sub_id = v
+                                .get("subId")
+                                .or_else(|| v.get("sub_id"))
+                                .and_then(|x| x.as_str())
+                                .map(|s| s.to_string());
+                            let is_balancer = v
+                                .get("isBalancer")
+                                .and_then(|x| x.as_bool())
+                                .unwrap_or(false);
+                            let balancer_mode = v
+                                .get("balancerMode")
+                                .and_then(|x| x.as_str())
+                                .map(|s| s.to_string());
+                            let member_count = v
+                                .get("memberCount")
+                                .and_then(|x| x.as_u64())
+                                .map(|n| n as usize);
+                            let ping_ms = v.get("ping").and_then(|x| x.as_i64());
+                            let alive = v.get("alive").and_then(|x| x.as_bool());
+                            parsed.push(ServerNode {
+                                id,
+                                name,
+                                country,
+                                vless,
+                                sub_id,
+                                is_balancer,
+                                balancer_mode,
+                                member_count,
+                                ping_ms,
+                                ping_at: None,
+                                alive,
+                            });
                         }
-                    } else if needle == b"tachyon.subs" {
-                        if let Ok(vals) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str)
-                        {
-                            let mut parsed = Vec::new();
-                            for v in vals {
-                                let id = v
-                                    .get("id")
-                                    .and_then(|x| x.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let url = v
-                                    .get("url")
-                                    .and_then(|x| x.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                if id.is_empty() || url.is_empty() {
-                                    continue;
-                                }
-                                let handle = v
-                                    .get("handle")
-                                    .and_then(|x| x.as_str())
-                                    .unwrap_or(&url)
-                                    .to_string();
-                                let count =
-                                    v.get("count").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
-                                parsed.push(SubscriptionItem {
-                                    id,
-                                    url,
-                                    handle,
-                                    count,
-                                    updated_at: "Из прошлой версии".to_string(),
-                                    meta: None,
-                                });
-                            }
-                            if !parsed.is_empty() {
-                                *found_subs = Some(parsed);
-                            }
+                        if !parsed.is_empty() {
+                            *found_servers = Some(parsed);
                         }
+                    }
+                } else if needle == b"tachyon.subs"
+                    && let Ok(vals) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str)
+                {
+                    let mut parsed = Vec::new();
+                    for v in vals {
+                        let id = v
+                            .get("id")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let url = v
+                            .get("url")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if id.is_empty() || url.is_empty() {
+                            continue;
+                        }
+                        let handle = v
+                            .get("handle")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or(&url)
+                            .to_string();
+                        let count = v.get("count").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+                        parsed.push(SubscriptionItem {
+                            id,
+                            url,
+                            handle,
+                            count,
+                            updated_at: "Из прошлой версии".to_string(),
+                            meta: None,
+                        });
+                    }
+                    if !parsed.is_empty() {
+                        *found_subs = Some(parsed);
                     }
                 }
             }
@@ -1986,14 +2109,12 @@ fn scan_leveldb_bytes(
         pos = hit;
         let window_end = (hit + 64 * 1024).min(bytes.len());
         let slice = &bytes[hit..window_end];
-        if let Some(obj_start) = slice.iter().position(|&b| b == b'{') {
-            if let Some(json_str) = extract_balanced_json_object(&slice[obj_start..]) {
-                if let Ok(map) = serde_json::from_str::<BTreeMap<String, String>>(&json_str) {
-                    if !map.is_empty() {
-                        *found_lists = Some(map);
-                    }
-                }
-            }
+        if let Some(obj_start) = slice.iter().position(|&b| b == b'{')
+            && let Some(json_str) = extract_balanced_json_object(&slice[obj_start..])
+            && let Ok(map) = serde_json::from_str::<BTreeMap<String, String>>(&json_str)
+            && !map.is_empty()
+        {
+            *found_lists = Some(map);
         }
     }
 
@@ -2010,42 +2131,41 @@ fn scan_leveldb_bytes(
         pos = hit;
         let window_end = (hit + 64 * 1024).min(bytes.len());
         let slice = &bytes[hit..window_end];
-        if let Some(arr_start) = slice.iter().position(|&b| b == b'[') {
-            if let Some(json_str) = extract_balanced_json_array(&slice[arr_start..]) {
-                if let Ok(vals) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
-                    let mut parsed = Vec::new();
-                    for (idx, v) in vals.into_iter().enumerate() {
-                        let value = v
-                            .get("value")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or("")
-                            .trim()
-                            .to_string();
-                        if value.is_empty() {
-                            continue;
-                        }
-                        let rule_type = v
-                            .get("type")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or("domain")
-                            .to_string();
-                        let action = v
-                            .get("action")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or("vpn")
-                            .to_string();
-                        parsed.push(CustomRule {
-                            id: format!("migrated-rule-{}", idx + 1),
-                            rule_type,
-                            value,
-                            action,
-                            time_window: String::new(),
-                        });
-                    }
-                    if !parsed.is_empty() {
-                        *found_custom_rules = Some(parsed);
-                    }
+        if let Some(arr_start) = slice.iter().position(|&b| b == b'[')
+            && let Some(json_str) = extract_balanced_json_array(&slice[arr_start..])
+            && let Ok(vals) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str)
+        {
+            let mut parsed = Vec::new();
+            for (idx, v) in vals.into_iter().enumerate() {
+                let value = v
+                    .get("value")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if value.is_empty() {
+                    continue;
                 }
+                let rule_type = v
+                    .get("type")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("domain")
+                    .to_string();
+                let action = v
+                    .get("action")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("vpn")
+                    .to_string();
+                parsed.push(CustomRule {
+                    id: format!("migrated-rule-{}", idx + 1),
+                    rule_type,
+                    value,
+                    action,
+                    time_window: String::new(),
+                });
+            }
+            if !parsed.is_empty() {
+                *found_custom_rules = Some(parsed);
             }
         }
     }
@@ -2069,10 +2189,10 @@ fn scan_leveldb_bytes(
                 .copied()
                 .take_while(|b| b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_')
                 .collect();
-            if id_bytes.len() >= 3 {
-                if let Ok(s) = String::from_utf8(id_bytes) {
-                    *found_active_id = Some(s);
-                }
+            if id_bytes.len() >= 3
+                && let Ok(s) = String::from_utf8(id_bytes)
+            {
+                *found_active_id = Some(s);
             }
         }
     }

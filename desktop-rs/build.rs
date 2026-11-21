@@ -11,15 +11,15 @@ fn collect_files(base: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
         let path = entry.path();
         if path.is_dir() {
             collect_files(base, &path, out);
-        } else if path.is_file() {
-            if let Ok(rel) = path.strip_prefix(base) {
-                let rel_str = rel
-                    .components()
-                    .map(|c| c.as_os_str().to_string_lossy())
-                    .collect::<Vec<_>>()
-                    .join("/");
-                out.push((rel_str, path));
-            }
+        } else if path.is_file()
+            && let Ok(rel) = path.strip_prefix(base)
+        {
+            let rel_str = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            out.push((rel_str, path));
         }
     }
 }

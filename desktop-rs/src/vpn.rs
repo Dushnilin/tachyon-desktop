@@ -163,10 +163,8 @@ pub fn decode_inline_node_uri(raw: &str) -> Option<Value> {
             .get("tag")
             .and_then(Value::as_str)
             .is_some_and(|s| !s.is_empty());
-        if !has_tag {
-            if let Some(f) = frag_part.filter(|s| !s.is_empty()) {
-                obj.insert("tag".to_string(), json!(f.replace("%20", " ")));
-            }
+        if !has_tag && let Some(f) = frag_part.filter(|s| !s.is_empty()) {
+            obj.insert("tag".to_string(), json!(f.replace("%20", " ")));
         }
     }
     Some(node)
@@ -309,12 +307,11 @@ pub fn decode_balancer_uri(raw: &str) -> Option<BalancerPayload> {
     };
     let bytes = B64.decode(b64_part).ok()?;
     let mut payload: BalancerPayload = serde_json::from_slice(&bytes).ok()?;
-    if payload.name.is_empty() {
-        if let Some(f) = frag_part {
-            if !f.is_empty() {
-                payload.name = f.replace("%20", " ");
-            }
-        }
+    if payload.name.is_empty()
+        && let Some(f) = frag_part
+        && !f.is_empty()
+    {
+        payload.name = f.replace("%20", " ");
     }
     payload.mode = normalize_balancer_mode(&payload.mode).to_string();
     Some(payload)
@@ -330,6 +327,15 @@ pub struct BalancerOptions {
     pub pool_tolerance: u32,
     pub sticky_hash: Vec<String>,
     pub quota_mib: u32,
+    /// `true`, если параметры пришли из глобальных настроек балансировщика клиента.
+    /// Тогда они имеют приоритет над значениями, «замороженными» в `tachyon-balancer://`.
+    pub from_prefs: bool,
+    pub excluded_countries: Vec<String>,
+    pub excluded_protocols: Vec<String>,
+    pub include_regex: String,
+    pub exclude_regex: String,
+    /// Сервисы мульти-URL балансировщика (отдельный `urltest-svc-<id>` на каждый).
+    pub multi_services: Vec<String>,
 }
 
 impl Default for BalancerOptions {
@@ -343,8 +349,312 @@ impl Default for BalancerOptions {
             pool_tolerance: default_balancer_pool_tolerance(),
             sticky_hash: default_balancer_sticky_hash(),
             quota_mib: default_balancer_quota_mib(),
+            from_prefs: false,
+            excluded_countries: Vec::new(),
+            excluded_protocols: Vec::new(),
+            include_regex: String::new(),
+            exclude_regex: String::new(),
+            multi_services: Vec::new(),
         }
     }
+}
+
+/// Проверочные URL сервисов мульти-URL балансировщика (идентичны Android-версии).
+/// `https` — общий пул, использует основной URL проверки.
+pub fn balancer_service_probe_url(id: &str) -> Option<&'static str> {
+    match id {
+        "youtube" => Some("https://www.youtube.com/generate_204"),
+        "telegram" => Some("https://core.telegram.org/favicon.ico"),
+        "discord" => Some("https://discord.com/api/v9/experiments"),
+        "instagram" => Some("https://www.instagram.com/robots.txt"),
+        "openai" => Some("https://chatgpt.com/cdn-cgi/trace"),
+        _ => None,
+    }
+}
+
+/// Строит пару Unicode Regional Indicator (флаг страны) из 2-буквенного кода ISO.
+fn regional_indicator_flag(code: &str) -> Option<String> {
+    let bytes = code.trim().as_bytes();
+    if bytes.len() != 2 || !bytes[0].is_ascii_alphabetic() || !bytes[1].is_ascii_alphabetic() {
+        return None;
+    }
+    let c0 = char::from_u32(0x1F1E6 + u32::from(bytes[0].to_ascii_uppercase() - b'A'))?;
+    let c1 = char::from_u32(0x1F1E6 + u32::from(bytes[1].to_ascii_uppercase() - b'A'))?;
+    let mut s = String::with_capacity(8);
+    s.push(c0);
+    s.push(c1);
+    Some(s)
+}
+
+/// Страны для фильтра исключений: (код, название, алиасы).
+const BALANCER_COUNTRY_FILTERS: &[(&str, &str, &[&str])] = &[
+    (
+        "RU",
+        "Россия",
+        &[
+            "ru",
+            "rus",
+            "russia",
+            "россия",
+            "мск",
+            "спб",
+            "moscow",
+            "spb",
+        ],
+    ),
+    (
+        "NL",
+        "Нидерланды",
+        &[
+            "nl",
+            "nld",
+            "netherlands",
+            "нидерланды",
+            "голландия",
+            "amsterdam",
+            "амстердам",
+        ],
+    ),
+    (
+        "DE",
+        "Германия",
+        &[
+            "de",
+            "deu",
+            "germany",
+            "германия",
+            "frankfurt",
+            "франкфурт",
+            "falkenstein",
+        ],
+    ),
+    (
+        "FI",
+        "Финляндия",
+        &["fi", "fin", "finland", "финляндия", "helsinki", "хельсинки"],
+    ),
+    (
+        "US",
+        "США",
+        &[
+            "us",
+            "usa",
+            "united states",
+            "сша",
+            "америка",
+            "new york",
+            "dallas",
+            "miami",
+        ],
+    ),
+    (
+        "GB",
+        "Великобритания",
+        &[
+            "gb",
+            "uk",
+            "united kingdom",
+            "британия",
+            "англия",
+            "london",
+            "лондон",
+        ],
+    ),
+    (
+        "FR",
+        "Франция",
+        &["fr", "fra", "france", "франция", "paris", "париж"],
+    ),
+    (
+        "TR",
+        "Турция",
+        &[
+            "tr",
+            "tur",
+            "turkey",
+            "türkiye",
+            "турция",
+            "istanbul",
+            "стамбул",
+        ],
+    ),
+    (
+        "KZ",
+        "Казахстан",
+        &["kz", "kaz", "kazakhstan", "казахстан", "алматы", "астана"],
+    ),
+    (
+        "BY",
+        "Беларусь",
+        &["by", "blr", "belarus", "беларусь", "минск", "minsk"],
+    ),
+    (
+        "SE",
+        "Швеция",
+        &["se", "swe", "sweden", "швеция", "stockholm", "стокгольм"],
+    ),
+    (
+        "PL",
+        "Польша",
+        &["pl", "pol", "poland", "польша", "warsaw", "варшава"],
+    ),
+    (
+        "LV",
+        "Латвия",
+        &["lv", "lva", "latvia", "латвия", "riga", "рига"],
+    ),
+    (
+        "EE",
+        "Эстония",
+        &["ee", "est", "estonia", "эстония", "tallinn", "таллин"],
+    ),
+    ("SG", "Сингапур", &["sg", "sgp", "singapore", "сингапур"]),
+    (
+        "JP",
+        "Япония",
+        &["jp", "jpn", "japan", "япония", "tokyo", "токио"],
+    ),
+];
+
+/// Быстрые варианты стран для UI: (код, название).
+pub fn balancer_country_presets() -> impl Iterator<Item = (&'static str, &'static str)> {
+    BALANCER_COUNTRY_FILTERS
+        .iter()
+        .map(|(code, title, _)| (*code, *title))
+}
+
+fn balancer_regex_or_substring(haystack: &str, raw_pattern: &str) -> bool {
+    let pattern = raw_pattern.trim();
+    if pattern.is_empty() {
+        return true;
+    }
+    match regex::RegexBuilder::new(pattern)
+        .case_insensitive(true)
+        .build()
+    {
+        Ok(re) => re.is_match(haystack),
+        // Некорректный RegExp не должен ломать подключение — откат к поиску подстроки.
+        Err(_) => haystack.to_lowercase().contains(&pattern.to_lowercase()),
+    }
+}
+
+fn balancer_word_boundary_hit(code_lower: &str, haystack: &str) -> bool {
+    let pat = format!(
+        "(?i)(^|[^a-zа-яё0-9]){}([^a-zа-яё0-9]|$)",
+        regex::escape(code_lower)
+    );
+    Regex::new(&pat)
+        .map(|re| re.is_match(haystack))
+        .unwrap_or(false)
+}
+
+fn balancer_protocol_excluded(p_type: &str, raw_proto: &str) -> bool {
+    let proto = raw_proto.trim().to_ascii_lowercase();
+    if proto.is_empty() {
+        return false;
+    }
+    if p_type == proto {
+        return true;
+    }
+    match proto.as_str() {
+        "wireguard" | "awg" | "amneziawg" => matches!(p_type, "wireguard" | "amneziawg"),
+        "socks" | "http" => matches!(p_type, "socks" | "http"),
+        "ss" | "shadowsocks" => p_type == "shadowsocks",
+        "hy2" | "hysteria2" | "hysteria" => matches!(p_type, "hysteria2" | "hysteria"),
+        "wdtt" | "csqtt" | "qwdtt" => p_type == "wdtt",
+        "openvpn" | "openvpn-client" => p_type == "openvpn-client",
+        "mierus" => p_type == "mieru",
+        "openconnect" | "anyconnect" => p_type == "openconnect",
+        _ => false,
+    }
+}
+
+fn balancer_country_excluded(name: &str, server: &str, raw_token: &str) -> bool {
+    let token = raw_token.trim().to_lowercase();
+    if token.is_empty() {
+        return false;
+    }
+    let name_lower = name.to_lowercase();
+    let server_lower = server.to_lowercase();
+    let combined = format!("{name_lower} {server_lower}");
+
+    let preset = BALANCER_COUNTRY_FILTERS.iter().find(|(code, title, _)| {
+        code.to_lowercase() == token
+            || regional_indicator_flag(code).as_deref() == Some(token.as_str())
+            || title.to_lowercase() == token
+    });
+    if let Some((code, _, aliases)) = preset {
+        let code_lower = code.to_lowercase();
+        if let Some(flag) = regional_indicator_flag(code)
+            && name.contains(&flag)
+        {
+            return true;
+        }
+        if server_lower.ends_with(&format!(".{code_lower}"))
+            || server_lower.starts_with(&format!("{code_lower}."))
+            || server_lower.starts_with(&format!("{code_lower}-"))
+        {
+            return true;
+        }
+        if balancer_word_boundary_hit(&code_lower, &name_lower) {
+            return true;
+        }
+        for alias in aliases.iter() {
+            if alias.encode_utf16().count() <= 2 {
+                continue;
+            }
+            if combined.contains(alias) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if token.chars().count() == 2 && token.chars().all(|c| c.is_ascii_lowercase()) {
+        return regional_indicator_flag(&token).is_some_and(|flag| name.contains(&flag))
+            || balancer_word_boundary_hit(&token, &name_lower)
+            || server_lower.ends_with(&format!(".{token}"))
+            || server_lower.starts_with(&format!("{token}."))
+            || server_lower.starts_with(&format!("{token}-"));
+    }
+    combined.contains(&token)
+}
+
+/// Проходит ли узел фильтры балансировщика: включающий / исключающий RegExp,
+/// исключённые протоколы и исключённые страны (порт `BalancerSettings.matchesFilter`
+/// из Android-версии).
+pub fn balancer_node_passes_filter(
+    name: &str,
+    server: &str,
+    sni: &str,
+    node_type: &str,
+    opts: &BalancerOptions,
+) -> bool {
+    let p_type = node_type.trim().to_ascii_lowercase();
+    let target = format!("{name} {server} {sni} {p_type}");
+    if !balancer_regex_or_substring(&target, &opts.include_regex) {
+        return false;
+    }
+    if !opts.exclude_regex.trim().is_empty()
+        && balancer_regex_or_substring(&target, &opts.exclude_regex)
+    {
+        return false;
+    }
+    if opts
+        .excluded_protocols
+        .iter()
+        .any(|proto| balancer_protocol_excluded(&p_type, proto))
+    {
+        return false;
+    }
+    if opts
+        .excluded_countries
+        .iter()
+        .any(|tok| balancer_country_excluded(name, server, tok))
+    {
+        return false;
+    }
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -458,18 +768,18 @@ impl ConnectOptions {
         let mut rules = Vec::new();
         if let Some(arr) = root.get("rules").and_then(Value::as_array) {
             for item in arr {
-                if let Some(s) = item.as_str() {
-                    if !s.trim().is_empty() {
-                        rules.push(s.trim().to_string());
-                    }
+                if let Some(s) = item.as_str()
+                    && !s.trim().is_empty()
+                {
+                    rules.push(s.trim().to_string());
                 }
             }
         } else if let Some(arr) = root.get("apps").and_then(Value::as_array) {
             for item in arr {
-                if let Some(s) = item.as_str() {
-                    if !s.trim().is_empty() {
-                        rules.push(format!("PROCESS-NAME,{},GLOBAL", s.trim()));
-                    }
+                if let Some(s) = item.as_str()
+                    && !s.trim().is_empty()
+                {
+                    rules.push(format!("PROCESS-NAME,{},GLOBAL", s.trim()));
                 }
             }
             if !rules.is_empty() {
@@ -605,10 +915,10 @@ impl ConnectOptions {
             if let Some(v) = d.get("fakeTtl").and_then(Value::as_u64) {
                 desync.fake_ttl = (v as u32).clamp(1, 128);
             }
-            if let Some(v) = d.get("fakeSni").and_then(Value::as_str) {
-                if !v.trim().is_empty() {
-                    desync.fake_sni = v.trim().to_string();
-                }
+            if let Some(v) = d.get("fakeSni").and_then(Value::as_str)
+                && !v.trim().is_empty()
+            {
+                desync.fake_sni = v.trim().to_string();
             }
             if let Some(v) = d.get("repeats").and_then(Value::as_u64) {
                 desync.repeats = (v as u32).clamp(1, 100);
@@ -715,8 +1025,42 @@ impl ConnectOptions {
                 .or_else(|| b.get("quota_mib"))
                 .and_then(Value::as_u64)
             {
-                balancer.quota_mib = (q as u32).clamp(1, 1_048_576);
+                // 0 — квота выключена (в ядро `quota_mib` тогда не передаётся).
+                balancer.quota_mib = (q as u32).clamp(0, 1_048_576);
             }
+            balancer.from_prefs = true;
+            let str_list = |key: &str| -> Vec<String> {
+                b.get(key)
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            balancer.excluded_countries = str_list("excludedCountries");
+            balancer.excluded_protocols = str_list("excludedProtocols")
+                .into_iter()
+                .map(|s| s.to_ascii_lowercase())
+                .collect();
+            balancer.include_regex = b
+                .get("includeRegex")
+                .and_then(Value::as_str)
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            balancer.exclude_regex = b
+                .get("excludeRegex")
+                .and_then(Value::as_str)
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            balancer.multi_services = str_list("multiServices")
+                .into_iter()
+                .map(|s| s.to_ascii_lowercase())
+                .filter(|s| balancer_service_probe_url(s).is_some())
+                .collect();
             if let Some(arr) = b
                 .get("stickyHash")
                 .or_else(|| b.get("sticky_hash"))
@@ -1014,6 +1358,7 @@ struct RunningEngine {
     in_proc: Option<BoxInstance>,
     worker: Option<Child>,
     worker_pid: Option<u32>,
+    macos_helper: bool,
     running_config: Value,
     proxy_mode: bool,
     block_only: bool,
@@ -1025,6 +1370,13 @@ impl RunningEngine {
     async fn stop(&mut self) {
         if let Some(mut bx) = self.in_proc.take() {
             bx.shutdown_wait().await;
+        }
+        if self.macos_helper {
+            self.macos_helper = false;
+            self.worker_pid = None;
+            #[cfg(target_os = "macos")]
+            let _ = tokio::task::spawn_blocking(stop_macos_helper_tunnel).await;
+            return;
         }
         let child_opt = self.worker.take();
         let pid_opt = self.worker_pid.take().or_else(read_core_pid_file);
@@ -1079,6 +1431,7 @@ impl VpnManager {
         self.emit(format!("vpn:{payload}"));
     }
 
+    #[allow(dead_code)]
     pub fn log_path(&self) -> &Path {
         &self.log_path
     }
@@ -1086,17 +1439,17 @@ impl VpnManager {
     pub async fn is_running(&self) -> bool {
         let mut guard = self.engine.lock().await;
         if let Some(eng) = guard.as_mut() {
-            if let Some(child) = eng.worker.as_mut() {
-                if let Ok(Some(_)) = child.try_wait() {
-                    *guard = None;
-                    return false;
-                }
+            if let Some(child) = eng.worker.as_mut()
+                && let Ok(Some(_)) = child.try_wait()
+            {
+                *guard = None;
+                return false;
             }
-            if let Some(pid) = eng.worker_pid {
-                if !is_pid_alive(pid) {
-                    *guard = None;
-                    return false;
-                }
+            if let Some(pid) = eng.worker_pid
+                && !is_pid_alive(pid)
+            {
+                *guard = None;
+                return false;
             }
             return true;
         }
@@ -1137,13 +1490,15 @@ impl VpnManager {
             format!("{TACHYON_LISTS_TRS_MIRROR}/{canonical_name}.trs"),
         ];
         for url in &urls {
-            if let Ok(resp) = fetch_url(url, "GET", &[], None, None, Duration::from_secs(8)).await {
-                if resp.status == 200 && resp.body.len() > 96 && &resp.body[0..4] == b"TSRS" {
-                    let tmp = path.with_extension("trs.tmp");
-                    if fs::write(&tmp, &resp.body).is_ok() {
-                        let _ = fs::rename(&tmp, &path);
-                        return true;
-                    }
+            if let Ok(resp) = fetch_url(url, "GET", &[], None, None, Duration::from_secs(8)).await
+                && resp.status == 200
+                && resp.body.len() > 96
+                && &resp.body[0..4] == b"TSRS"
+            {
+                let tmp = path.with_extension("trs.tmp");
+                if fs::write(&tmp, &resp.body).is_ok() {
+                    let _ = fs::rename(&tmp, &path);
+                    return true;
                 }
             }
         }
@@ -1198,15 +1553,14 @@ impl VpnManager {
         if let Ok(entries) = fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let fname = entry.file_name().to_string_lossy().into_owned();
-                if let Some(rest) = fname.strip_prefix("community-") {
-                    if let Some(stem) = rest
+                if let Some(rest) = fname.strip_prefix("community-")
+                    && let Some(stem) = rest
                         .strip_suffix(".trs")
                         .or_else(|| rest.strip_suffix(".srs"))
-                    {
-                        let can = canonical_ruleset_name(stem);
-                        if !can.is_empty() {
-                            target.insert(can);
-                        }
+                {
+                    let can = canonical_ruleset_name(stem);
+                    if !can.is_empty() {
+                        target.insert(can);
                     }
                 }
             }
@@ -1241,10 +1595,10 @@ impl VpnManager {
         self.emit(format!("lists-update:done:{ok_count}/{total}"));
 
         let last_opts = self.last_connect_opts.lock().unwrap().clone();
-        if self.is_running().await {
-            if let Some(opts_json) = last_opts {
-                self.connect(opts_json).await;
-            }
+        if self.is_running().await
+            && let Some(opts_json) = last_opts
+        {
+            self.connect(opts_json).await;
         }
     }
 
@@ -1516,10 +1870,9 @@ impl VpnManager {
             if tls_fragment
                 && matches!(ntype.as_str(), "vless" | "vmess" | "trojan")
                 && obj.get("tls").and_then(Value::as_object).is_some()
+                && let Some(tls_obj) = obj.get_mut("tls").and_then(Value::as_object_mut)
             {
-                if let Some(tls_obj) = obj.get_mut("tls").and_then(Value::as_object_mut) {
-                    tls_obj.insert("record_fragment".to_string(), json!(true));
-                }
+                tls_obj.insert("record_fragment".to_string(), json!(true));
             }
         }
         Ok((false, node, server_host))
@@ -1552,6 +1905,7 @@ impl VpnManager {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     fn expand_parsed_target(
         raw_uri: &str,
         tag: &str,
@@ -1567,6 +1921,9 @@ impl VpnManager {
             let mut hosts = Vec::new();
             let mut member_tags = Vec::new();
 
+            // 1. Разбираем всех участников, помечая тех, кто проходит фильтры
+            //    (страны / протоколы / RegExp из настроек балансировщика).
+            let mut candidates: Vec<(String, bool, Value, Option<String>, bool)> = Vec::new();
             for (idx, m) in bal.members.iter().enumerate() {
                 if m.vless.trim().is_empty() || m.vless.trim().starts_with(BALANCER_URI_PREFIX) {
                     continue;
@@ -1575,16 +1932,41 @@ impl VpnManager {
                 if let Ok((is_ep, val, host)) =
                     Self::prepare_parsed_node(&m.vless, &m_tag, tls_fragment, detour_tag)
                 {
-                    if let Some(h) = host {
-                        hosts.push(h);
-                    }
-                    if is_ep {
-                        ep_list.push(val);
-                    } else {
-                        ob_list.push(val);
-                    }
-                    member_tags.push(m_tag);
+                    let node_type = val.get("type").and_then(Value::as_str).unwrap_or("");
+                    let sni = val
+                        .pointer("/tls/server_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let passes = balancer_node_passes_filter(
+                        &m.name,
+                        host.as_deref().unwrap_or(""),
+                        sni,
+                        node_type,
+                        balancer_opts,
+                    );
+                    candidates.push((m_tag, is_ep, val, host, passes));
+                } else {
+                    used_tags.remove(&m_tag);
                 }
+            }
+
+            // Если фильтры отсекли все узлы — используем полный список (как в Android),
+            // чтобы подключение не оставалось без рабочих узлов.
+            let any_pass = candidates.iter().any(|c| c.4);
+            for (m_tag, is_ep, val, host, passes) in candidates {
+                if any_pass && !passes {
+                    used_tags.remove(&m_tag);
+                    continue;
+                }
+                if let Some(h) = host {
+                    hosts.push(h);
+                }
+                if is_ep {
+                    ep_list.push(val);
+                } else {
+                    ob_list.push(val);
+                }
+                member_tags.push(m_tag);
             }
 
             if member_tags.is_empty() {
@@ -1596,66 +1978,101 @@ impl VpnManager {
                 .as_deref()
                 .map(normalize_balancer_mode)
                 .unwrap_or_else(|| normalize_balancer_mode(&bal.mode));
-            let probe_url = if !bal.url.trim().is_empty() {
+
+            // Глобальные настройки клиента имеют приоритет над значениями, сохранёнными в
+            // самом балансировщике при его создании, поэтому изменения применяются сразу.
+            let live = balancer_opts.from_prefs;
+            let probe_url = if live && !balancer_opts.url.trim().is_empty() {
+                balancer_opts.url.trim().to_string()
+            } else if !bal.url.trim().is_empty() {
                 bal.url.trim().to_string()
             } else {
                 balancer_opts.url.clone()
             };
-            let probe_interval = if !bal.interval.trim().is_empty() {
+            let probe_interval = if live && !balancer_opts.interval.trim().is_empty() {
+                balancer_opts.interval.trim().to_string()
+            } else if !bal.interval.trim().is_empty() {
                 bal.interval.trim().to_string()
             } else {
                 balancer_opts.interval.clone()
             };
-            let tolerance = if bal.tolerance > 0 {
+            let tolerance = if live {
+                balancer_opts.tolerance
+            } else if bal.tolerance > 0 {
                 bal.tolerance.max(balancer_opts.tolerance)
             } else {
                 balancer_opts.tolerance
             };
-            let pool = if bal.pool > 0 {
+            let pool = if live {
+                balancer_opts.pool
+            } else if bal.pool > 0 {
                 bal.pool
             } else {
                 balancer_opts.pool
             };
-            let pool_tol = if bal.pool_tolerance > 0 {
+            let pool_tol = if live {
+                balancer_opts.pool_tolerance
+            } else if bal.pool_tolerance > 0 {
                 bal.pool_tolerance
             } else {
                 balancer_opts.pool_tolerance
             };
-            let quota_mib = if bal.quota_mib > 0 {
+            let quota_mib = if live {
+                balancer_opts.quota_mib
+            } else if bal.quota_mib > 0 {
                 bal.quota_mib
             } else {
                 balancer_opts.quota_mib
             };
-            let sticky_hash = if !bal.sticky_hash.is_empty() {
+            let sticky_hash = if live && !balancer_opts.sticky_hash.is_empty() {
+                balancer_opts.sticky_hash.clone()
+            } else if !bal.sticky_hash.is_empty() {
                 bal.sticky_hash.clone()
             } else {
                 balancer_opts.sticky_hash.clone()
             };
 
-            let mut urltest_ob = json!({
-                "type": "urltest",
-                "tag": tag,
-                "outbounds": member_tags,
-                "url": probe_url,
-                "interval": probe_interval,
-                "tolerance": tolerance,
-                "mode": effective_mode
-            });
-            if !matches!(effective_mode, "least_test" | "failover") {
-                if let Some(obj) = urltest_ob.as_object_mut() {
-                    obj.insert(
-                        "balancer".to_string(),
-                        json!({
-                            "pool": pool,
-                            "pool_tolerance": pool_tol,
-                            "sticky_hash": sticky_hash,
-                            "quota_mib": quota_mib
-                        }),
-                    );
+            let build_urltest = |group_tag: &str, url: &str| -> Value {
+                let mut ob = json!({
+                    "type": "urltest",
+                    "tag": group_tag,
+                    "outbounds": member_tags.clone(),
+                    "url": url,
+                    "interval": probe_interval.clone(),
+                    "tolerance": tolerance,
+                    "mode": effective_mode
+                });
+                if !matches!(effective_mode, "least_test" | "failover") {
+                    let mut block = json!({
+                        "pool": pool,
+                        "pool_tolerance": pool_tol,
+                        "sticky_hash": sticky_hash.clone()
+                    });
+                    if quota_mib > 0 {
+                        block["quota_mib"] = json!(quota_mib);
+                    }
+                    ob["balancer"] = block;
+                }
+                ob
+            };
+
+            // Put urltest group first, followed by its member outbounds
+            let mut final_obs = vec![build_urltest(tag, &probe_url)];
+
+            // Мульти-URL: отдельный пул `urltest-svc-<id>` со своим проверочным URL
+            // на каждый выбранный сервис (только для основного узла).
+            if tag == "PROXY" {
+                for svc in &balancer_opts.multi_services {
+                    let Some(svc_url) = balancer_service_probe_url(svc) else {
+                        continue;
+                    };
+                    let svc_tag = format!("urltest-svc-{svc}");
+                    if !used_tags.insert(svc_tag.clone()) {
+                        continue;
+                    }
+                    final_obs.push(build_urltest(&svc_tag, svc_url));
                 }
             }
-            // Put urltest group first, followed by its member outbounds
-            let mut final_obs = vec![urltest_ob];
             final_obs.extend(ob_list);
             return Ok((ep_list, final_obs, hosts));
         }
@@ -1763,6 +2180,7 @@ impl VpnManager {
         }
     }
 
+    #[allow(dead_code)]
     pub fn build_config(&self, opts: &ConnectOptions) -> Result<(Value, bool), String> {
         self.build_config_with_fakeip_override(opts, false)
     }
@@ -1932,7 +2350,7 @@ impl VpnManager {
                 "strict_route": opts.strict_route,
                 "stack": opts.tun_stack,
                 "route_exclude_address": [
-                    "172.19.0.0/30",
+                    "172.19.0.1/32",
                     "224.0.0.0/4",
                     "255.255.255.255/32",
                     "169.254.0.0/16",
@@ -2013,18 +2431,17 @@ impl VpnManager {
             outbounds.extend(obs.clone());
         }
 
-        if let Some(ep_mtu) = min_endpoint_mtu {
-            if let Some(tun_obj) = inbounds.first_mut().and_then(Value::as_object_mut) {
-                if tun_obj.get("type").and_then(Value::as_str) == Some("tun") {
-                    let cur_mtu = tun_obj
-                        .get("mtu")
-                        .and_then(Value::as_u64)
-                        .map(|m| m as u32)
-                        .unwrap_or(1420);
-                    if ep_mtu < cur_mtu {
-                        tun_obj.insert("mtu".to_string(), json!(ep_mtu));
-                    }
-                }
+        if let Some(ep_mtu) = min_endpoint_mtu
+            && let Some(tun_obj) = inbounds.first_mut().and_then(Value::as_object_mut)
+            && tun_obj.get("type").and_then(Value::as_str) == Some("tun")
+        {
+            let cur_mtu = tun_obj
+                .get("mtu")
+                .and_then(Value::as_u64)
+                .map(|m| m as u32)
+                .unwrap_or(1420);
+            if ep_mtu < cur_mtu {
+                tun_obj.insert("mtu".to_string(), json!(ep_mtu));
             }
         }
 
@@ -2080,9 +2497,30 @@ impl VpnManager {
         if opts.sniff {
             rules.push(json!({ "action": "sniff" }));
         }
+        rules.push(json!({ "protocol": "dns", "action": "hijack-dns" }));
+        const SELF_PROCS: &[&str] = &[
+            "tachyon",
+            "tachyon-desktop",
+            "tachyon-core",
+            "tachyon-core.exe",
+            "Tachyon.exe",
+            "tachyon.exe",
+        ];
+        if main_parsed.is_some() {
+            rules.push(json!({
+                "inbound": ["mixed-in"],
+                "process_name": SELF_PROCS,
+                "outbound": "GLOBAL"
+            }));
+        }
+        if !opts.proxy_mode {
+            rules.push(json!({
+                "inbound": ["tun-in"],
+                "process_name": SELF_PROCS,
+                "outbound": "direct"
+            }));
+        }
         rules.extend([
-            json!({ "protocol": "dns", "action": "hijack-dns" }),
-            json!({ "process_name": ["tachyon", "tachyon-desktop", "tachyon-core", "tachyon-core.exe", "Tachyon.exe", "tachyon.exe"], "outbound": "direct" }),
             json!({ "network": "udp", "port": [135, 137, 138, 139, 445, 1900, 3702, 5353, 5355], "action": "reject" }),
             json!({ "ip_is_private": true, "outbound": "direct" }),
             json!({ "ip_cidr": [format!("{bootstrap_ip}/32")], "outbound": "direct" }),
@@ -2102,13 +2540,13 @@ impl VpnManager {
                 server_domains.push(h);
             }
         }
-        if !opts.proxy_mode && !server_ips.is_empty() {
-            if let Some(tun_obj) = inbounds.first_mut().and_then(Value::as_object_mut)
-                && let Some(Value::Array(excl)) = tun_obj.get_mut("route_exclude_address")
-            {
-                for cidr in &server_ips {
-                    excl.push(Value::String(cidr.clone()));
-                }
+        if !opts.proxy_mode
+            && !server_ips.is_empty()
+            && let Some(tun_obj) = inbounds.first_mut().and_then(Value::as_object_mut)
+            && let Some(Value::Array(excl)) = tun_obj.get_mut("route_exclude_address")
+        {
+            for cidr in &server_ips {
+                excl.push(Value::String(cidr.clone()));
             }
         }
         if !server_ips.is_empty() {
@@ -2206,8 +2644,18 @@ impl VpnManager {
         } else {
             "DESYNC"
         };
-        let valid_extra_tags: HashSet<String> =
+        let mut valid_extra_tags: HashSet<String> =
             extra_parsed.iter().map(|(t, _)| t.clone()).collect();
+        // Пулы мульти-URL (`urltest-svc-<id>`) — допустимые цели правил маршрутизации.
+        if let Some((_, obs, _)) = main_parsed.as_ref() {
+            for ob in obs {
+                if let Some(t) = ob.get("tag").and_then(Value::as_str)
+                    && t.starts_with("urltest-svc-")
+                {
+                    valid_extra_tags.insert(t.to_string());
+                }
+            }
+        }
         let mut rule_sets = Vec::new();
         let mut registered_rs = HashSet::new();
 
@@ -2764,52 +3212,49 @@ impl VpnManager {
         // Try in-place hot reload if already running in the same mode
         {
             let mut guard = self.engine.lock().await;
-            if let Some(eng) = guard.as_mut() {
-                if eng.proxy_mode == opts.proxy_mode && !eng.block_only && !opts.block_only {
-                    let suppress_fake_ip = eng.suppress_fake_ip;
-                    let Ok((cfg_val, has_node)) =
-                        self.build_config_with_fakeip_override(&opts, suppress_fake_ip)
-                    else {
-                        return;
-                    };
-                    let cfg_text = serde_json::to_string_pretty(&cfg_val).unwrap_or_default();
-                    let _ = fs::write(&cfg_path, &cfg_text);
+            if let Some(eng) = guard.as_mut()
+                && eng.proxy_mode == opts.proxy_mode
+                && !eng.block_only
+                && !opts.block_only
+            {
+                let suppress_fake_ip = eng.suppress_fake_ip;
+                let Ok((cfg_val, has_node)) =
+                    self.build_config_with_fakeip_override(&opts, suppress_fake_ip)
+                else {
+                    return;
+                };
+                let cfg_text = serde_json::to_string_pretty(&cfg_val).unwrap_or_default();
+                let _ = fs::write(&cfg_path, &cfg_text);
 
-                    let mut reloaded = false;
-                    if let Some(bx) = eng.in_proc.as_mut() {
-                        if bx.reload_in_place(&cfg_val).await.is_ok() {
-                            reloaded = true;
-                        }
-                    } else if eng.worker.is_some() || eng.worker_pid.is_some() {
-                        let body = json!({ "path": cfg_path.to_string_lossy() }).to_string();
-                        if let Ok((status, _)) = clash_api_request(
-                            API_PORT,
-                            &self.secret,
-                            "PUT",
-                            "/configs?force=true",
-                            Some(&body),
-                        )
-                        .await
-                        {
-                            reloaded = (200..300).contains(&status);
-                        }
+                let mut reloaded = false;
+                if let Some(bx) = eng.in_proc.as_mut() {
+                    if bx.reload_in_place(&cfg_val).await.is_ok() {
+                        reloaded = true;
                     }
+                } else if eng.worker.is_some() || eng.worker_pid.is_some() {
+                    let body = json!({ "path": cfg_path.to_string_lossy() }).to_string();
+                    if let Ok((status, _)) = clash_api_request(
+                        API_PORT,
+                        &self.secret,
+                        "PUT",
+                        "/configs?force=true",
+                        Some(&body),
+                    )
+                    .await
+                    {
+                        reloaded = (200..300).contains(&status);
+                    }
+                }
 
-                    if reloaded {
-                        let _ = clash_api_request(
-                            API_PORT,
-                            &self.secret,
-                            "DELETE",
-                            "/connections",
-                            None,
-                        )
-                        .await;
-                        eng.running_config = cfg_val;
-                        eng.has_node = has_node;
-                        flush_os_dns();
-                        self.emit_vpn(json!({ "state": "switched" }));
-                        return;
-                    }
+                if reloaded {
+                    let _ =
+                        clash_api_request(API_PORT, &self.secret, "DELETE", "/connections", None)
+                            .await;
+                    eng.running_config = cfg_val;
+                    eng.has_node = has_node;
+                    flush_os_dns();
+                    self.emit_vpn(json!({ "state": "switched" }));
+                    return;
                 }
             }
         }
@@ -2860,31 +3305,30 @@ impl VpnManager {
         let mut started_in_proc: Option<BoxInstance> = None;
         let mut started_worker: Option<Child> = None;
         let mut started_worker_pid: Option<u32> = None;
+        let mut started_macos_helper = false;
 
         // On Windows/macOS/Linux, opening a TUN adapter (Wintun / utun / /dev/net/tun)
         // requires administrator/root privileges. Note that `core_runtime::inbound::tun::Tun::bind`
         // logs a warning and falls back to `PlatformTun::Passive` instead of returning `Err`
         // when the process is not elevated! Therefore, if `opts.proxy_mode == false` and the
-        // current process is not elevated (or on Windows lacks an active Wintun outbound interface
-        // after `start()`), we must spawn the elevated worker `--run-core` so TUN actually routes traffic.
+        // current process is not elevated (or TUN fell back to passive after `start()`),
+        // we must spawn the elevated worker / helper so TUN actually routes traffic.
         let try_in_proc_first = opts.proxy_mode || opts.block_only || is_current_process_elevated();
 
         if try_in_proc_first {
             match core_runtime::start(&cfg_val).await {
                 Ok(mut bx) => {
-                    #[cfg(target_os = "windows")]
                     let tun_failed_passively = !opts.proxy_mode
                         && !opts.block_only
-                        && core_runtime::inbound::tun::active_win_outbound_if_index().is_none();
-                    #[cfg(not(target_os = "windows"))]
-                    let tun_failed_passively = false;
+                        && detect_passive_tun_error(&cfg_val).is_some();
 
                     if tun_failed_passively {
                         bx.shutdown_wait().await;
                         match spawn_elevated_worker(&cfg_path, &self.secret).await {
-                            Ok((child, pid)) => {
-                                started_worker = child;
-                                started_worker_pid = pid;
+                            Ok(w) => {
+                                started_worker = w.child;
+                                started_worker_pid = w.pid;
+                                started_macos_helper = w.macos_helper;
                             }
                             Err(elev_err) => {
                                 self.emit_vpn(json!({
@@ -2912,9 +3356,10 @@ impl VpnManager {
 
                     if need_elevation {
                         match spawn_elevated_worker(&cfg_path, &self.secret).await {
-                            Ok((child, pid)) => {
-                                started_worker = child;
-                                started_worker_pid = pid;
+                            Ok(w) => {
+                                started_worker = w.child;
+                                started_worker_pid = w.pid;
+                                started_macos_helper = w.macos_helper;
                             }
                             Err(elev_err) => {
                                 self.emit_vpn(json!({
@@ -2937,9 +3382,10 @@ impl VpnManager {
             }
         } else {
             match spawn_elevated_worker(&cfg_path, &self.secret).await {
-                Ok((child, pid)) => {
-                    started_worker = child;
-                    started_worker_pid = pid;
+                Ok(w) => {
+                    started_worker = w.child;
+                    started_worker_pid = w.pid;
+                    started_macos_helper = w.macos_helper;
                 }
                 Err(elev_err) => {
                     self.emit_vpn(json!({
@@ -2956,6 +3402,7 @@ impl VpnManager {
                 in_proc: started_in_proc,
                 worker: started_worker,
                 worker_pid: started_worker_pid,
+                macos_helper: started_macos_helper,
                 running_config: cfg_val,
                 proxy_mode: opts.proxy_mode,
                 block_only: opts.block_only,
@@ -2974,6 +3421,7 @@ impl VpnManager {
                 in_proc: started_in_proc,
                 worker: started_worker,
                 worker_pid: started_worker_pid,
+                macos_helper: started_macos_helper,
                 running_config: cfg_val,
                 proxy_mode: opts.proxy_mode,
                 block_only: opts.block_only,
@@ -3057,76 +3505,70 @@ impl VpnManager {
                 }
                 if let Ok((200, body)) =
                     clash_api_request(API_PORT, &secret, "GET", "/connections", None).await
+                    && let Ok(doc) = serde_json::from_str::<Value>(&body)
                 {
-                    if let Ok(doc) = serde_json::from_str::<Value>(&body) {
-                        let down_total = doc
-                            .get("downloadTotal")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0);
-                        let up_total = doc.get("uploadTotal").and_then(Value::as_u64).unwrap_or(0);
-                        let dt = last_sample.elapsed().as_secs_f64().max(0.2);
-                        let down_rate = if last_down == 0 {
-                            0
-                        } else {
-                            ((down_total.saturating_sub(last_down)) as f64 / dt) as u64
-                        };
-                        let up_rate = if last_up == 0 {
-                            0
-                        } else {
-                            ((up_total.saturating_sub(last_up)) as f64 / dt) as u64
-                        };
-                        last_down = down_total;
-                        last_up = up_total;
-                        last_sample = Instant::now();
+                    let down_total = doc
+                        .get("downloadTotal")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let up_total = doc.get("uploadTotal").and_then(Value::as_u64).unwrap_or(0);
+                    let dt = last_sample.elapsed().as_secs_f64().max(0.2);
+                    let down_rate = if last_down == 0 {
+                        0
+                    } else {
+                        ((down_total.saturating_sub(last_down)) as f64 / dt) as u64
+                    };
+                    let up_rate = if last_up == 0 {
+                        0
+                    } else {
+                        ((up_total.saturating_sub(last_up)) as f64 / dt) as u64
+                    };
+                    last_down = down_total;
+                    last_up = up_total;
+                    last_sample = Instant::now();
 
-                        let mut msg = json!({
-                            "state": "connected",
-                            "down": down_rate,
-                            "up": up_rate,
-                            "totalDown": down_total,
-                            "totalUp": up_total
-                        });
-                        if let Ok((200, pbody)) =
-                            clash_api_request(API_PORT, &secret, "GET", "/proxies/PROXY", None)
-                                .await
+                    let mut msg = json!({
+                        "state": "connected",
+                        "down": down_rate,
+                        "up": up_rate,
+                        "totalDown": down_total,
+                        "totalUp": up_total
+                    });
+                    if let Ok((200, pbody)) =
+                        clash_api_request(API_PORT, &secret, "GET", "/proxies/PROXY", None).await
+                        && let Ok(pdoc) = serde_json::from_str::<Value>(&pbody)
+                        && (pdoc.get("type").and_then(Value::as_str) == Some("URLTest")
+                            || pdoc.get("telemetry").is_some())
+                    {
+                        let now_tag = pdoc
+                            .get("now")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let mode_str = pdoc
+                            .get("mode")
+                            .and_then(Value::as_str)
+                            .unwrap_or("stability")
+                            .to_string();
+                        let telemetry = pdoc.get("telemetry").cloned().unwrap_or_else(|| json!({}));
+                        let all = pdoc.get("all").cloned().unwrap_or_else(|| json!([]));
+                        if let Some(active_rtt) = telemetry
+                            .get(&now_tag)
+                            .and_then(|t| t.get("rtt_ms"))
+                            .and_then(Value::as_u64)
+                            .filter(|&ms| ms > 0)
                         {
-                            if let Ok(pdoc) = serde_json::from_str::<Value>(&pbody) {
-                                if pdoc.get("type").and_then(Value::as_str) == Some("URLTest")
-                                    || pdoc.get("telemetry").is_some()
-                                {
-                                    let now_tag = pdoc
-                                        .get("now")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("")
-                                        .to_string();
-                                    let mode_str = pdoc
-                                        .get("mode")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("stability")
-                                        .to_string();
-                                    let telemetry =
-                                        pdoc.get("telemetry").cloned().unwrap_or_else(|| json!({}));
-                                    let all = pdoc.get("all").cloned().unwrap_or_else(|| json!([]));
-                                    if let Some(active_rtt) = telemetry
-                                        .get(&now_tag)
-                                        .and_then(|t| t.get("rtt_ms"))
-                                        .and_then(Value::as_u64)
-                                        .filter(|&ms| ms > 0)
-                                    {
-                                        msg["ping"] = json!(active_rtt);
-                                    }
-                                    msg["balancer"] = json!({
-                                        "tag": "PROXY",
-                                        "now": now_tag,
-                                        "mode": mode_str,
-                                        "all": all,
-                                        "telemetry": telemetry
-                                    });
-                                }
-                            }
+                            msg["ping"] = json!(active_rtt);
                         }
-                        (send_js)(format!("vpn:{msg}"));
+                        msg["balancer"] = json!({
+                            "tag": "PROXY",
+                            "now": now_tag,
+                            "mode": mode_str,
+                            "all": all,
+                            "telemetry": telemetry
+                        });
                     }
+                    (send_js)(format!("vpn:{msg}"));
                 }
                 tokio::select! {
                     _ = rx.changed() => break,
@@ -3158,6 +3600,7 @@ impl VpnManager {
         });
     }
 
+    #[allow(dead_code)]
     pub async fn probe_delay(&self) -> Option<u64> {
         probe_proxy_delay(&self.secret).await
     }
@@ -3168,15 +3611,15 @@ impl VpnManager {
             return false;
         }
         let guard = self.engine.lock().await;
-        if let Some(eng) = guard.as_ref() {
-            if let Some(bx) = eng.in_proc.as_ref() {
-                let inner = bx.router().inner();
-                for (_, tag, outbound) in inner.outbound_table() {
-                    if tag == "PROXY" {
-                        if let core_runtime::route::Outbound::Urltest(u) = outbound {
-                            return u.select(member);
-                        }
-                    }
+        if let Some(eng) = guard.as_ref()
+            && let Some(bx) = eng.in_proc.as_ref()
+        {
+            let inner = bx.router().inner();
+            for (_, tag, outbound) in inner.outbound_table() {
+                if tag == "PROXY"
+                    && let core_runtime::route::Outbound::Urltest(u) = outbound
+                {
+                    return u.select(member);
                 }
             }
         }
@@ -3272,17 +3715,33 @@ impl VpnManager {
         let _ = clash_api_request(API_PORT, &self.secret, "DELETE", &path, None).await;
     }
 
+    #[allow(dead_code)]
     pub fn get_log_tail(&self, max_lines: usize) -> String {
+        self.get_log_tail_filtered(max_lines, "all")
+    }
+
+    pub fn get_log_tail_filtered(&self, max_lines: usize, min_level: &str) -> String {
         if let Ok(content) = fs::read_to_string(&self.log_path) {
             let lines: Vec<&str> = content.lines().collect();
-            let start = lines.len().saturating_sub(max_lines);
-            if !lines[start..].is_empty() {
-                return lines[start..].join("\n");
+            if !lines.is_empty() {
+                return filter_log_lines(&lines, max_lines, min_level);
             }
         }
         let ring = core_runtime::logging::recent(core_runtime::logging::Level::Trace);
-        let start = ring.len().saturating_sub(max_lines);
-        ring[start..].join("\n")
+        let refs: Vec<&str> = ring.iter().map(String::as_str).collect();
+        filter_log_lines(&refs, max_lines, min_level)
+    }
+
+    pub fn clear_log_file(&self) {
+        let _ = fs::write(&self.log_path, b"");
+    }
+
+    pub async fn set_live_log_level(&self, level: &str) -> bool {
+        let body = json!({ "log-level": level }).to_string();
+        matches!(
+            clash_api_request(API_PORT, &self.secret, "PATCH", "/configs", Some(&body)).await,
+            Ok((200..=299, _))
+        )
     }
 
     pub async fn import_subscription(&self, input: String) {
@@ -3530,14 +3989,14 @@ impl VpnManager {
             let mut ex = None;
             if let Some(ref ui_raw) = meta.user_info_raw {
                 for part in ui_raw.split(';') {
-                    if let Some((k, v)) = part.trim().split_once('=') {
-                        if let Ok(num) = v.trim().parse::<u64>() {
-                            match k.trim() {
-                                "upload" | "download" => u += num,
-                                "total" => t = num,
-                                "expire" if num > 0 => ex = Some(num),
-                                _ => {}
-                            }
+                    if let Some((k, v)) = part.trim().split_once('=')
+                        && let Ok(num) = v.trim().parse::<u64>()
+                    {
+                        match k.trim() {
+                            "upload" | "download" => u += num,
+                            "total" => t = num,
+                            "expire" if num > 0 => ex = Some(num),
+                            _ => {}
                         }
                     }
                 }
@@ -3570,8 +4029,8 @@ impl VpnManager {
     }
 
     pub async fn provision_warp_awg(&self) -> String {
-        if self.is_running().await {
-            if let Ok((200, body)) = clash_api_request(
+        if self.is_running().await
+            && let Ok((200, body)) = clash_api_request(
                 API_PORT,
                 &self.secret,
                 "POST",
@@ -3579,71 +4038,65 @@ impl VpnManager {
                 Some(r#"{"tag":"Cloudflare WARP"}"#),
             )
             .await
-            {
-                if let Ok(doc) = serde_json::from_str::<Value>(&body) {
-                    if let Some(acct) = doc.get("account") {
-                        let priv_b64 = acct
-                            .get("private_key")
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        let peer_pub = acct
-                            .get("peer_public_key")
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        let inet4 = acct
-                            .get("inet4")
-                            .and_then(Value::as_str)
-                            .unwrap_or("172.16.0.2/32");
-                        let endpoint = acct
-                            .get("endpoint")
-                            .and_then(Value::as_str)
-                            .unwrap_or("162.159.192.1:2408");
-                        let reserved_param = acct
-                            .get("reserved")
-                            .and_then(Value::as_array)
-                            .filter(|a| a.len() >= 3)
-                            .map(|a| {
-                                format!(
-                                    "&reserved={},{},{}",
-                                    a[0].as_u64().unwrap_or(0),
-                                    a[1].as_u64().unwrap_or(0),
-                                    a[2].as_u64().unwrap_or(0),
-                                )
-                            })
-                            .unwrap_or_default();
-                        if !priv_b64.is_empty() && !peer_pub.is_empty() {
-                            let awg_uri = format!(
-                                "awg://{}@{}?publickey={}&address={}{}&mtu=1280&jc=4&jmin=40&jmax=70&s1=0&s2=0&h1=1&h2=2&h3=3&h4=4#Cloudflare%20WARP%20(AmneziaWG)",
-                                core_config::subscription::percent_encode_component(priv_b64),
-                                endpoint,
-                                core_config::subscription::percent_encode_component(peer_pub),
-                                core_config::subscription::percent_encode_component(inet4),
-                                reserved_param,
-                            );
-                            let masque_uri = doc
-                                .get("masque_outbound")
-                                .cloned()
-                                .map(|mut ob| {
-                                    if let Some(m) = ob.as_object_mut() {
-                                        m.insert(
-                                            "tag".to_string(),
-                                            json!("Cloudflare WARP (MASQUE)"),
-                                        );
-                                    }
-                                    encode_inline_node_uri(&ob)
-                                })
-                                .unwrap_or_default();
-                            return json!({
-                                "ok": true,
-                                "uri": awg_uri,
-                                "masque_uri": masque_uri,
-                                "name": "Cloudflare WARP (AmneziaWG)",
-                                "ip": inet4
-                            })
-                            .to_string();
+            && let Ok(doc) = serde_json::from_str::<Value>(&body)
+            && let Some(acct) = doc.get("account")
+        {
+            let priv_b64 = acct
+                .get("private_key")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let peer_pub = acct
+                .get("peer_public_key")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let inet4 = acct
+                .get("inet4")
+                .and_then(Value::as_str)
+                .unwrap_or("172.16.0.2/32");
+            let endpoint = acct
+                .get("endpoint")
+                .and_then(Value::as_str)
+                .unwrap_or("162.159.192.1:2408");
+            let reserved_param = acct
+                .get("reserved")
+                .and_then(Value::as_array)
+                .filter(|a| a.len() >= 3)
+                .map(|a| {
+                    format!(
+                        "&reserved={},{},{}",
+                        a[0].as_u64().unwrap_or(0),
+                        a[1].as_u64().unwrap_or(0),
+                        a[2].as_u64().unwrap_or(0),
+                    )
+                })
+                .unwrap_or_default();
+            if !priv_b64.is_empty() && !peer_pub.is_empty() {
+                let awg_uri = format!(
+                    "awg://{}@{}?publickey={}&address={}{}&mtu=1280&jc=4&jmin=40&jmax=70&s1=0&s2=0&h1=1&h2=2&h3=3&h4=4#Cloudflare%20WARP%20(AmneziaWG)",
+                    core_config::subscription::percent_encode_component(priv_b64),
+                    endpoint,
+                    core_config::subscription::percent_encode_component(peer_pub),
+                    core_config::subscription::percent_encode_component(inet4),
+                    reserved_param,
+                );
+                let masque_uri = doc
+                    .get("masque_outbound")
+                    .cloned()
+                    .map(|mut ob| {
+                        if let Some(m) = ob.as_object_mut() {
+                            m.insert("tag".to_string(), json!("Cloudflare WARP (MASQUE)"));
                         }
-                    }
-                }
+                        encode_inline_node_uri(&ob)
+                    })
+                    .unwrap_or_default();
+                return json!({
+                    "ok": true,
+                    "uri": awg_uri,
+                    "masque_uri": masque_uri,
+                    "name": "Cloudflare WARP (AmneziaWG)",
+                    "ip": inet4
+                })
+                .to_string();
             }
         }
 
@@ -3852,10 +4305,10 @@ impl VpnManager {
         d: &DesyncOptions,
     ) -> core_runtime::outbound::desync::DesyncConfig {
         let val = Self::build_desync_outbound("DESYNC", d);
-        if let Some(obj) = val.as_object() {
-            if let Ok(cfg) = core_runtime::outbound::desync::DesyncConfig::from_json(obj) {
-                return cfg;
-            }
+        if let Some(obj) = val.as_object()
+            && let Ok(cfg) = core_runtime::outbound::desync::DesyncConfig::from_json(obj)
+        {
+            return cfg;
         }
         core_runtime::outbound::desync::DesyncConfig::default()
     }
@@ -3955,71 +4408,93 @@ impl VpnManager {
         } else {
             None
         };
+        let no_cache = &[("Cache-Control", "no-cache")];
         let sw = Instant::now();
         if let Ok(resp) = fetch_url(
             "http://ip-api.com/json/?fields=status,country,countryCode,city,isp,org,query&lang=ru",
             "GET",
-            &[],
+            no_cache,
             None,
             proxy,
             Duration::from_secs(5),
         )
         .await
+            && let Ok(doc) = serde_json::from_slice::<Value>(&resp.body)
+            && doc.get("status").and_then(Value::as_str) == Some("success")
         {
-            if let Ok(doc) = serde_json::from_slice::<Value>(&resp.body) {
-                if doc.get("status").and_then(Value::as_str) == Some("success") {
-                    let ip = doc.get("query").and_then(Value::as_str).unwrap_or("—");
-                    let country = doc.get("country").and_then(Value::as_str).unwrap_or("");
-                    let cc = doc.get("countryCode").and_then(Value::as_str).unwrap_or("");
-                    let city = doc.get("city").and_then(Value::as_str).unwrap_or("");
-                    let isp = doc
-                        .get("isp")
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.is_empty())
-                        .or_else(|| doc.get("org").and_then(Value::as_str))
-                        .unwrap_or("");
-                    return json!({
-                        "ok": true,
-                        "ip": ip,
-                        "country": country,
-                        "countryCode": cc,
-                        "city": city,
-                        "isp": isp,
-                        "latencyMs": sw.elapsed().as_millis() as u64
-                    })
-                    .to_string();
-                }
-            }
+            let ip = doc.get("query").and_then(Value::as_str).unwrap_or("—");
+            let country = doc.get("country").and_then(Value::as_str).unwrap_or("");
+            let cc = doc.get("countryCode").and_then(Value::as_str).unwrap_or("");
+            let city = doc.get("city").and_then(Value::as_str).unwrap_or("");
+            let isp = doc
+                .get("isp")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .or_else(|| doc.get("org").and_then(Value::as_str))
+                .unwrap_or("");
+            return json!({
+                "ok": true,
+                "ip": ip,
+                "country": country,
+                "countryCode": cc,
+                "city": city,
+                "isp": isp,
+                "latencyMs": sw.elapsed().as_millis() as u64
+            })
+            .to_string();
         }
 
         let sw2 = Instant::now();
         if let Ok(resp) = fetch_url(
             "https://ipinfo.io/json",
             "GET",
-            &[],
+            no_cache,
             None,
             proxy,
             Duration::from_secs(5),
         )
         .await
+            && let Ok(doc) = serde_json::from_slice::<Value>(&resp.body)
+            && let Some(ip) = doc.get("ip").and_then(Value::as_str)
         {
-            if let Ok(doc) = serde_json::from_slice::<Value>(&resp.body) {
-                if let Some(ip) = doc.get("ip").and_then(Value::as_str) {
-                    let cc = doc.get("country").and_then(Value::as_str).unwrap_or("");
-                    let city = doc.get("city").and_then(Value::as_str).unwrap_or("");
-                    let isp = doc.get("org").and_then(Value::as_str).unwrap_or("");
-                    return json!({
-                        "ok": true,
-                        "ip": ip,
-                        "country": cc,
-                        "countryCode": cc,
-                        "city": city,
-                        "isp": isp,
-                        "latencyMs": sw2.elapsed().as_millis() as u64
-                    })
-                    .to_string();
-                }
-            }
+            let cc = doc.get("country").and_then(Value::as_str).unwrap_or("");
+            let city = doc.get("city").and_then(Value::as_str).unwrap_or("");
+            let isp = doc.get("org").and_then(Value::as_str).unwrap_or("");
+            return json!({
+                "ok": true,
+                "ip": ip,
+                "country": cc,
+                "countryCode": cc,
+                "city": city,
+                "isp": isp,
+                "latencyMs": sw2.elapsed().as_millis() as u64
+            })
+            .to_string();
+        }
+
+        let sw3 = Instant::now();
+        if let Ok(resp) = fetch_url(
+            "https://api.ipify.org?format=json",
+            "GET",
+            no_cache,
+            None,
+            proxy,
+            Duration::from_secs(5),
+        )
+        .await
+            && let Ok(doc) = serde_json::from_slice::<Value>(&resp.body)
+            && let Some(ip) = doc.get("ip").and_then(Value::as_str)
+        {
+            return json!({
+                "ok": true,
+                "ip": ip,
+                "country": "",
+                "countryCode": "",
+                "city": "",
+                "isp": "",
+                "latencyMs": sw3.elapsed().as_millis() as u64
+            })
+            .to_string();
         }
 
         json!({ "ok": false, "error": "Нет ответа от гео-сервисов" }).to_string()
@@ -4361,8 +4836,8 @@ impl VpnManager {
         let send_prog = self.send_js.clone();
         let report_dl = move |got: usize, total_opt: Option<usize>| {
             let total = total_opt.unwrap_or(expected_size);
-            if total > 0 {
-                let pct = 15 + ((got.saturating_mul(70)) / total).min(70);
+            if let Some(scaled) = got.saturating_mul(70).checked_div(total) {
+                let pct = 15 + scaled.min(70);
                 (send_prog)(format!("core-update:progress:{pct}"));
             }
         };
@@ -4424,13 +4899,12 @@ impl VpnManager {
                 Duration::from_secs(15),
             )
             .await
+                && (200..300).contains(&r.status)
             {
-                if (200..300).contains(&r.status) {
-                    let sums_text = String::from_utf8_lossy(&r.body);
-                    if let Err(err_msg) = verify_asset_sha256(&bytes, &rel.asset_name, &sums_text) {
-                        self.emit(format!("core-update:error:{err_msg}"));
-                        return;
-                    }
+                let sums_text = String::from_utf8_lossy(&r.body);
+                if let Err(err_msg) = verify_asset_sha256(&bytes, &rel.asset_name, &sums_text) {
+                    self.emit(format!("core-update:error:{err_msg}"));
+                    return;
                 }
             }
         }
@@ -4881,14 +5355,12 @@ async fn probe_proxy_delay(secret: &str) -> Option<u64> {
     ];
     for u in urls {
         let path = format!("/proxies/PROXY/delay?timeout=5000&url={u}");
-        if let Ok((200, body)) = clash_api_request(API_PORT, secret, "GET", &path, None).await {
-            if let Ok(doc) = serde_json::from_str::<Value>(&body) {
-                if let Some(d) = doc.get("delay").and_then(Value::as_u64) {
-                    if d > 0 {
-                        return Some(d);
-                    }
-                }
-            }
+        if let Ok((200, body)) = clash_api_request(API_PORT, secret, "GET", &path, None).await
+            && let Ok(doc) = serde_json::from_str::<Value>(&body)
+            && let Some(d) = doc.get("delay").and_then(Value::as_u64)
+            && d > 0
+        {
+            return Some(d);
         }
     }
     None
@@ -5071,29 +5543,526 @@ async fn detect_upstream_fakeip() -> bool {
             tokio::net::lookup_host((host, 443)),
         )
         .await
+            && addrs.into_iter().any(|sa| is_fakeip_pool_addr(sa.ip()))
         {
-            if addrs.into_iter().any(|sa| is_fakeip_pool_addr(sa.ip())) {
-                return true;
-            }
+            return true;
         }
     }
     false
 }
 
-pub fn cleanup_stale_state_on_startup() {
-    if let Some(stale_pid) = read_core_pid_file() {
-        if is_pid_alive(stale_pid) {
-            let stop_file = app_data_dir().join("config.stop");
-            let _ = fs::write(&stop_file, b"1");
-            for _ in 0..60 {
-                if !is_pid_alive(stale_pid) {
+pub fn parse_log_level_rank(level: &str) -> u8 {
+    match level.trim().to_ascii_lowercase().as_str() {
+        "all" | "trace" => 0,
+        "debug" => 1,
+        "info" => 2,
+        "warn" | "warning" => 3,
+        "error" | "err" => 4,
+        "fatal" | "panic" => 5,
+        _ => 2,
+    }
+}
+
+pub fn extract_log_line_rank(line: &str) -> Option<u8> {
+    for (tag, rank) in [
+        ("[TRACE]", 0u8),
+        ("[DEBUG]", 1u8),
+        ("[INFO]", 2u8),
+        ("[WARN]", 3u8),
+        ("[ERROR]", 4u8),
+        ("[FATAL]", 5u8),
+    ] {
+        if line.contains(tag) {
+            return Some(rank);
+        }
+    }
+    None
+}
+
+pub fn filter_log_lines(lines: &[&str], max_lines: usize, min_level: &str) -> String {
+    let min_rank = parse_log_level_rank(min_level);
+    if min_rank == 0 {
+        let start = lines.len().saturating_sub(max_lines);
+        return lines[start..].join("\n");
+    }
+    let mut kept = Vec::new();
+    let mut last_rank: Option<u8> = None;
+    for &line in lines {
+        if let Some(r) = extract_log_line_rank(line) {
+            last_rank = Some(r);
+            if r >= min_rank {
+                kept.push(line);
+            }
+        } else if last_rank.is_none_or(|r| r >= min_rank) {
+            kept.push(line);
+        }
+    }
+    let start = kept.len().saturating_sub(max_lines);
+    kept[start..].join("\n")
+}
+
+pub fn detect_passive_tun_error(root: &Value) -> Option<String> {
+    let has_tun = root
+        .get("inbounds")
+        .and_then(Value::as_array)
+        .is_some_and(|arr| {
+            arr.iter()
+                .any(|ib| ib.get("type").and_then(Value::as_str) == Some("tun"))
+        });
+    if !has_tun {
+        return None;
+    }
+
+    #[cfg(target_os = "windows")]
+    if core_runtime::inbound::tun::active_win_outbound_if_index().is_none() {
+        return Some(
+            "Не удалось открыть виртуальный адаптер Wintun (ошибка драйвера или прав)".to_string(),
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let recent_warns = core_runtime::logging::recent(core_runtime::logging::Level::Warn);
+        for line in recent_warns.iter().rev().take(24) {
+            let lower = line.to_ascii_lowercase();
+            if lower.contains("failed to open utun")
+                || lower.contains("failed to open tun")
+                || lower.contains("failed to register utun")
+                || lower.contains("continuing in passive mode")
+            {
+                return Some(format!(
+                    "Нет прав на создание виртуального TUN-интерфейса ({line}). Выдайте права администратора / установите службу или переключитесь в режим «Системный прокси»."
+                ));
+            }
+        }
+    }
+
+    None
+}
+
+struct SpawnedWorker {
+    child: Option<Child>,
+    pid: Option<u32>,
+    macos_helper: bool,
+}
+
+#[cfg(target_os = "macos")]
+mod macos_helper {
+    use std::ffi::OsStr;
+    use std::fs;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    use std::path::Path;
+    use std::process::Command;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use core_runtime::BoxInstance;
+    use serde_json::{Value, json};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+    use tokio::net::UnixListener;
+
+    pub const HELPER_BIN: &str = "/Library/PrivilegedHelperTools/io.tachyon.desktop.helper";
+    pub const HELPER_PLIST: &str = "/Library/LaunchDaemons/io.tachyon.desktop.helper.plist";
+    pub const HELPER_SOCK: &str = "/var/run/tachyon-helper.sock";
+    pub const HELPER_LABEL: &str = "io.tachyon.desktop.helper";
+
+    fn helper_request(req: &Value, timeout: Duration) -> Result<Value, String> {
+        let mut stream = UnixStream::connect(HELPER_SOCK)
+            .map_err(|e| format!("Служба macOS не отвечает ({e})"))?;
+        let _ = stream.set_read_timeout(Some(timeout));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+        let line = format!("{req}\n");
+        stream
+            .write_all(line.as_bytes())
+            .map_err(|e| format!("Ошибка записи в сокет службы: {e}"))?;
+        let _ = stream.flush();
+
+        let mut reader = BufReader::new(stream);
+        let mut resp_line = String::new();
+        reader
+            .by_ref()
+            .take(64 * 1024)
+            .read_line(&mut resp_line)
+            .map_err(|e| format!("Таймаут ответа службы macOS: {e}"))?;
+        serde_json::from_str::<Value>(resp_line.trim())
+            .map_err(|e| format!("Некорректный ответ службы macOS: {e}"))
+    }
+
+    pub fn status() -> (bool, Option<String>) {
+        match helper_request(&json!({ "cmd": "ping" }), Duration::from_millis(800)) {
+            Ok(doc) if doc.get("ok").and_then(Value::as_bool) == Some(true) => {
+                let ver = doc
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                (true, ver)
+            }
+            _ => (false, None),
+        }
+    }
+
+    pub fn stop_tunnel() {
+        let _ = helper_request(&json!({ "cmd": "stop" }), Duration::from_secs(12));
+    }
+
+    pub fn sysproxy(enable: bool, port: u16) -> bool {
+        matches!(
+            helper_request(
+                &json!({ "cmd": "sysproxy", "enable": enable, "port": port }),
+                Duration::from_secs(6)
+            ),
+            Ok(doc) if doc.get("ok").and_then(Value::as_bool) == Some(true)
+        )
+    }
+
+    pub fn start_tunnel(cfg_path: &Path) -> Result<Option<u32>, String> {
+        let resp = helper_request(
+            &json!({
+                "cmd": "start",
+                "config_path": cfg_path.to_string_lossy()
+            }),
+            Duration::from_secs(20),
+        )?;
+        if resp.get("ok").and_then(Value::as_bool) == Some(true) {
+            Ok(resp.get("pid").and_then(Value::as_u64).map(|p| p as u32))
+        } else {
+            let err = resp
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("Неизвестная ошибка службы macOS");
+            Err(err.to_string())
+        }
+    }
+
+    pub fn install() -> Result<(), String> {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let plist_content = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{HELPER_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{HELPER_BIN}</string>
+        <string>--macos-helper</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+</dict>
+</plist>
+"#
+        );
+        let tmp_plist = std::env::temp_dir().join(format!("{HELPER_LABEL}.plist.tmp"));
+        fs::write(&tmp_plist, plist_content)
+            .map_err(|e| format!("Не удалось записать временный plist: {e}"))?;
+
+        let exe_q = exe.to_string_lossy().replace('\'', "'\\''");
+        let tmp_q = tmp_plist.to_string_lossy().replace('\'', "'\\''");
+        let shell_cmd = format!(
+            "mkdir -p /Library/PrivilegedHelperTools /Library/LaunchDaemons && \
+cp -f '{exe_q}' '{HELPER_BIN}' && \
+chown root:wheel '{HELPER_BIN}' && \
+chmod 755 '{HELPER_BIN}' && \
+(codesign -v '{HELPER_BIN}' >/dev/null 2>&1 || codesign --force --sign - '{HELPER_BIN}' >/dev/null 2>&1 || true) && \
+cp -f '{tmp_q}' '{HELPER_PLIST}' && \
+chown root:wheel '{HELPER_PLIST}' && \
+chmod 644 '{HELPER_PLIST}' && \
+launchctl bootout system/{HELPER_LABEL} >/dev/null 2>&1 || true; \
+launchctl unload -w '{HELPER_PLIST}' >/dev/null 2>&1 || true; \
+launchctl bootstrap system '{HELPER_PLIST}' || launchctl load -w '{HELPER_PLIST}'"
+        );
+        let osa_script = format!(
+            "do shell script \"{}\" with administrator privileges",
+            shell_cmd.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+        let status = Command::new("osascript")
+            .args(["-e", &osa_script])
+            .status()
+            .map_err(|e| format!("osascript error: {e}"))?;
+        let _ = fs::remove_file(&tmp_plist);
+
+        if !status.success() {
+            return Err("Установка службы macOS отменена или завершилась с ошибкой".to_string());
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let (alive, ver) = status();
+            if alive && ver.as_deref() == Some(env!("CARGO_PKG_VERSION")) {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        Err("Служба macOS установлена, но не ответила на проверочный запрос".to_string())
+    }
+
+    pub fn uninstall() -> Result<(), String> {
+        let _ = helper_request(&json!({ "cmd": "uninstall" }), Duration::from_secs(6));
+        let shell_cmd = format!(
+            "launchctl bootout system/{HELPER_LABEL} >/dev/null 2>&1 || true; \
+launchctl unload -w '{HELPER_PLIST}' >/dev/null 2>&1 || true; \
+rm -f '{HELPER_PLIST}' '{HELPER_BIN}' '{HELPER_SOCK}'"
+        );
+        let osa_script = format!(
+            "do shell script \"{}\" with administrator privileges",
+            shell_cmd.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+        let status = Command::new("osascript")
+            .args(["-e", &osa_script])
+            .status()
+            .map_err(|e| format!("osascript error: {e}"))?;
+        if !status.success() {
+            return Err("Удаление службы macOS отменено или завершилось с ошибкой".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn run_daemon() -> i32 {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime for macOS helper");
+
+        rt.block_on(async move {
+            let _ = fs::remove_file(HELPER_SOCK);
+            let listener = match UnixListener::bind(HELPER_SOCK) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("macos-helper: bind {HELPER_SOCK} failed: {e}");
+                    return 1;
+                }
+            };
+            if let Ok(c_sock) = std::ffi::CString::new(HELPER_SOCK) {
+                unsafe {
+                    let _ = libc::chmod(c_sock.as_ptr(), 0o666);
+                }
+            }
+            let engine: Arc<tokio::sync::Mutex<Option<BoxInstance>>> =
+                Arc::new(tokio::sync::Mutex::new(None));
+
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => continue,
+                };
+                let eng = Arc::clone(&engine);
+                tokio::spawn(async move {
+                    let exit_now = handle_client(stream, eng).await;
+                    if exit_now {
+                        std::process::exit(0);
+                    }
+                });
+            }
+        })
+    }
+
+    async fn handle_client(
+        stream: tokio::net::UnixStream,
+        engine: Arc<tokio::sync::Mutex<Option<BoxInstance>>>,
+    ) -> bool {
+        let mut peer_uid: libc::uid_t = u32::MAX;
+        let mut peer_gid: libc::gid_t = u32::MAX;
+        let peer_ok =
+            unsafe { libc::getpeereid(stream.as_raw_fd(), &mut peer_uid, &mut peer_gid) } == 0;
+        let _ = peer_gid;
+
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = TokioBufReader::new(read_half);
+        let mut line = String::new();
+        let read_res = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut buf = Vec::with_capacity(512);
+            loop {
+                let mut byte = [0u8; 1];
+                let n = tokio::io::AsyncReadExt::read(&mut reader, &mut byte).await?;
+                if n == 0 || byte[0] == b'\n' {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(100));
+                buf.push(byte[0]);
+                if buf.len() > 8192 {
+                    return Err(std::io::Error::other("request too large"));
+                }
             }
-            if is_pid_alive(stale_pid) {
-                terminate_pid(stale_pid);
+            line = String::from_utf8_lossy(&buf).into_owned();
+            Ok::<(), std::io::Error>(())
+        })
+        .await;
+
+        let Ok(Ok(())) = read_res else {
+            return false;
+        };
+        let Ok(req) = serde_json::from_str::<Value>(line.trim()) else {
+            let _ = write_half
+                .write_all(b"{\"ok\":false,\"error\":\"invalid json\"}\n")
+                .await;
+            return false;
+        };
+        let cmd = req.get("cmd").and_then(Value::as_str).unwrap_or("");
+        let mut exit_after = false;
+
+        let reply = match cmd {
+            "ping" => {
+                let running = engine.lock().await.is_some();
+                json!({
+                    "ok": true,
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "running": running,
+                    "pid": std::process::id()
+                })
             }
+            "start" => {
+                if !peer_ok {
+                    json!({ "ok": false, "error": "getpeereid failed" })
+                } else if let Some(cfg_str) = req.get("config_path").and_then(Value::as_str) {
+                    match start_from_path(cfg_str, peer_uid, &engine).await {
+                        Ok(()) => json!({ "ok": true, "pid": std::process::id() }),
+                        Err(err) => json!({ "ok": false, "error": err }),
+                    }
+                } else {
+                    json!({ "ok": false, "error": "missing config_path" })
+                }
+            }
+            "stop" => {
+                let prev = engine.lock().await.take();
+                if let Some(mut bx) = prev {
+                    bx.shutdown_wait().await;
+                }
+                super::flush_os_dns();
+                json!({ "ok": true })
+            }
+            "sysproxy" => {
+                let enable = req.get("enable").and_then(Value::as_bool).unwrap_or(false);
+                let port = req.get("port").and_then(Value::as_u64).unwrap_or(0) as u16;
+                if !(1024..=65535).contains(&port) {
+                    json!({ "ok": false, "error": "invalid proxy port" })
+                } else if super::apply_macos_system_proxy_direct(enable, port) {
+                    json!({ "ok": true })
+                } else {
+                    json!({ "ok": false, "error": "networksetup failed" })
+                }
+            }
+            "uninstall" => {
+                let prev = engine.lock().await.take();
+                if let Some(mut bx) = prev {
+                    bx.shutdown_wait().await;
+                }
+                super::flush_os_dns();
+                let _ = fs::remove_file(HELPER_PLIST);
+                let _ = fs::remove_file(HELPER_BIN);
+                let _ = fs::remove_file(HELPER_SOCK);
+                exit_after = true;
+                json!({ "ok": true })
+            }
+            _ => json!({ "ok": false, "error": "unknown command" }),
+        };
+
+        let _ = write_half.write_all(format!("{reply}\n").as_bytes()).await;
+        let _ = write_half.flush().await;
+        exit_after
+    }
+
+    async fn start_from_path(
+        cfg_str: &str,
+        peer_uid: u32,
+        engine: &Arc<tokio::sync::Mutex<Option<BoxInstance>>>,
+    ) -> Result<(), String> {
+        let canon = fs::canonicalize(cfg_str)
+            .map_err(|e| format!("Не найден файл конфигурации {cfg_str}: {e}"))?;
+        if canon.file_name() != Some(OsStr::new("config.json")) {
+            return Err("Недопустимое имя файла конфигурации".to_string());
+        }
+        let meta = fs::metadata(&canon)
+            .map_err(|e| format!("Не удалось прочитать метаданные конфига: {e}"))?;
+        if !meta.is_file() || meta.len() > 2 * 1024 * 1024 {
+            return Err("Некорректный размер файла конфигурации".to_string());
+        }
+        if peer_uid != 0 && meta.uid() != peer_uid {
+            return Err("Доступ к файлу конфигурации запрещён".to_string());
+        }
+        let raw =
+            fs::read_to_string(&canon).map_err(|e| format!("Ошибка чтения конфигурации: {e}"))?;
+        core_config::check_str(&raw).map_err(|e| format!("Ошибка валидации конфигурации: {e}"))?;
+        let root: Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("Ошибка разбора JSON конфигурации: {e}"))?;
+
+        let prev = engine.lock().await.take();
+        if let Some(mut old) = prev {
+            old.shutdown_wait().await;
+        }
+
+        let mut bx = core_runtime::start(&root)
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        if let Some(msg) = super::detect_passive_tun_error(&root) {
+            bx.shutdown_wait().await;
+            return Err(msg);
+        }
+        *engine.lock().await = Some(bx);
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn run_macos_helper_daemon() -> i32 {
+    macos_helper::run_daemon()
+}
+
+#[cfg(target_os = "macos")]
+pub fn macos_helper_status() -> (bool, Option<String>) {
+    macos_helper::status()
+}
+
+#[cfg(target_os = "macos")]
+pub fn install_macos_helper() -> Result<(), String> {
+    macos_helper::install()
+}
+
+#[cfg(target_os = "macos")]
+pub fn uninstall_macos_helper() -> Result<(), String> {
+    macos_helper::uninstall()
+}
+
+#[cfg(target_os = "macos")]
+fn stop_macos_helper_tunnel() {
+    macos_helper::stop_tunnel();
+}
+
+pub fn cleanup_stale_state_on_startup() {
+    #[cfg(target_os = "macos")]
+    {
+        if macos_helper::status().0 {
+            macos_helper::stop_tunnel();
+        }
+    }
+    if let Some(stale_pid) = read_core_pid_file()
+        && is_pid_alive(stale_pid)
+    {
+        let stop_file = app_data_dir().join("config.stop");
+        let _ = fs::write(&stop_file, b"1");
+        for _ in 0..60 {
+            if !is_pid_alive(stale_pid) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if is_pid_alive(stale_pid) {
+            terminate_pid(stale_pid);
         }
     }
     let _ = fs::remove_file(app_data_dir().join("config.stop"));
@@ -5112,177 +6081,479 @@ pub fn cleanup_stale_state_on_startup() {
     flush_os_dns();
 }
 
-async fn spawn_elevated_worker(
-    cfg_path: &Path,
-    secret: &str,
-) -> Result<(Option<Child>, Option<u32>), String> {
-    if let Some(stale_pid) = read_core_pid_file() {
-        if is_pid_alive(stale_pid) {
+async fn spawn_elevated_worker(cfg_path: &Path, secret: &str) -> Result<SpawnedWorker, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let cfg_owned = cfg_path.to_path_buf();
+        let pid = tokio::task::spawn_blocking(move || -> Result<Option<u32>, String> {
+            let (alive, ver) = macos_helper::status();
+            if !alive || ver.as_deref() != Some(env!("CARGO_PKG_VERSION")) {
+                macos_helper::install()?;
+            }
+            macos_helper::start_tunnel(&cfg_owned)
+        })
+        .await
+        .map_err(|e| format!("Ошибка задачи службы macOS: {e}"))??;
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if let Ok((200, _)) =
+                clash_api_request(API_PORT, secret, "GET", "/connections", None).await
+            {
+                return Ok(SpawnedWorker {
+                    child: None,
+                    pid,
+                    macos_helper: true,
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        let _ = tokio::task::spawn_blocking(macos_helper::stop_tunnel).await;
+        return Err("Таймаут запуска ядра через службу macOS".to_string());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Some(stale_pid) = read_core_pid_file()
+            && is_pid_alive(stale_pid)
+        {
             stop_worker_process(None, Some(stale_pid)).await;
         }
-    }
-    let _ = fs::remove_file(app_data_dir().join("config.stop"));
-    let _ = fs::remove_file(core_pid_path());
-    let _ = fs::remove_file(core_err_path());
+        let _ = fs::remove_file(app_data_dir().join("config.stop"));
+        let _ = fs::remove_file(core_pid_path());
+        let _ = fs::remove_file(core_err_path());
 
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let cfg_str = cfg_path.to_string_lossy().into_owned();
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let cfg_str = cfg_path.to_string_lossy().into_owned();
 
-    #[cfg(target_os = "linux")]
-    let (mut child_opt, mut worker_pid): (Option<Child>, Option<u32>) = {
-        // First try granting capabilities to the binary via pkexec so future starts don't even need a worker
-        let _ = Command::new("pkexec")
-            .args([
-                "setcap",
-                "cap_net_admin,cap_net_raw+eip",
-                &exe.to_string_lossy(),
-            ])
-            .status();
+        #[cfg(target_os = "linux")]
+        let (mut child_opt, mut worker_pid): (Option<Child>, Option<u32>) = {
+            // First try granting capabilities to the binary via pkexec so future starts don't even need a worker
+            let _ = Command::new("pkexec")
+                .args([
+                    "setcap",
+                    "cap_net_admin,cap_net_raw+eip",
+                    &exe.to_string_lossy(),
+                ])
+                .status();
 
-        let ch = Command::new("pkexec")
-            .arg(&exe)
-            .arg("--run-core")
-            .arg(&cfg_str)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("pkexec error: {e}"))?;
-        let pid = Some(ch.id());
-        (Some(ch), pid)
-    };
-
-    #[cfg(target_os = "macos")]
-    let (mut child_opt, mut worker_pid): (Option<Child>, Option<u32>) = {
-        let script = format!(
-            "do shell script \"'{}' --run-core '{}'\" with administrator privileges",
-            exe.to_string_lossy().replace('\'', "'\\''"),
-            cfg_str.replace('\'', "'\\''")
-        );
-        let ch = Command::new("osascript")
-            .arg("-e")
-            .arg(&script)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("osascript error: {e}"))?;
-        let pid = Some(ch.id());
-        (Some(ch), pid)
-    };
-
-    #[cfg(target_os = "windows")]
-    let (mut child_opt, mut worker_pid): (Option<Child>, Option<u32>) = {
-        use std::io::Read;
-        use std::os::windows::process::CommandExt;
-        let ps_cmd = format!(
-            "$p = Start-Process -FilePath '{}' -ArgumentList '--run-core','{}' -Verb RunAs -WindowStyle Hidden -PassThru; if ($p) {{ Write-Output $p.Id }} else {{ exit 1 }}",
-            exe.to_string_lossy().replace('\'', "''"),
-            cfg_str.replace('\'', "''")
-        );
-        let mut launcher = Command::new("powershell")
-            .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps_cmd])
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("UAC elevation error: {e}"))?;
-
-        let uac_deadline = Instant::now() + Duration::from_secs(45);
-        let mut status_opt = None;
-        while Instant::now() < uac_deadline {
-            match launcher.try_wait() {
-                Ok(Some(st)) => {
-                    status_opt = Some(st);
-                    break;
-                }
-                Ok(None) => tokio::time::sleep(Duration::from_millis(100)).await,
-                Err(e) => return Err(format!("UAC wait error: {e}")),
-            }
-        }
-        let Some(status) = status_opt else {
-            let _ = launcher.kill();
-            let _ = launcher.wait();
-            return Err("Превышено время ожидания подтверждения прав администратора".to_string());
+            let ch = Command::new("pkexec")
+                .arg(&exe)
+                .arg("--run-core")
+                .arg(&cfg_str)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|e| format!("pkexec error: {e}"))?;
+            let pid = Some(ch.id());
+            (Some(ch), pid)
         };
-        if !status.success() {
-            return Err("Запрос прав администратора отклонён".to_string());
-        }
-        let mut out_str = String::new();
-        if let Some(mut out) = launcher.stdout.take() {
-            let _ = out.read_to_string(&mut out_str);
-        }
-        let pid = out_str
-            .lines()
-            .find_map(|line| line.trim().parse::<u32>().ok())
-            .or_else(read_core_pid_file);
-        (None, pid)
-    };
 
-    // Wait up to 15 seconds for Clash API to come up
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while Instant::now() < deadline {
-        if worker_pid.is_none() {
-            worker_pid = read_core_pid_file();
-        }
-        if let Some(err_msg) = read_core_err_file() {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            let _ = fs::remove_file(core_pid_path());
-            return Err(err_msg);
-        }
-        if let Some(c) = child_opt.as_mut() {
-            if let Ok(Some(code)) = c.try_wait() {
-                let err_msg = read_core_err_file()
-                    .unwrap_or_else(|| format!("Elevated worker exited with {code}"));
+        #[cfg(target_os = "windows")]
+        let (mut child_opt, mut worker_pid): (Option<Child>, Option<u32>) = {
+            use std::io::Read;
+            use std::os::windows::process::CommandExt;
+            let ps_cmd = format!(
+                "$p = Start-Process -FilePath '{}' -ArgumentList '--run-core','{}' -Verb RunAs -WindowStyle Hidden -PassThru; if ($p) {{ Write-Output $p.Id }} else {{ exit 1 }}",
+                exe.to_string_lossy().replace('\'', "''"),
+                cfg_str.replace('\'', "''")
+            );
+            let mut launcher = Command::new("powershell")
+                .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps_cmd])
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("UAC elevation error: {e}"))?;
+
+            let uac_deadline = Instant::now() + Duration::from_secs(45);
+            let mut status_opt = None;
+            while Instant::now() < uac_deadline {
+                match launcher.try_wait() {
+                    Ok(Some(st)) => {
+                        status_opt = Some(st);
+                        break;
+                    }
+                    Ok(None) => tokio::time::sleep(Duration::from_millis(100)).await,
+                    Err(e) => return Err(format!("UAC wait error: {e}")),
+                }
+            }
+            let Some(status) = status_opt else {
+                let _ = launcher.kill();
+                let _ = launcher.wait();
+                return Err(
+                    "Превышено время ожидания подтверждения прав администратора".to_string()
+                );
+            };
+            if !status.success() {
+                return Err("Запрос прав администратора отклонён".to_string());
+            }
+            let mut out_str = String::new();
+            if let Some(mut out) = launcher.stdout.take() {
+                let _ = out.read_to_string(&mut out_str);
+            }
+            let pid = out_str
+                .lines()
+                .find_map(|line| line.trim().parse::<u32>().ok())
+                .or_else(read_core_pid_file);
+            (None, pid)
+        };
+
+        // Wait up to 15 seconds for Clash API to come up
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if worker_pid.is_none() {
+                worker_pid = read_core_pid_file();
+            }
+            if let Some(err_msg) = read_core_err_file() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let _ = fs::remove_file(core_pid_path());
                 return Err(err_msg);
             }
-        } else if let Some(pid) = worker_pid {
-            if !is_pid_alive(pid) {
+            if let Some(c) = child_opt.as_mut() {
+                if let Ok(Some(code)) = c.try_wait() {
+                    let err_msg = read_core_err_file()
+                        .unwrap_or_else(|| format!("Elevated worker exited with {code}"));
+                    return Err(err_msg);
+                }
+            } else if let Some(pid) = worker_pid
+                && !is_pid_alive(pid)
+            {
                 let err_msg = read_core_err_file()
                     .unwrap_or_else(|| format!("Привилегированный процесс {pid} завершился"));
                 let _ = fs::remove_file(core_pid_path());
                 return Err(err_msg);
             }
-        }
-        if let Ok((200, _)) = clash_api_request(API_PORT, secret, "GET", "/connections", None).await
-        {
-            if worker_pid.is_none() {
-                worker_pid = read_core_pid_file();
+            if let Ok((200, _)) =
+                clash_api_request(API_PORT, secret, "GET", "/connections", None).await
+            {
+                if worker_pid.is_none() {
+                    worker_pid = read_core_pid_file();
+                }
+                return Ok(SpawnedWorker {
+                    child: child_opt,
+                    pid: worker_pid,
+                    macos_helper: false,
+                });
             }
-            return Ok((child_opt, worker_pid));
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
 
-    stop_worker_process(child_opt, worker_pid.or_else(read_core_pid_file)).await;
-    cleanup_orphaned_wintun_routes();
-    Err(read_core_err_file()
-        .unwrap_or_else(|| "Таймаут ожидания запуска привилегированного процесса".to_string()))
+        stop_worker_process(child_opt, worker_pid.or_else(read_core_pid_file)).await;
+        cleanup_orphaned_wintun_routes();
+        Err(read_core_err_file()
+            .unwrap_or_else(|| "Таймаут ожидания запуска привилегированного процесса".to_string()))
+    }
 }
 
-pub async fn icmp_or_tcp_ping_ms(host: &str, timeout_ms: u64) -> i64 {
+pub fn median_ping_samples(samples: &[i64]) -> i64 {
+    let mut valid: Vec<i64> = samples.iter().copied().filter(|&v| v > 0).collect();
+    if valid.is_empty() {
+        return -1;
+    }
+    valid.sort_unstable();
+    let n = valid.len();
+    if n % 2 == 1 {
+        valid[n / 2]
+    } else {
+        (valid[n / 2 - 1] + valid[n / 2]) / 2
+    }
+}
+
+pub async fn probe_endpoint_median_ms(host: &str, port: u16, is_udp_proto: bool) -> i64 {
+    let first = if is_udp_proto {
+        icmp_ping_ms(host, 1800).await
+    } else {
+        tcp_connect_ms(host, port, 1800).await
+    };
+    let mut samples = Vec::with_capacity(3);
+    if first > 0 {
+        samples.push(first);
+    } else {
+        let retry = if is_udp_proto {
+            icmp_ping_ms(host, 1200).await
+        } else {
+            tcp_connect_ms(host, port, 1200).await
+        };
+        if retry <= 0 {
+            return -1;
+        }
+        samples.push(retry);
+    }
+    for _ in 0..2 {
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        let next = if is_udp_proto {
+            icmp_ping_ms(host, 1500).await
+        } else {
+            tcp_connect_ms(host, port, 1500).await
+        };
+        if next > 0 {
+            samples.push(next);
+        }
+    }
+    median_ping_samples(&samples)
+}
+
+pub async fn icmp_ping_ms(host: &str, timeout_ms: u64) -> i64 {
     let host_owned = host.trim().trim_matches(['[', ']']).to_string();
     #[cfg(target_os = "windows")]
     {
         let h = host_owned.clone();
-        let res = tokio::task::spawn_blocking(move || windows_icmp_ping_ms(&h, timeout_ms))
+        if let Some(ms) = tokio::task::spawn_blocking(move || windows_icmp_ping_ms(&h, timeout_ms))
             .await
             .ok()
-            .flatten();
-        if let Some(ms) = res {
+            .flatten()
+        {
             return ms;
         }
     }
-    let ms443 = tcp_connect_ms(&host_owned, 443, timeout_ms / 2).await;
-    if ms443 > 0 {
-        return ms443;
+    #[cfg(unix)]
+    {
+        let h = host_owned;
+        if let Some(ms) = tokio::task::spawn_blocking(move || unix_icmp_ping_ms(&h, timeout_ms))
+            .await
+            .ok()
+            .flatten()
+        {
+            return ms;
+        }
     }
-    let ms80 = tcp_connect_ms(&host_owned, 80, timeout_ms / 2).await;
-    if ms80 > 0 {
-        return ms80;
+    -1
+}
+
+fn bind_std_udp_bypassing_tun(sock: &std::net::UdpSocket) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        if let Some(ifname) = default_linux_phys_interface()
+            && let Ok(cstr) = std::ffi::CString::new(ifname)
+        {
+            unsafe {
+                let _ = libc::setsockopt(
+                    sock.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_BINDTODEVICE,
+                    cstr.as_ptr() as *const libc::c_void,
+                    cstr.as_bytes_with_nul().len() as libc::socklen_t,
+                );
+            }
+        }
     }
-    tcp_connect_ms(&host_owned, 22, timeout_ms / 2).await
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        if let Some(ifidx) = core_runtime::inbound::tun::active_macos_outbound_if_index()
+            .or_else(default_macos_phys_ifindex)
+        {
+            const IP_BOUND_IF: libc::c_int = 25;
+            unsafe {
+                let _ = libc::setsockopt(
+                    sock.as_raw_fd(),
+                    libc::IPPROTO_IP,
+                    IP_BOUND_IF,
+                    &ifidx as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+                );
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::io::AsRawSocket;
+        let if_idx = core_runtime::inbound::tun::active_win_outbound_if_index()
+            .or_else(|| {
+                let cached = CACHED_WIN_PHYS_IFINDEX.load(std::sync::atomic::Ordering::Relaxed);
+                (cached != 0).then_some(cached)
+            })
+            .or_else(default_windows_phys_ifindex);
+        if let Some(idx) = if_idx {
+            #[link(name = "ws2_32")]
+            unsafe extern "system" {
+                fn setsockopt(
+                    s: usize,
+                    level: i32,
+                    optname: i32,
+                    optval: *const u8,
+                    optlen: i32,
+                ) -> i32;
+            }
+            let val = idx.to_be_bytes();
+            unsafe {
+                let _ = setsockopt(
+                    sock.as_raw_socket() as usize,
+                    0,  // IPPROTO_IP
+                    31, // IP_UNICAST_IF
+                    val.as_ptr(),
+                    val.len() as i32,
+                );
+            }
+        }
+    }
+}
+
+fn skip_dns_name(packet: &[u8], mut offset: usize) -> Option<usize> {
+    let mut jumps = 0u8;
+    while offset < packet.len() {
+        let len = packet[offset];
+        if (len & 0xC0) == 0xC0 {
+            if offset + 1 >= packet.len() {
+                return None;
+            }
+            return Some(offset + 2);
+        }
+        if len == 0 {
+            return Some(offset + 1);
+        }
+        if len > 63 || jumps > 32 {
+            return None;
+        }
+        jumps += 1;
+        offset = offset.checked_add(1 + usize::from(len))?;
+    }
+    None
+}
+
+fn resolve_ipv4_bypassing_tun(host: &str, timeout_ms: u64) -> Option<std::net::Ipv4Addr> {
+    let clean = host.trim().trim_matches(['[', ']']).trim_end_matches('.');
+    if clean.is_empty() {
+        return None;
+    }
+    if let Ok(ip) = clean.parse::<std::net::Ipv4Addr>() {
+        return (!is_fake_or_tun_ip(IpAddr::V4(ip))).then_some(ip);
+    }
+    if let Ok(addrs) = (clean, 0u16).to_socket_addrs() {
+        for addr in addrs {
+            if let IpAddr::V4(v4) = addr.ip()
+                && !is_fake_or_tun_ip(IpAddr::V4(v4))
+            {
+                return Some(v4);
+            }
+        }
+    }
+
+    let mut req = Vec::with_capacity(64);
+    req.extend_from_slice(&[
+        0x54, 0x41, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]);
+    for label in clean.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return None;
+        }
+        req.push(label.len() as u8);
+        req.extend_from_slice(label.as_bytes());
+    }
+    req.push(0);
+    req.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    let timeout = Duration::from_millis(timeout_ms.clamp(300, 1500));
+    let _ = sock.set_read_timeout(Some(timeout));
+    let _ = sock.set_write_timeout(Some(timeout));
+    bind_std_udp_bypassing_tun(&sock);
+
+    let mut buf = [0u8; 512];
+    for dns_srv in ["1.1.1.1:53", "8.8.8.8:53"] {
+        if sock.send_to(&req, dns_srv).is_err() {
+            continue;
+        }
+        let Ok((n, _)) = sock.recv_from(&mut buf) else {
+            continue;
+        };
+        let pkt = &buf[..n];
+        if pkt.len() < 12 || pkt[0..2] != req[0..2] || (pkt[2] & 0x80) == 0 || (pkt[3] & 0x0F) != 0
+        {
+            continue;
+        }
+        let qdcount = u16::from_be_bytes([pkt[4], pkt[5]]);
+        let ancount = u16::from_be_bytes([pkt[6], pkt[7]]);
+        let mut off = 12usize;
+        for _ in 0..qdcount {
+            off = skip_dns_name(pkt, off)?;
+            off = off.checked_add(4)?;
+            if off > pkt.len() {
+                return None;
+            }
+        }
+        for _ in 0..ancount {
+            let Some(next) = skip_dns_name(pkt, off) else {
+                break;
+            };
+            off = next;
+            if off + 10 > pkt.len() {
+                break;
+            }
+            let rtype = u16::from_be_bytes([pkt[off], pkt[off + 1]]);
+            let rclass = u16::from_be_bytes([pkt[off + 2], pkt[off + 3]]);
+            let rdlen = u16::from_be_bytes([pkt[off + 8], pkt[off + 9]]) as usize;
+            off += 10;
+            if off + rdlen > pkt.len() {
+                break;
+            }
+            if rtype == 1 && rclass == 1 && rdlen == 4 {
+                let ip =
+                    std::net::Ipv4Addr::new(pkt[off], pkt[off + 1], pkt[off + 2], pkt[off + 3]);
+                if !is_fake_or_tun_ip(IpAddr::V4(ip)) {
+                    return Some(ip);
+                }
+            }
+            off += rdlen;
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn windows_phys_ipv4() -> Option<u32> {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct MibIpAddrRow {
+        dw_addr: u32,
+        dw_index: u32,
+        dw_mask: u32,
+        dw_bcast_addr: u32,
+        dw_reasm_size: u32,
+        unused1: u16,
+        w_type: u16,
+    }
+    #[link(name = "iphlpapi")]
+    unsafe extern "system" {
+        fn GetIpAddrTable(p_ip_addr_table: *mut u8, pdw_size: *mut u32, border: i32) -> u32;
+    }
+
+    let if_idx = core_runtime::inbound::tun::active_win_outbound_if_index()
+        .or_else(|| {
+            let cached = CACHED_WIN_PHYS_IFINDEX.load(std::sync::atomic::Ordering::Relaxed);
+            (cached != 0).then_some(cached)
+        })
+        .or_else(default_windows_phys_ifindex)?;
+
+    let mut size: u32 = 0;
+    let _ = unsafe { GetIpAddrTable(std::ptr::null_mut(), &mut size, 0) };
+    if !(4..=1024 * 1024).contains(&size) {
+        return None;
+    }
+    let mut buf = vec![0u8; size as usize];
+    let rc = unsafe { GetIpAddrTable(buf.as_mut_ptr(), &mut size, 0) };
+    if rc != 0 || buf.len() < 4 {
+        return None;
+    }
+    let count = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    let row_size = std::mem::size_of::<MibIpAddrRow>();
+    let max_rows = (buf.len() - 4) / row_size;
+    for i in 0..count.min(max_rows) {
+        let row = unsafe {
+            std::ptr::read_unaligned(buf.as_ptr().add(4 + i * row_size) as *const MibIpAddrRow)
+        };
+        if row.dw_index == if_idx && row.dw_addr != 0 {
+            let ip = std::net::Ipv4Addr::from(row.dw_addr.to_ne_bytes());
+            if !ip.is_loopback() && !ip.is_unspecified() && !is_fake_or_tun_ip(IpAddr::V4(ip)) {
+                return Some(row.dw_addr);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(target_os = "windows")]
@@ -5320,37 +6591,61 @@ fn windows_icmp_ping_ms(host: &str, timeout_ms: u64) -> Option<i64> {
             reply_size: u32,
             timeout: u32,
         ) -> u32;
+        fn IcmpSendEcho2Ex(
+            icmp_handle: *mut c_void,
+            event: *mut c_void,
+            apc_routine: *mut c_void,
+            apc_context: *mut c_void,
+            source_address: u32,
+            destination_address: u32,
+            request_data: *const u8,
+            request_size: u16,
+            request_options: *const IpOptionInformation,
+            reply_buffer: *mut u8,
+            reply_size: u32,
+            timeout: u32,
+        ) -> u32;
     }
 
-    let ipv4 = if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
-        ip
-    } else {
-        let mut addrs = (host, 0u16).to_socket_addrs().ok()?;
-        addrs.find_map(|a| match a.ip() {
-            IpAddr::V4(v4) if !is_fake_or_tun_ip(IpAddr::V4(v4)) => Some(v4),
-            _ => None,
-        })?
-    };
-
+    let ipv4 = resolve_ipv4_bypassing_tun(host, timeout_ms.min(1200))?;
     let dest_in_addr = u32::from_ne_bytes(ipv4.octets());
     let handle = unsafe { IcmpCreateFile() };
     if handle.is_null() || handle == (-1isize as *mut c_void) {
         return None;
     }
     let payload = b"tachyon";
-    let mut reply_buf = vec![0u8; std::mem::size_of::<IcmpEchoReply>() + payload.len() + 32];
+    let mut reply_buf = vec![0u8; std::mem::size_of::<IcmpEchoReply>() + payload.len() + 64];
+    let timeout_clamped = timeout_ms.clamp(200, 5000) as u32;
+    let src_in_addr = windows_phys_ipv4();
     let sw = Instant::now();
     let count = unsafe {
-        IcmpSendEcho(
-            handle,
-            dest_in_addr,
-            payload.as_ptr(),
-            payload.len() as u16,
-            std::ptr::null(),
-            reply_buf.as_mut_ptr(),
-            reply_buf.len() as u32,
-            timeout_ms.clamp(200, 5000) as u32,
-        )
+        if let Some(src) = src_in_addr {
+            IcmpSendEcho2Ex(
+                handle,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                src,
+                dest_in_addr,
+                payload.as_ptr(),
+                payload.len() as u16,
+                std::ptr::null(),
+                reply_buf.as_mut_ptr(),
+                reply_buf.len() as u32,
+                timeout_clamped,
+            )
+        } else {
+            IcmpSendEcho(
+                handle,
+                dest_in_addr,
+                payload.as_ptr(),
+                payload.len() as u16,
+                std::ptr::null(),
+                reply_buf.as_mut_ptr(),
+                reply_buf.len() as u32,
+                timeout_clamped,
+            )
+        }
     };
     let elapsed_ms = sw.elapsed().as_millis() as i64;
     unsafe {
@@ -5361,6 +6656,174 @@ fn windows_icmp_ping_ms(host: &str, timeout_ms: u64) -> Option<i64> {
         if reply.status == 0 && reply.address == dest_in_addr {
             let rtt = (reply.round_trip_time as i64).max(elapsed_ms).max(1);
             return Some(rtt);
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn unix_icmp_ping_ms(host: &str, timeout_ms: u64) -> Option<i64> {
+    struct FdGuard(libc::c_int);
+    impl Drop for FdGuard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.0);
+            }
+        }
+    }
+
+    let ipv4 = resolve_ipv4_bypassing_tun(host, timeout_ms.min(1200))?;
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_ICMP) };
+    if fd < 0 {
+        return None;
+    }
+    let _guard = FdGuard(fd);
+
+    #[cfg(target_os = "linux")]
+    if let Some(ifname) = default_linux_phys_interface()
+        && let Ok(cstr) = std::ffi::CString::new(ifname)
+    {
+        unsafe {
+            let _ = libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_BINDTODEVICE,
+                cstr.as_ptr() as *const libc::c_void,
+                cstr.as_bytes_with_nul().len() as libc::socklen_t,
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    if let Some(ifidx) = core_runtime::inbound::tun::active_macos_outbound_if_index()
+        .or_else(default_macos_phys_ifindex)
+    {
+        const IP_BOUND_IF: libc::c_int = 25;
+        unsafe {
+            let _ = libc::setsockopt(
+                fd,
+                libc::IPPROTO_IP,
+                IP_BOUND_IF,
+                &ifidx as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+            );
+        }
+    }
+
+    let tv = libc::timeval {
+        tv_sec: (timeout_ms / 1000) as libc::time_t,
+        tv_usec: ((timeout_ms % 1000) * 1000) as libc::suseconds_t,
+    };
+    unsafe {
+        let _ = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            &tv as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
+        let _ = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDTIMEO,
+            &tv as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
+    }
+
+    let mut pkt = [0u8; 16];
+    pkt[0] = 8; // Echo Request
+    pkt[1] = 0;
+    let pid = (std::process::id() & 0xFFFF) as u16;
+    pkt[4..6].copy_from_slice(&pid.to_be_bytes());
+    pkt[6..8].copy_from_slice(&1u16.to_be_bytes());
+    pkt[8..16].copy_from_slice(b"tachyon!");
+    let mut sum = 0u32;
+    for chunk in pkt.chunks_exact(2) {
+        sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    let csum = !(sum as u16);
+    pkt[2..4].copy_from_slice(&csum.to_be_bytes());
+
+    let dest = libc::sockaddr_in {
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        ))]
+        sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: 0,
+        sin_addr: libc::in_addr {
+            s_addr: u32::from_ne_bytes(ipv4.octets()),
+        },
+        sin_zero: [0; 8],
+    };
+
+    let sw = Instant::now();
+    let sent = unsafe {
+        libc::sendto(
+            fd,
+            pkt.as_ptr() as *const libc::c_void,
+            pkt.len(),
+            0,
+            &dest as *const libc::sockaddr_in as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    if sent < 0 {
+        return None;
+    }
+
+    let mut recv_buf = [0u8; 256];
+    let mut from: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut from_len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.clamp(200, 5000));
+    while Instant::now() < deadline {
+        let n = unsafe {
+            libc::recvfrom(
+                fd,
+                recv_buf.as_mut_ptr() as *mut libc::c_void,
+                recv_buf.len(),
+                0,
+                &mut from as *mut libc::sockaddr_in as *mut libc::sockaddr,
+                &mut from_len,
+            )
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error().raw_os_error();
+            if err == Some(libc::EINTR) {
+                continue;
+            }
+            return None;
+        }
+        let elapsed_ms = sw.elapsed().as_millis() as i64;
+        let len = n as usize;
+        if len < 8 {
+            continue;
+        }
+        let from_ip = std::net::Ipv4Addr::from(from.sin_addr.s_addr.to_ne_bytes());
+        if from_ip != ipv4 {
+            continue;
+        }
+        let icmp = if (recv_buf[0] >> 4) == 4 {
+            let ihl = ((recv_buf[0] & 0x0F) * 4) as usize;
+            if len >= ihl + 8 {
+                &recv_buf[ihl..len]
+            } else {
+                continue;
+            }
+        } else {
+            &recv_buf[..len]
+        };
+        if icmp[0] == 0 && icmp[1] == 0 {
+            return Some(elapsed_ms.max(1));
         }
     }
     None
@@ -5382,6 +6845,10 @@ pub async fn tcp_connect_ms(host: &str, port: u16, timeout_ms: u64) -> i64 {
                             .ok()?
                             .find(|a| !is_fake_or_tun_ip(a.ip()))
                     })
+            })
+            .or_else(|| {
+                resolve_ipv4_bypassing_tun(&host, 1200)
+                    .map(|v4| SocketAddr::new(IpAddr::V4(v4), port))
             })
     })
     .await
@@ -5546,11 +7013,33 @@ fn default_linux_phys_interface() -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn default_macos_phys_ifindex() -> Option<libc::c_uint> {
-    for candidate in ["en0", "en1", "en2"] {
-        let cstr = std::ffi::CString::new(candidate).ok()?;
-        let idx = unsafe { libc::if_nametoindex(cstr.as_ptr()) };
-        if idx != 0 {
-            return Some(idx);
+    if let Ok(out) = Command::new("/sbin/route")
+        .args(["-n", "get", "default"])
+        .output()
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            if let Some(rest) = line.trim().strip_prefix("interface:") {
+                let iface = rest.trim();
+                if !iface.is_empty()
+                    && !iface.starts_with("utun")
+                    && let Ok(cstr) = std::ffi::CString::new(iface)
+                {
+                    let idx = unsafe { libc::if_nametoindex(cstr.as_ptr()) };
+                    if idx != 0 {
+                        return Some(idx);
+                    }
+                }
+            }
+        }
+    }
+    for idx_num in 0..=9 {
+        let candidate = format!("en{idx_num}");
+        if let Ok(cstr) = std::ffi::CString::new(candidate) {
+            let idx = unsafe { libc::if_nametoindex(cstr.as_ptr()) };
+            if idx != 0 {
+                return Some(idx);
+            }
         }
     }
     None
@@ -5611,6 +7100,104 @@ fn notify_wininet_proxy_changed() {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn list_macos_network_services() -> Vec<String> {
+    let Ok(out) = Command::new("/usr/sbin/networksetup")
+        .arg("-listallnetworkservices")
+        .output()
+    else {
+        return vec![
+            "Wi-Fi".to_string(),
+            "Ethernet".to_string(),
+            "USB 10/100/1000 LAN".to_string(),
+        ];
+    };
+    let services: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .skip(1)
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('*'))
+        .map(str::to_string)
+        .collect();
+    if services.is_empty() {
+        vec![
+            "Wi-Fi".to_string(),
+            "Ethernet".to_string(),
+            "USB 10/100/1000 LAN".to_string(),
+        ]
+    } else {
+        services
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn apply_macos_system_proxy_direct(enable: bool, port: u16) -> bool {
+    let p = port.to_string();
+    let mut any_ok = false;
+    let mut all_ok = true;
+    for service in list_macos_network_services() {
+        if enable {
+            let s1 = Command::new("/usr/sbin/networksetup")
+                .args(["-setwebproxy", &service, "127.0.0.1", &p])
+                .status()
+                .is_ok_and(|s| s.success());
+            let s2 = Command::new("/usr/sbin/networksetup")
+                .args(["-setwebproxystate", &service, "on"])
+                .status()
+                .is_ok_and(|s| s.success());
+            let s3 = Command::new("/usr/sbin/networksetup")
+                .args(["-setsecurewebproxy", &service, "127.0.0.1", &p])
+                .status()
+                .is_ok_and(|s| s.success());
+            let s4 = Command::new("/usr/sbin/networksetup")
+                .args(["-setsecurewebproxystate", &service, "on"])
+                .status()
+                .is_ok_and(|s| s.success());
+            let s5 = Command::new("/usr/sbin/networksetup")
+                .args(["-setsocksfirewallproxy", &service, "127.0.0.1", &p])
+                .status()
+                .is_ok_and(|s| s.success());
+            let s6 = Command::new("/usr/sbin/networksetup")
+                .args(["-setsocksfirewallproxystate", &service, "on"])
+                .status()
+                .is_ok_and(|s| s.success());
+            let _ = Command::new("/usr/sbin/networksetup")
+                .args([
+                    "-setproxybypassdomains",
+                    &service,
+                    "127.0.0.1",
+                    "localhost",
+                    "*.local",
+                ])
+                .status();
+            if s1 && s2 && s3 && s4 && s5 && s6 {
+                any_ok = true;
+            } else {
+                all_ok = false;
+            }
+        } else {
+            let s1 = Command::new("/usr/sbin/networksetup")
+                .args(["-setwebproxystate", &service, "off"])
+                .status()
+                .is_ok_and(|s| s.success());
+            let s2 = Command::new("/usr/sbin/networksetup")
+                .args(["-setsecurewebproxystate", &service, "off"])
+                .status()
+                .is_ok_and(|s| s.success());
+            let s3 = Command::new("/usr/sbin/networksetup")
+                .args(["-setsocksfirewallproxystate", &service, "off"])
+                .status()
+                .is_ok_and(|s| s.success());
+            if s1 && s2 && s3 {
+                any_ok = true;
+            } else {
+                all_ok = false;
+            }
+        }
+    }
+    any_ok && all_ok
+}
+
 pub fn set_system_proxy(enable: bool) {
     #[cfg(target_os = "linux")]
     {
@@ -5636,29 +7223,8 @@ pub fn set_system_proxy(enable: bool) {
 
     #[cfg(target_os = "macos")]
     {
-        for service in ["Wi-Fi", "Ethernet", "USB 10/100/1000 LAN"] {
-            if enable {
-                let p = PROXY_PORT.to_string();
-                let _ = Command::new("networksetup")
-                    .args(["-setwebproxy", service, "127.0.0.1", &p])
-                    .status();
-                let _ = Command::new("networksetup")
-                    .args(["-setsecurewebproxy", service, "127.0.0.1", &p])
-                    .status();
-                let _ = Command::new("networksetup")
-                    .args(["-setsocksfirewallproxy", service, "127.0.0.1", &p])
-                    .status();
-            } else {
-                let _ = Command::new("networksetup")
-                    .args(["-setwebproxystate", service, "off"])
-                    .status();
-                let _ = Command::new("networksetup")
-                    .args(["-setsecurewebproxystate", service, "off"])
-                    .status();
-                let _ = Command::new("networksetup")
-                    .args(["-setsocksfirewallproxystate", service, "off"])
-                    .status();
-            }
+        if !apply_macos_system_proxy_direct(enable, PROXY_PORT) && macos_helper::status().0 {
+            let _ = macos_helper::sysproxy(enable, PROXY_PORT);
         }
     }
 
@@ -5713,7 +7279,12 @@ pub fn flush_os_dns() {
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = Command::new("dscacheutil").arg("-flushcache").status();
+        let _ = Command::new("/usr/bin/dscacheutil")
+            .arg("-flushcache")
+            .status();
+        let _ = Command::new("/usr/bin/killall")
+            .args(["-HUP", "mDNSResponder"])
+            .status();
     }
     #[cfg(target_os = "windows")]
     {
@@ -5905,7 +7476,7 @@ pub fn enumerate_apps() -> Vec<RunningApp> {
         }
     }
 
-    apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    apps.sort_by_key(|a| a.name.to_lowercase());
     apps
 }
 
@@ -5979,10 +7550,10 @@ pub fn build_subscription_servers_list(nodes: &[Value], handle: &str) -> Vec<Val
         };
         let mut members = Vec::new();
         for mt in member_tags {
-            if let Some(t_str) = mt.as_str() {
-                if let Some(m) = leaf_by_tag.get(t_str) {
-                    members.push(m.clone());
-                }
+            if let Some(t_str) = mt.as_str()
+                && let Some(m) = leaf_by_tag.get(t_str)
+            {
+                members.push(m.clone());
             }
         }
         if members.is_empty() {
@@ -6466,6 +8037,7 @@ mod tests {
             balancer_mode: None,
             member_count: None,
             ping_ms: Some(18),
+            ping_at: None,
             alive: Some(true),
         });
         st.active_id = "node-awg-1".to_string();
@@ -6766,6 +8338,7 @@ mod tests {
                 balancer_mode: None,
                 member_count: None,
                 ping_ms: None,
+                ping_at: None,
                 alive: None,
             });
             st.active_id = "n1".to_string();
@@ -6867,6 +8440,7 @@ mod tests {
             balancer_mode: None,
             member_count: None,
             ping_ms: None,
+            ping_at: None,
             alive: None,
         });
         st_any.active_id = "any1".to_string();
@@ -6930,5 +8504,222 @@ mod tests {
             json!(false)
         );
         core_config::check_str(&cfg_suppressed.to_string()).expect("check_str suppressed fakeip");
+    }
+    #[test]
+    fn balancer_filter_excludes_countries_protocols_and_regex() {
+        let o = BalancerOptions {
+            excluded_countries: vec!["RU".to_string()],
+            ..Default::default()
+        };
+        let ru_flag = regional_indicator_flag("RU").unwrap();
+        let nl_flag = regional_indicator_flag("NL").unwrap();
+        assert!(!balancer_node_passes_filter(
+            &format!("{ru_flag} Moscow"),
+            "1.2.3.4",
+            "",
+            "vless",
+            &o
+        ));
+        assert!(balancer_node_passes_filter(
+            &format!("{nl_flag} Amsterdam"),
+            "5.6.7.8",
+            "",
+            "vless",
+            &o
+        ));
+
+        let o = BalancerOptions {
+            excluded_protocols: vec!["ss".to_string()],
+            ..Default::default()
+        };
+        assert!(!balancer_node_passes_filter(
+            "n",
+            "h",
+            "",
+            "shadowsocks",
+            &o
+        ));
+        assert!(balancer_node_passes_filter("n", "h", "", "vless", &o));
+
+        let o = BalancerOptions {
+            include_regex: "LTE|Whitelist".to_string(),
+            exclude_regex: "expired".to_string(),
+            ..Default::default()
+        };
+        assert!(balancer_node_passes_filter(
+            "LTE node", "h", "", "vless", &o
+        ));
+        assert!(!balancer_node_passes_filter(
+            "LTE expired",
+            "h",
+            "",
+            "vless",
+            &o
+        ));
+        assert!(!balancer_node_passes_filter("plain", "h", "", "vless", &o));
+
+        // Некорректный RegExp откатывается к поиску подстроки
+        let o = BalancerOptions {
+            exclude_regex: "([".to_string(),
+            ..Default::default()
+        };
+        assert!(balancer_node_passes_filter("n", "h", "", "vless", &o));
+    }
+
+    #[test]
+    fn balancer_service_probe_urls_cover_multi_url_catalog() {
+        for id in ["youtube", "telegram", "discord", "instagram", "openai"] {
+            assert!(balancer_service_probe_url(id).is_some(), "{id}");
+        }
+        assert!(balancer_service_probe_url("https").is_none());
+    }
+
+    #[test]
+    fn balancer_prefs_override_and_multi_url_pass_core_config_check() {
+        let mgr = VpnManager::new(Arc::new(|_| {}));
+        let payload = BalancerPayload {
+            name: "AutoPool".to_string(),
+            mode: "stability".to_string(),
+            url: "https://frozen.example/204".to_string(),
+            interval: "10m".to_string(),
+            tolerance: 150,
+            pool: 2,
+            pool_tolerance: 90,
+            sticky_hash: vec!["domain".to_string()],
+            quota_mib: 512,
+            members: vec![
+                BalancerMember {
+                    name: "NL-1".to_string(),
+                    vless: "vless://11111111-1111-1111-1111-111111111111@198.51.100.11:443?security=tls&type=tcp&sni=nl1.example#NL1".to_string(),
+                    country: "nl".to_string(),
+                },
+                BalancerMember {
+                    name: "DE-2".to_string(),
+                    vless: "vless://22222222-2222-2222-2222-222222222222@198.51.100.12:443?security=tls&type=tcp&sni=de2.example#DE2".to_string(),
+                    country: "de".to_string(),
+                },
+            ],
+        };
+        let bal_uri = encode_balancer_uri(&payload);
+        let mut st = crate::state::PersistedState::default();
+        st.servers.push(crate::state::ServerNode {
+            id: "bal-1".to_string(),
+            name: "AutoPool".to_string(),
+            country: "xx".to_string(),
+            vless: bal_uri,
+            sub_id: None,
+            is_balancer: true,
+            balancer_mode: Some("stability".to_string()),
+            member_count: Some(2),
+            ping_ms: None,
+            ping_at: None,
+            alive: Some(true),
+        });
+        st.active_id = "bal-1".to_string();
+        st.vpn_prefs.balancer_mode = "least_test".to_string();
+        st.vpn_prefs.balancer_tolerance = 30;
+        st.vpn_prefs.balancer_quota_mib = 0;
+        st.vpn_prefs.balancer_interval = "2m".to_string();
+        st.vpn_prefs.balancer_url = "https://www.gstatic.com/generate_204".to_string();
+        st.vpn_prefs.balancer_multi_service = true;
+        st.vpn_prefs.balancer_multi_services = vec!["youtube".to_string(), "telegram".to_string()];
+
+        let opts = ConnectOptions::parse(&st.build_connect_payload(None))
+            .expect("ConnectOptions from balancer prefs");
+        assert!(opts.balancer.from_prefs);
+        let (cfg, _) = mgr.build_config(&opts).expect("build_config balancer");
+        core_config::check_str(&cfg.to_string()).expect("check_str balancer multi-url");
+
+        let outbounds = cfg["outbounds"].as_array().unwrap();
+        let proxy = outbounds.iter().find(|o| o["tag"] == "PROXY").unwrap();
+        assert_eq!(proxy["type"], "urltest");
+        assert_eq!(proxy["tolerance"], 30);
+        assert_eq!(proxy["interval"], "2m");
+        assert!(proxy.get("quota_mib").is_none());
+        assert!(outbounds.iter().any(|o| o["tag"] == "urltest-svc-youtube"));
+        assert!(outbounds.iter().any(|o| o["tag"] == "urltest-svc-telegram"));
+    }
+
+    #[test]
+    fn build_config_inbound_self_rules_pass_core_config_check() {
+        let mgr = VpnManager::new(Arc::new(|_| {}));
+        let mut st = crate::state::PersistedState::default();
+        st.servers.push(crate::state::ServerNode {
+            id: "s1".to_string(),
+            name: "DE".to_string(),
+            country: "de".to_string(),
+            vless: "vless://11111111-1111-1111-1111-111111111111@198.51.100.20:443?security=tls&type=tcp&sni=de.example#DE".to_string(),
+            sub_id: None,
+            is_balancer: false,
+            balancer_mode: None,
+            member_count: None,
+            ping_ms: None,
+            ping_at: None,
+            alive: None,
+        });
+        st.active_id = "s1".to_string();
+        st.vpn_prefs.mode = "tun".to_string();
+        let opts = ConnectOptions::parse(&st.build_connect_payload(None)).unwrap();
+        let (cfg, _) = mgr
+            .build_config(&opts)
+            .expect("build_config tun self rules");
+        core_config::check_str(&cfg.to_string()).expect("check_str tun self rules");
+
+        let rules = cfg["route"]["rules"].as_array().unwrap();
+        let has_mixed_global = rules.iter().any(|r| {
+            r["inbound"] == json!(["mixed-in"])
+                && r["outbound"] == "GLOBAL"
+                && r["process_name"].as_array().is_some_and(|a| !a.is_empty())
+        });
+        let has_tun_direct = rules.iter().any(|r| {
+            r["inbound"] == json!(["tun-in"])
+                && r["outbound"] == "direct"
+                && r["process_name"].as_array().is_some_and(|a| !a.is_empty())
+        });
+        assert!(has_mixed_global, "missing mixed-in -> GLOBAL self rule");
+        assert!(has_tun_direct, "missing tun-in -> direct self rule");
+    }
+
+    #[test]
+    fn filter_log_lines_respects_levels() {
+        let lines = [
+            "12:00:00 [DEBUG] trace packet",
+            "12:00:01 [INFO] core started",
+            "12:00:02 [WARN] urltest degraded",
+            "12:00:03 [ERROR] handshake failed",
+        ];
+        let err_only = filter_log_lines(&lines, 50, "error");
+        assert!(!err_only.contains("[WARN]"));
+        assert!(!err_only.contains("[INFO]"));
+        assert!(err_only.contains("[ERROR] handshake failed"));
+
+        let warn_up = filter_log_lines(&lines, 50, "warn");
+        assert!(!warn_up.contains("[INFO]"));
+        assert!(warn_up.contains("[WARN] urltest degraded"));
+        assert!(warn_up.contains("[ERROR] handshake failed"));
+
+        let all = filter_log_lines(&lines, 2, "all");
+        assert!(!all.contains("[INFO]"));
+        assert!(all.contains("[WARN]"));
+        assert!(all.contains("[ERROR]"));
+    }
+
+    #[test]
+    fn median_and_dns_wire_helpers() {
+        assert_eq!(median_ping_samples(&[]), -1);
+        assert_eq!(median_ping_samples(&[-1, 0]), -1);
+        assert_eq!(median_ping_samples(&[90, 20, 45]), 45);
+        assert_eq!(median_ping_samples(&[80, 20, -1, 40]), 40);
+        assert_eq!(median_ping_samples(&[10, 30, 50, 70]), 40);
+
+        let mut pkt = vec![
+            7u8, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0, 0, 1,
+        ];
+        assert_eq!(skip_dns_name(&pkt, 0), Some(13));
+        pkt[0] = 0xC0;
+        pkt[1] = 0x0C;
+        assert_eq!(skip_dns_name(&pkt[..2], 0), Some(2));
+        assert_eq!(skip_dns_name(&[0xC0], 0), None);
+        assert_eq!(skip_dns_name(&[10, b'a'], 0), None);
     }
 }

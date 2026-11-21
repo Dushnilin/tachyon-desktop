@@ -24,9 +24,11 @@ use crate::state::{
 };
 use crate::theme::Theme;
 use crate::vpn::{
-    BalancerMember, BalancerPayload, RunningApp, VpnManager, encode_balancer_uri, enumerate_apps,
-    icmp_or_tcp_ping_ms, tcp_connect_ms,
+    BalancerMember, BalancerPayload, RunningApp, VpnManager, balancer_country_presets,
+    encode_balancer_uri, enumerate_apps, probe_endpoint_median_ms,
 };
+#[cfg(target_os = "macos")]
+use crate::vpn::{install_macos_helper, macos_helper_status, uninstall_macos_helper};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
@@ -50,6 +52,7 @@ pub enum ModalKind {
     None,
     Subscriptions,
     KernelLog,
+    Balancer,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -67,8 +70,10 @@ pub struct ExitNodeInfo {
 
 #[derive(Clone, Debug)]
 pub struct DiagProbeItem {
+    #[allow(dead_code)]
     pub id: String,
     pub title: String,
+    #[allow(dead_code)]
     pub subtitle: String,
     pub ok: bool,
     pub status: String,
@@ -77,9 +82,12 @@ pub struct DiagProbeItem {
 
 #[derive(Clone, Debug)]
 pub struct DnsBenchItem {
+    #[allow(dead_code)]
     pub id: String,
     pub name: String,
+    #[allow(dead_code)]
     pub host: String,
+    #[allow(dead_code)]
     pub proto: String,
     pub ms: i64,
 }
@@ -98,12 +106,14 @@ pub struct SpeedtestStatus {
 
 #[derive(Clone, Debug)]
 pub struct ActiveConnectionRow {
+    #[allow(dead_code)]
     pub id: String,
     pub net: String,
     pub host: String,
     pub ip_port: String,
     pub process: String,
     pub chain: String,
+    #[allow(dead_code)]
     pub rule: String,
     pub dl: u64,
     pub ul: u64,
@@ -163,6 +173,11 @@ pub struct TachyonApp {
     pub udp_fake_payload_input_state: Entity<InputState>,
     pub desync_probe_input_state: Entity<InputState>,
     pub diag_target_input_state: Entity<InputState>,
+    pub bal_url_input_state: Entity<InputState>,
+    pub bal_include_input_state: Entity<InputState>,
+    pub bal_exclude_input_state: Entity<InputState>,
+    pub bal_words_input_state: Entity<InputState>,
+    pub auto_ping_interval_input: Entity<InputState>,
     pub pasted_multiline_uri: Option<String>,
     _input_subscriptions: Vec<Subscription>,
 
@@ -206,6 +221,7 @@ pub struct TachyonApp {
     pub dns_running: bool,
     pub speedtest: SpeedtestStatus,
     pub log_tail: String,
+    pub log_filter_level: String,
     pub toast: Option<(String, Instant)>,
     pub update_banner: UpdateBanner,
     pub last_conns_poll: Instant,
@@ -227,6 +243,10 @@ pub struct TachyonApp {
     pub diag_busy: bool,
     pub inspector_report: Option<String>,
     pub memory_report: Option<Value>,
+    #[cfg(target_os = "macos")]
+    pub macos_helper_installed: bool,
+    #[cfg(target_os = "macos")]
+    pub macos_helper_busy: bool,
 }
 
 impl TachyonApp {
@@ -257,6 +277,14 @@ impl TachyonApp {
         let fake_sni_init = state.desync_prefs.fake_sni.clone();
         let udp_out_range_init = state.desync_prefs.udp_out_range.clone();
         let udp_fake_payload_init = state.desync_prefs.udp_fake_payload.clone();
+        let bal_url_init = state.vpn_prefs.balancer_url.clone();
+        let bal_include_init = state.vpn_prefs.balancer_include_regex.clone();
+        let bal_exclude_init = state.vpn_prefs.balancer_exclude_regex.clone();
+        let bal_words_init = state.vpn_prefs.balancer_excluded_countries.join(", ");
+        let auto_ping_iv_init = format_interval_short(state.auto_ping.interval_s, is_en);
+        let log_filter_init = state.vpn_prefs.log_level.clone();
+        #[cfg(target_os = "macos")]
+        let macos_helper_init = macos_helper_status().0;
         let close_to_tray_flag = Arc::new(AtomicBool::new(state.vpn_prefs.close_to_tray));
 
         let server_search_input = cx.new(|cx| {
@@ -343,6 +371,43 @@ impl TachyonApp {
                 .default_value("youtube.com")
                 .placeholder("youtube.com")
         });
+        let bal_url_input_state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(bal_url_init)
+                .placeholder("https://www.gstatic.com/generate_204")
+        });
+        let bal_include_input_state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(bal_include_init)
+                .placeholder(if is_en {
+                    "e.g. LTE|Whitelist"
+                } else {
+                    "Например: LTE|Whitelist|МТС"
+                })
+        });
+        let bal_exclude_input_state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(bal_exclude_init)
+                .placeholder(if is_en {
+                    "e.g. backup|test|expired"
+                } else {
+                    "Например: резерв|тест|expired"
+                })
+        });
+        let bal_words_input_state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(bal_words_init)
+                .placeholder(if is_en {
+                    "RU, KZ, BY, ads, vip"
+                } else {
+                    "RU, KZ, BY, реклама, vip"
+                })
+        });
+        let auto_ping_interval_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(auto_ping_iv_init)
+                .placeholder("60s / 10m / 1h")
+        });
 
         let subs = vec![
             cx.subscribe_in(&server_search_input, window, |this, state, event, _, cx| {
@@ -378,10 +443,10 @@ impl TachyonApp {
                 |this, state, event, window, cx| match event {
                     InputEvent::Change => {
                         let val = state.read(cx).value().to_string();
-                        if let Some(raw) = &this.pasted_multiline_uri {
-                            if val != raw.trim().replace('\n', " ↵ ") {
-                                this.pasted_multiline_uri = None;
-                            }
+                        if let Some(raw) = &this.pasted_multiline_uri
+                            && val != raw.trim().replace('\n', " ↵ ")
+                        {
+                            this.pasted_multiline_uri = None;
                         }
                         this.node_uri_input = val;
                         cx.notify();
@@ -557,6 +622,83 @@ impl TachyonApp {
                     }
                 },
             ),
+            cx.subscribe_in(&bal_url_input_state, window, |this, state, event, _, cx| {
+                if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                    let v = state.read(cx).value().trim().to_string();
+                    if (v.starts_with("http://") || v.starts_with("https://"))
+                        && v != this.state.vpn_prefs.balancer_url
+                    {
+                        this.state.vpn_prefs.balancer_url = v;
+                        this.reconnect_if_active();
+                        cx.notify();
+                    }
+                }
+            }),
+            cx.subscribe_in(
+                &bal_include_input_state,
+                window,
+                |this, state, event, _, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                        let v = state.read(cx).value().trim().to_string();
+                        if v != this.state.vpn_prefs.balancer_include_regex {
+                            this.state.vpn_prefs.balancer_include_regex = v;
+                            this.reconnect_if_active();
+                            cx.notify();
+                        }
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &bal_exclude_input_state,
+                window,
+                |this, state, event, _, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                        let v = state.read(cx).value().trim().to_string();
+                        if v != this.state.vpn_prefs.balancer_exclude_regex {
+                            this.state.vpn_prefs.balancer_exclude_regex = v;
+                            this.reconnect_if_active();
+                            cx.notify();
+                        }
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &bal_words_input_state,
+                window,
+                |this, state, event, _, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                        let parsed: Vec<String> = state
+                            .read(cx)
+                            .value()
+                            .split(',')
+                            .map(|x| x.trim().to_string())
+                            .filter(|x| !x.is_empty())
+                            .collect();
+                        if parsed != this.state.vpn_prefs.balancer_excluded_countries {
+                            this.state.vpn_prefs.balancer_excluded_countries = parsed;
+                            this.reconnect_if_active();
+                            cx.notify();
+                        }
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &auto_ping_interval_input,
+                window,
+                |this, state, event, window, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                        let raw = state.read(cx).value().to_string();
+                        if let Some(secs) = parse_duration_secs(&raw) {
+                            this.state.auto_ping.interval_s = secs;
+                            this.state.save();
+                        }
+                        let norm =
+                            format_interval_short(this.state.auto_ping.interval_s, this.is_en());
+                        state.update(cx, |s, cx| s.set_value(norm, window, cx));
+                        cx.notify();
+                    }
+                },
+            ),
         ];
 
         crate::tray::register_main_window();
@@ -595,6 +737,11 @@ impl TachyonApp {
             udp_fake_payload_input_state,
             desync_probe_input_state,
             diag_target_input_state,
+            bal_url_input_state,
+            bal_include_input_state,
+            bal_exclude_input_state,
+            bal_words_input_state,
+            auto_ping_interval_input,
             pasted_multiline_uri: None,
             _input_subscriptions: subs,
             vpn_status: "disconnected".to_string(),
@@ -632,6 +779,7 @@ impl TachyonApp {
             dns_running: false,
             speedtest: SpeedtestStatus::default(),
             log_tail: String::new(),
+            log_filter_level: log_filter_init,
             toast: None,
             update_banner: UpdateBanner::default(),
             last_conns_poll: Instant::now(),
@@ -650,6 +798,10 @@ impl TachyonApp {
             diag_busy: false,
             inspector_report: None,
             memory_report: None,
+            #[cfg(target_os = "macos")]
+            macos_helper_installed: macos_helper_init,
+            #[cfg(target_os = "macos")]
+            macos_helper_busy: false,
         };
 
         // Initial background tasks
@@ -710,18 +862,18 @@ impl TachyonApp {
 
     pub fn drain_backend_events(&mut self, cx: &mut Context<Self>) {
         let mut drained = Vec::new();
-        if let Ok(mut guard) = self.event_queue.lock() {
-            if !guard.is_empty() {
-                std::mem::swap(&mut drained, &mut *guard);
-            }
+        if let Ok(mut guard) = self.event_queue.lock()
+            && !guard.is_empty()
+        {
+            std::mem::swap(&mut drained, &mut *guard);
         }
 
         let mut needs_notify = false;
-        if let Some((_, ts)) = &self.toast {
-            if ts.elapsed() > Duration::from_secs(4) {
-                self.toast = None;
-                needs_notify = true;
-            }
+        if let Some((_, ts)) = &self.toast
+            && ts.elapsed() > Duration::from_secs(4)
+        {
+            self.toast = None;
+            needs_notify = true;
         }
         if self.vpn_status == "connected" {
             needs_notify = true;
@@ -766,6 +918,7 @@ impl TachyonApp {
                                     self.connected_since = Some(Instant::now());
                                     self.last_error.clear();
                                     self.refresh_exit_info();
+                                    self.trigger_auto_ping_debounced();
                                 } else if st == "switched" {
                                     self.refresh_exit_info();
                                 }
@@ -779,6 +932,9 @@ impl TachyonApp {
                                 self.rx_bps = 0;
                                 self.tx_bps = 0;
                                 self.live_balancer = None;
+                                if prev != "disconnected" {
+                                    self.trigger_auto_ping_debounced();
+                                }
                             }
                             "error" => {
                                 self.vpn_status = "disconnected".to_string();
@@ -818,11 +974,11 @@ impl TachyonApp {
                             self.tx_history.remove(0);
                         }
                     }
-                    if let Some(ping) = doc.get("ping").and_then(Value::as_i64) {
-                        if ping > 0 {
-                            // RTT «через туннель» — хранится отдельно, не затирает прямой пинг узла
-                            self.live_rtt_ms = Some(ping);
-                        }
+                    if let Some(ping) = doc.get("ping").and_then(Value::as_i64)
+                        && ping > 0
+                    {
+                        // RTT «через туннель» — хранится отдельно, не затирает прямой пинг узла
+                        self.live_rtt_ms = Some(ping);
                     }
                     if let Some(bal) = doc.get("balancer") {
                         self.live_balancer = Some(bal.clone());
@@ -835,12 +991,16 @@ impl TachyonApp {
                     self.connected_since = Some(Instant::now());
                     self.last_error.clear();
                     self.refresh_exit_info();
+                    self.trigger_auto_ping_debounced();
                 } else if status == "disconnected" {
                     self.connected_since = None;
                     self.rx_bps = 0;
                     self.tx_bps = 0;
                     self.live_balancer = None;
                     self.live_rtt_ms = None;
+                    if prev != "disconnected" {
+                        self.trigger_auto_ping_debounced();
+                    }
                 }
             } else if let Some(err) = msg.strip_prefix("error:") {
                 self.last_error = err.to_string();
@@ -869,8 +1029,10 @@ impl TachyonApp {
                 let mut it = pong.splitn(2, ':');
                 if let (Some(id), Some(ms_str)) = (it.next(), it.next()) {
                     let ms = ms_str.parse::<i64>().unwrap_or(-1);
+                    let now = now_unix_secs();
                     if let Some(srv) = self.state.servers.iter_mut().find(|s| s.id == id) {
                         srv.ping_ms = Some(ms);
+                        srv.ping_at = Some(now);
                         srv.alive = Some(ms > 0);
                     }
                 }
@@ -967,160 +1129,157 @@ impl TachyonApp {
                     }
                 }
             } else if let Some(conn_str) = msg.strip_prefix("conn:data:") {
-                if let Ok(doc) = serde_json::from_str::<Value>(conn_str) {
-                    if let Some(arr) = doc
+                if let Ok(doc) = serde_json::from_str::<Value>(conn_str)
+                    && let Some(arr) = doc
                         .get("conns")
                         .or_else(|| doc.get("connections"))
                         .and_then(Value::as_array)
-                    {
-                        let mut rows = Vec::with_capacity(arr.len());
-                        for item in arr {
-                            let id = item
-                                .get("id")
+                {
+                    let mut rows = Vec::with_capacity(arr.len());
+                    for item in arr {
+                        let id = item
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let dl = item
+                            .get("down")
+                            .or_else(|| item.get("download"))
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        let ul = item
+                            .get("up")
+                            .or_else(|| item.get("upload"))
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        let direct = item.get("direct").and_then(Value::as_bool).unwrap_or(false);
+                        let desync = item.get("desync").and_then(Value::as_bool).unwrap_or(false);
+                        let chain = if direct {
+                            "DIRECT".to_string()
+                        } else if desync {
+                            "DESYNC".to_string()
+                        } else {
+                            item.get("chains")
+                                .and_then(Value::as_array)
+                                .and_then(|a| a.first())
                                 .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string();
-                            let dl = item
-                                .get("down")
-                                .or_else(|| item.get("download"))
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0);
-                            let ul = item
-                                .get("up")
-                                .or_else(|| item.get("upload"))
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0);
-                            let direct =
-                                item.get("direct").and_then(Value::as_bool).unwrap_or(false);
-                            let desync =
-                                item.get("desync").and_then(Value::as_bool).unwrap_or(false);
-                            let chain = if direct {
-                                "DIRECT".to_string()
-                            } else if desync {
-                                "DESYNC".to_string()
-                            } else {
-                                item.get("chains")
-                                    .and_then(Value::as_array)
-                                    .and_then(|a| a.first())
+                                .unwrap_or("PROXY")
+                                .to_string()
+                        };
+                        let rule = item
+                            .get("type")
+                            .or_else(|| item.get("rule"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("match")
+                            .to_string();
+                        let net = item
+                            .get("net")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .or_else(|| {
+                                item.get("metadata")
+                                    .and_then(|m| m.get("network"))
                                     .and_then(Value::as_str)
-                                    .unwrap_or("PROXY")
-                                    .to_string()
-                            };
-                            let rule = item
-                                .get("type")
-                                .or_else(|| item.get("rule"))
-                                .and_then(Value::as_str)
-                                .unwrap_or("match")
-                                .to_string();
-                            let net = item
-                                .get("net")
-                                .and_then(Value::as_str)
-                                .filter(|s| !s.is_empty())
-                                .or_else(|| {
-                                    item.get("metadata")
-                                        .and_then(|m| m.get("network"))
+                            })
+                            .unwrap_or("tcp")
+                            .to_ascii_uppercase();
+                        let ip_raw = item
+                            .get("ip")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .or_else(|| {
+                                item.get("metadata")
+                                    .and_then(|m| m.get("destinationIP"))
+                                    .and_then(Value::as_str)
+                            })
+                            .unwrap_or("");
+                        let port_str = item.get("port").and_then(Value::as_str).unwrap_or("");
+                        let ip_port = if !ip_raw.is_empty() && !port_str.is_empty() {
+                            format!("{ip_raw}:{port_str}")
+                        } else if !ip_raw.is_empty() {
+                            ip_raw.to_string()
+                        } else {
+                            String::new()
+                        };
+                        let host_raw = item
+                            .get("host")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .or_else(|| {
+                                item.get("metadata").and_then(|m| {
+                                    m.get("host")
+                                        .and_then(Value::as_str)
+                                        .filter(|s| !s.is_empty())
+                                })
+                            })
+                            .unwrap_or(if ip_raw.is_empty() { "—" } else { ip_raw });
+                        let host = if !port_str.is_empty() && !host_raw.contains(':') {
+                            format!("{host_raw}:{port_str}")
+                        } else {
+                            host_raw.to_string()
+                        };
+                        let process = item
+                            .get("proc")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .or_else(|| {
+                                item.get("metadata").and_then(|m| {
+                                    m.get("processPath")
+                                        .or_else(|| m.get("process"))
                                         .and_then(Value::as_str)
                                 })
-                                .unwrap_or("tcp")
-                                .to_ascii_uppercase();
-                            let ip_raw = item
-                                .get("ip")
-                                .and_then(Value::as_str)
-                                .filter(|s| !s.is_empty())
-                                .or_else(|| {
-                                    item.get("metadata")
-                                        .and_then(|m| m.get("destinationIP"))
-                                        .and_then(Value::as_str)
-                                })
-                                .unwrap_or("");
-                            let port_str = item.get("port").and_then(Value::as_str).unwrap_or("");
-                            let ip_port = if !ip_raw.is_empty() && !port_str.is_empty() {
-                                format!("{ip_raw}:{port_str}")
-                            } else if !ip_raw.is_empty() {
-                                ip_raw.to_string()
-                            } else {
-                                String::new()
-                            };
-                            let host_raw = item
-                                .get("host")
-                                .and_then(Value::as_str)
-                                .filter(|s| !s.is_empty())
-                                .or_else(|| {
-                                    item.get("metadata").and_then(|m| {
-                                        m.get("host")
-                                            .and_then(Value::as_str)
-                                            .filter(|s| !s.is_empty())
-                                    })
-                                })
-                                .unwrap_or(if ip_raw.is_empty() { "—" } else { ip_raw });
-                            let host = if !port_str.is_empty() && !host_raw.contains(':') {
-                                format!("{host_raw}:{port_str}")
-                            } else {
-                                host_raw.to_string()
-                            };
-                            let process = item
-                                .get("proc")
-                                .and_then(Value::as_str)
-                                .filter(|s| !s.is_empty())
-                                .or_else(|| {
-                                    item.get("metadata").and_then(|m| {
-                                        m.get("processPath")
-                                            .or_else(|| m.get("process"))
-                                            .and_then(Value::as_str)
-                                    })
-                                })
-                                .unwrap_or("system")
-                                .rsplit(['/', '\\'])
-                                .next()
-                                .unwrap_or("system")
-                                .to_string();
-                            rows.push(ActiveConnectionRow {
-                                id,
-                                net,
-                                host,
-                                ip_port,
-                                process,
-                                chain,
-                                rule,
-                                dl,
-                                ul,
-                            });
-                        }
-                        self.connections = rows;
+                            })
+                            .unwrap_or("system")
+                            .rsplit(['/', '\\'])
+                            .next()
+                            .unwrap_or("system")
+                            .to_string();
+                        rows.push(ActiveConnectionRow {
+                            id,
+                            net,
+                            host,
+                            ip_port,
+                            process,
+                            chain,
+                            rule,
+                            dl,
+                            ul,
+                        });
                     }
+                    self.connections = rows;
                 }
             } else if let Some(diag_str) = msg.strip_prefix("diag:matrix:") {
                 self.diag_running = false;
-                if let Ok(doc) = serde_json::from_str::<Value>(diag_str) {
-                    if let Some(arr) = doc.get("items").and_then(Value::as_array) {
-                        self.diag_items = arr
-                            .iter()
-                            .map(|v| DiagProbeItem {
-                                id: v
-                                    .get("id")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("")
-                                    .to_string(),
-                                title: v
-                                    .get("title")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("")
-                                    .to_string(),
-                                subtitle: v
-                                    .get("subtitle")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("")
-                                    .to_string(),
-                                ok: v.get("ok").and_then(Value::as_bool).unwrap_or(false),
-                                status: v
-                                    .get("status")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("")
-                                    .to_string(),
-                                ms: v.get("ms").and_then(Value::as_i64).unwrap_or(-1),
-                            })
-                            .collect();
-                    }
+                if let Ok(doc) = serde_json::from_str::<Value>(diag_str)
+                    && let Some(arr) = doc.get("items").and_then(Value::as_array)
+                {
+                    self.diag_items = arr
+                        .iter()
+                        .map(|v| DiagProbeItem {
+                            id: v
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                            title: v
+                                .get("title")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                            subtitle: v
+                                .get("subtitle")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                            ok: v.get("ok").and_then(Value::as_bool).unwrap_or(false),
+                            status: v
+                                .get("status")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                            ms: v.get("ms").and_then(Value::as_i64).unwrap_or(-1),
+                        })
+                        .collect();
                 }
             } else if let Some(step_str) = msg.strip_prefix("diag:step:") {
                 if let Ok(doc) = serde_json::from_str::<Value>(step_str) {
@@ -1133,35 +1292,35 @@ impl TachyonApp {
                 self.show_toast("Самодиагностика стека завершена");
             } else if let Some(dns_str) = msg.strip_prefix("dns:bench:") {
                 self.dns_running = false;
-                if let Ok(doc) = serde_json::from_str::<Value>(dns_str) {
-                    if let Some(arr) = doc.get("results").and_then(Value::as_array) {
-                        self.dns_bench = arr
-                            .iter()
-                            .map(|v| DnsBenchItem {
-                                id: v
-                                    .get("id")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("")
-                                    .to_string(),
-                                name: v
-                                    .get("name")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("")
-                                    .to_string(),
-                                host: v
-                                    .get("host")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("")
-                                    .to_string(),
-                                proto: v
-                                    .get("proto")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("")
-                                    .to_string(),
-                                ms: v.get("ms").and_then(Value::as_i64).unwrap_or(-1),
-                            })
-                            .collect();
-                    }
+                if let Ok(doc) = serde_json::from_str::<Value>(dns_str)
+                    && let Some(arr) = doc.get("results").and_then(Value::as_array)
+                {
+                    self.dns_bench = arr
+                        .iter()
+                        .map(|v| DnsBenchItem {
+                            id: v
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                            name: v
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                            host: v
+                                .get("host")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                            proto: v
+                                .get("proto")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                            ms: v.get("ms").and_then(Value::as_i64).unwrap_or(-1),
+                        })
+                        .collect();
                 }
             } else if let Some(prog_str) = msg.strip_prefix("speedtest:progress:") {
                 if let Ok(doc) = serde_json::from_str::<Value>(prog_str) {
@@ -1417,14 +1576,18 @@ impl TachyonApp {
                     }
                 }
             } else if let Some(fl) = msg.strip_prefix("diag:flight:") {
-                if let Ok(doc) = serde_json::from_str::<Value>(fl) {
-                    if let Some(arr) = doc.get("entries").and_then(Value::as_array) {
-                        self.flight_entries = arr.clone();
-                    }
+                if let Ok(doc) = serde_json::from_str::<Value>(fl)
+                    && let Some(arr) = doc.get("entries").and_then(Value::as_array)
+                {
+                    self.flight_entries = arr.clone();
                 }
             } else if msg == "diag:flight:cleared" {
                 self.flight_entries.clear();
                 self.show_toast(self.tr("Журнал соединений очищен", "Flight log cleared"));
+            } else if let Some(tmsg) = msg.strip_prefix("toast:") {
+                self.show_toast(tmsg.to_string());
+            } else if let Some(mh) = msg.strip_prefix("macos_helper:done:") {
+                self.handle_macos_helper_event(mh);
             }
         }
 
@@ -1485,21 +1648,8 @@ impl TachyonApp {
     async fn probe_single_uri_ms(uri: &str) -> i64 {
         let badge = detect_protocol_badge(uri);
         if let Some((host, port)) = extract_host_port_from_uri(uri) {
-            if matches!(badge, "AWG" | "WG" | "HY2" | "TUIC" | "WDTT") {
-                let icmp = icmp_or_tcp_ping_ms(&host, 1800).await;
-                if icmp > 0 {
-                    icmp
-                } else {
-                    tcp_connect_ms(&host, port, 1500).await
-                }
-            } else {
-                let tcp = tcp_connect_ms(&host, port, 2000).await;
-                if tcp > 0 {
-                    tcp
-                } else {
-                    icmp_or_tcp_ping_ms(&host, 1500).await
-                }
-            }
+            let is_udp = matches!(badge, "AWG" | "WG" | "HY2" | "TUIC" | "WDTT");
+            probe_endpoint_median_ms(&host, port, is_udp).await
         } else {
             -1
         }
@@ -1612,6 +1762,16 @@ impl TachyonApp {
         self.spawn_ping_batch(targets, true);
     }
 
+    pub fn trigger_auto_ping_debounced(&mut self) {
+        if self.state.auto_ping.enabled
+            && self.auto_ping_busy.is_none()
+            && self.last_auto_ping.elapsed() >= Duration::from_secs(15)
+        {
+            self.last_auto_ping = Instant::now();
+            self.run_auto_ping();
+        }
+    }
+
     pub fn toggle_auto_ping(&mut self) {
         self.state.auto_ping.enabled = !self.state.auto_ping.enabled;
         self.last_auto_ping = Instant::now()
@@ -1621,11 +1781,60 @@ impl TachyonApp {
     }
 
     pub fn cycle_auto_ping_interval(&mut self) {
-        const STEPS: [u64; 7] = [5, 10, 15, 30, 60, 120, 300];
+        const STEPS: [u64; 8] = [15, 30, 60, 120, 300, 600, 1800, 3600];
         let cur = self.state.auto_ping.interval_s;
         self.state.auto_ping.interval_s =
             STEPS.iter().copied().find(|&x| x > cur).unwrap_or(STEPS[0]);
         self.state.save();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn handle_macos_helper_event(&mut self, payload: &str) {
+        self.macos_helper_busy = false;
+        self.macos_helper_installed = macos_helper_status().0;
+        let msg = payload
+            .strip_prefix("1:")
+            .or_else(|| payload.strip_prefix("0:"))
+            .unwrap_or(payload);
+        self.show_toast(msg.to_string());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn handle_macos_helper_event(&mut self, _payload: &str) {}
+
+    #[cfg(target_os = "macos")]
+    fn trigger_macos_helper_action(&mut self, install: bool) {
+        if self.macos_helper_busy {
+            return;
+        }
+        self.macos_helper_busy = true;
+        let eq = self.event_queue.clone();
+        let is_en = self.is_en();
+        let ok_msg = if install {
+            if is_en {
+                "macOS helper installed"
+            } else {
+                "Помощник macOS установлен"
+            }
+        } else if is_en {
+            "macOS helper removed"
+        } else {
+            "Помощник macOS удалён"
+        };
+        self.rt.spawn_blocking(move || {
+            let res = if install {
+                install_macos_helper()
+            } else {
+                uninstall_macos_helper()
+            };
+            let msg = match res {
+                Ok(()) => format!("macos_helper:done:1:{ok_msg}"),
+                Err(e) => format!("macos_helper:done:0:{e}"),
+            };
+            if let Ok(mut g) = eq.lock() {
+                g.push(msg);
+            }
+        });
     }
 
     pub fn toggle_auto_ping_all(&mut self) {
@@ -1683,16 +1892,12 @@ impl TachyonApp {
         let payload = BalancerPayload {
             name: name.clone(),
             mode: mode.clone(),
-            url: "https://www.gstatic.com/generate_204".to_string(),
+            url: self.state.vpn_prefs.balancer_url.clone(),
             interval: self.state.vpn_prefs.balancer_interval.clone(),
             tolerance: self.state.vpn_prefs.balancer_tolerance,
             pool: self.state.vpn_prefs.balancer_pool as u32,
-            pool_tolerance: (self.state.vpn_prefs.balancer_tolerance + 30).min(500),
-            sticky_hash: vec![
-                "domain".to_string(),
-                "dest_ip".to_string(),
-                "process".to_string(),
-            ],
+            pool_tolerance: self.state.vpn_prefs.balancer_tolerance,
+            sticky_hash: self.state.vpn_prefs.balancer_sticky_hash.clone(),
             quota_mib: self.state.vpn_prefs.balancer_quota_mib,
             members: members.clone(),
         };
@@ -1710,6 +1915,7 @@ impl TachyonApp {
                 balancer_mode: Some(mode),
                 member_count: Some(members.len()),
                 ping_ms: None,
+                ping_at: None,
                 alive: Some(true),
             },
         );
@@ -1834,12 +2040,13 @@ impl TachyonApp {
                     .and_then(Value::as_str)
                     .unwrap_or("Узел")
                     .to_string();
-                if !is_remote_sub && arr.len() == 1 && !handle.is_empty() && handle != "Подписка"
+                if !is_remote_sub
+                    && arr.len() == 1
+                    && !handle.is_empty()
+                    && handle != "Подписка"
+                    && (name.starts_with("Узел #") || name == "WireGuard" || name == "AmneziaWG")
                 {
-                    if name.starts_with("Узел #") || name == "WireGuard" || name == "AmneziaWG"
-                    {
-                        name = handle.clone();
-                    }
+                    name = handle.clone();
                 }
                 let country = item
                     .get("country")
@@ -1876,6 +2083,7 @@ impl TachyonApp {
                     balancer_mode,
                     member_count,
                     ping_ms: None,
+                    ping_at: None,
                     alive: None,
                 });
                 imported_count += 1;
@@ -1906,7 +2114,14 @@ impl TachyonApp {
             self.state.active_id = fid;
         }
         self.state.save();
-        self.ping_all_nodes();
+        if imported_count > 0 {
+            if self.state.auto_ping.enabled && self.auto_ping_busy.is_none() {
+                self.last_auto_ping = Instant::now();
+                self.run_auto_ping();
+            } else if !self.state.auto_ping.enabled {
+                self.ping_all_nodes();
+            }
+        }
         self.show_toast(format!("Добавлено узлов: {imported_count}"));
     }
 
@@ -1939,6 +2154,15 @@ impl TachyonApp {
             .update(cx, |s, cx| s.set_placeholder(name_ph, window, cx));
         self.custom_dns_input_state
             .update(cx, |s, cx| s.set_placeholder(dns_ph, window, cx));
+        let bal_inc_ph = self.tr("Например: LTE|Whitelist|МТС", "e.g. LTE|Whitelist");
+        let bal_exc_ph = self.tr("Например: резерв|тест|expired", "e.g. backup|test|expired");
+        let bal_words_ph = self.tr("RU, KZ, BY, реклама, vip", "RU, KZ, BY, ads, vip");
+        self.bal_include_input_state
+            .update(cx, |s, cx| s.set_placeholder(bal_inc_ph, window, cx));
+        self.bal_exclude_input_state
+            .update(cx, |s, cx| s.set_placeholder(bal_exc_ph, window, cx));
+        self.bal_words_input_state
+            .update(cx, |s, cx| s.set_placeholder(bal_words_ph, window, cx));
     }
 
     pub fn submit_custom_rule_ui(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2037,15 +2261,14 @@ fn is_ip_or_cidr(s: &str) -> bool {
     if s.parse::<std::net::IpAddr>().is_ok() {
         return true;
     }
-    if let Some((ip_part, prefix_part)) = s.split_once('/') {
-        if let Ok(ip) = ip_part.parse::<std::net::IpAddr>() {
-            if let Ok(prefix) = prefix_part.parse::<u8>() {
-                return match ip {
-                    std::net::IpAddr::V4(_) => prefix <= 32,
-                    std::net::IpAddr::V6(_) => prefix <= 128,
-                };
-            }
-        }
+    if let Some((ip_part, prefix_part)) = s.split_once('/')
+        && let Ok(ip) = ip_part.parse::<std::net::IpAddr>()
+        && let Ok(prefix) = prefix_part.parse::<u8>()
+    {
+        return match ip {
+            std::net::IpAddr::V4(_) => prefix <= 32,
+            std::net::IpAddr::V6(_) => prefix <= 128,
+        };
     }
     false
 }
@@ -2084,6 +2307,128 @@ fn strip_url_to_host(raw: &str) -> String {
         .trim_end_matches('.')
         .trim()
         .to_lowercase()
+}
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Парсит интервал (`60`, `60s`, `10m`, `1h`, русские `с`/`м`/`ч`) с зажатием в `5..=86400`.
+pub fn parse_duration_secs(raw: &str) -> Option<u64> {
+    let s = raw.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        return None;
+    }
+    let (num_str, mult) = if let Some(n) = s
+        .strip_suffix("сек")
+        .or_else(|| s.strip_suffix('s'))
+        .or_else(|| s.strip_suffix('с'))
+    {
+        (n, 1u64)
+    } else if let Some(n) = s
+        .strip_suffix("мин")
+        .or_else(|| s.strip_suffix('m'))
+        .or_else(|| s.strip_suffix('м'))
+    {
+        (n, 60u64)
+    } else if let Some(n) = s
+        .strip_suffix("час")
+        .or_else(|| s.strip_suffix('h'))
+        .or_else(|| s.strip_suffix('ч'))
+    {
+        (n, 3600u64)
+    } else {
+        (s.as_str(), 1u64)
+    };
+    let val = num_str.trim().parse::<u64>().ok()?;
+    if val == 0 {
+        return None;
+    }
+    Some(val.saturating_mul(mult).clamp(5, 86_400))
+}
+
+fn format_interval_short(secs: u64, is_en: bool) -> String {
+    if secs >= 3600 && secs.is_multiple_of(3600) {
+        format!("{}{}", secs / 3600, if is_en { "h" } else { "ч" })
+    } else if (secs >= 60 && secs.is_multiple_of(60)) || secs >= 3600 {
+        format!("{}{}", secs / 60, if is_en { "m" } else { "м" })
+    } else {
+        format!("{secs}{}", if is_en { "s" } else { "с" })
+    }
+}
+
+fn format_ping_age(ping_at: Option<u64>, now: u64, is_en: bool) -> Option<(String, u64)> {
+    let ts = ping_at?;
+    let age = now.saturating_sub(ts);
+    let label = if age < 60 {
+        if is_en { "now" } else { "только что" }.to_string()
+    } else if age < 3600 {
+        format!("{}{}", age / 60, if is_en { "m" } else { "м" })
+    } else {
+        format!("{}{}", age / 3600, if is_en { "h" } else { "ч" })
+    };
+    Some((label, age))
+}
+
+fn ping_badge_style(
+    ping_ms: Option<i64>,
+    ping_at: Option<u64>,
+    now: u64,
+    stale_thresh: u64,
+    is_en: bool,
+    compact: bool,
+    t: Theme,
+) -> (gpui::Rgba, gpui::Rgba, String) {
+    let age_info = format_ping_age(ping_at, now, is_en);
+    let stale = age_info
+        .as_ref()
+        .is_some_and(|(_, age)| *age > stale_thresh);
+    match ping_ms {
+        Some(ms) if ms > 0 => {
+            let col = if stale { t.text_mute } else { t.green };
+            let base = if compact {
+                format!("{ms}{}", if is_en { "ms" } else { "мс" })
+            } else {
+                format!("{ms} {}", if is_en { "ms" } else { "мс" })
+            };
+            let txt = if let Some((age_s, _)) = age_info {
+                format!("{base} · {age_s}")
+            } else {
+                base
+            };
+            (col, col, txt)
+        }
+        Some(_) => {
+            let col = if stale { t.text_mute } else { t.red };
+            let base = if compact {
+                "×".to_string()
+            } else if is_en {
+                "Dead".to_string()
+            } else {
+                "Недоступен".to_string()
+            };
+            let txt = if let Some((age_s, _)) = age_info {
+                format!("{base} · {age_s}")
+            } else {
+                base
+            };
+            (col, col, txt)
+        }
+        None => {
+            let text_col = if compact { t.text_mute } else { t.text_soft };
+            let txt = if compact {
+                "—".to_string()
+            } else if is_en {
+                "Ping".to_string()
+            } else {
+                "Пинг".to_string()
+            };
+            (t.text_dim, text_col, txt)
+        }
+    }
 }
 
 pub fn parse_custom_rule_entries(selected_type: &str, raw: &str) -> Vec<(String, String)> {
@@ -2747,7 +3092,8 @@ impl TachyonApp {
                             .text_color(t.accent)
                             .hover(|s| s.underline())
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.log_tail = this.vpn.get_log_tail(140);
+                                this.log_tail =
+                                    this.vpn.get_log_tail_filtered(200, &this.log_filter_level);
                                 this.modal = ModalKind::KernelLog;
                                 cx.notify();
                             }))
@@ -3266,8 +3612,14 @@ impl TachyonApp {
                                         // Когда подключены — показываем RTT через туннель,
                                         // когда нет — прямой пинг узла
                                         self.live_rtt_ms
-                                            .or_else(|| active_srv.as_ref().and_then(|s| s.ping_ms)),
-                                        |el, ms| {
+                                            .map(|ms| (true, ms))
+                                            .or_else(|| {
+                                                active_srv
+                                                    .as_ref()
+                                                    .and_then(|s| s.ping_ms)
+                                                    .map(|ms| (false, ms))
+                                            }),
+                                        |el, (via_tunnel, ms)| {
                                             el.child(
                                                 div()
                                                     .flex_shrink_0()
@@ -3282,7 +3634,15 @@ impl TachyonApp {
                                                         t.text_dim
                                                     })
                                                     .child(if ms > 0 {
-                                                        format!("{ms} {}", self.tr("мс", "ms"))
+                                                        let prefix = if via_tunnel {
+                                                            self.tr("Туннель", "Tunnel")
+                                                        } else {
+                                                            self.tr("До сервера", "Direct")
+                                                        };
+                                                        format!(
+                                                            "{prefix}: {ms} {}",
+                                                            self.tr("мс", "ms")
+                                                        )
                                                     } else {
                                                         "—".to_string()
                                                     }),
@@ -4178,6 +4538,19 @@ impl TachyonApp {
                                                             let sid_ping = srv.id.clone();
                                                             let proto =
                                                                 detect_protocol_badge(&srv.vless);
+                                                            let stale_thresh =
+                                                                (self.state.auto_ping.interval_s * 2)
+                                                                    .max(300);
+                                                            let (ping_icon_col, ping_text_col, ping_label) =
+                                                                ping_badge_style(
+                                                                    srv.ping_ms,
+                                                                    srv.ping_at,
+                                                                    now_unix_secs(),
+                                                                    stale_thresh,
+                                                                    self.is_en(),
+                                                                    true,
+                                                                    t,
+                                                                );
                                                             div()
                                                                 .id(SharedString::from(format!(
                                                                     "srv-chip-{}",
@@ -4295,11 +4668,7 @@ impl TachyonApp {
                                                                                         .path("icons/bolt.svg")
                                                                                         .size(px(9.0))
                                                                                         .text_color(
-                                                                                            match srv.ping_ms {
-                                                                                                Some(ms) if ms > 0 => t.green,
-                                                                                                Some(_) => t.red,
-                                                                                                None => t.text_dim,
-                                                                                            },
+                                                                                            ping_icon_col,
                                                                                         ),
                                                                                 )
                                                                                 .child(
@@ -4308,28 +4677,14 @@ impl TachyonApp {
                                                                                             px(9.5),
                                                                                         )
                                                                                         .text_color(
-                                                                                            match srv.ping_ms {
-                                                                                                Some(ms) if ms > 0 => t.green,
-                                                                                                Some(_) => t.red,
-                                                                                                None => t.text_mute,
-                                                                                            },
+                                                                                            ping_text_col,
                                                                                         )
                                                                                         .child(
-                                                                                            match srv.ping_ms {
-                                                                                                Some(ms) if ms > 0 => {
-                                                                                                    if self.is_en() {
-                                                                                                        format!("{ms}ms")
-                                                                                                    } else {
-                                                                                                        format!("{ms}мс")
-                                                                                                    }
-                                                                                                }
-                                                                                                                        Some(_) => "×".to_string(),
-                                                                                        None => "—".to_string(),
-                                                                                    },
+                                                                                            ping_label,
+                                                                                        ),
                                                                                 ),
                                                                         ),
                                                                 )
-                                                            )
                                                         })),
                                                 )
                                             })
@@ -6775,11 +7130,10 @@ impl TachyonApp {
                                             .items_center()
                                             .gap(px(6.0))
                                             .on_click(cx.listener(|this, _, _, cx| {
-                                                if let Some(clip) = cx.read_from_clipboard() {
-                                                    if let Some(txt) = clip.text() {
+                                                if let Some(clip) = cx.read_from_clipboard()
+                                                    && let Some(txt) = clip.text() {
                                                         this.add_single_server_uri(&txt, None);
                                                     }
-                                                }
                                                 cx.notify();
                                             }))
                                             .child(
@@ -7028,6 +7382,58 @@ impl TachyonApp {
                                     )
                                     .child(
                                         div()
+                                            .id("btn-open-balancer-settings")
+                                            .px(px(8.0))
+                                            .py(px(3.0))
+                                            .rounded(px(5.0))
+                                            .bg(t.bg_elev)
+                                            .border_1()
+                                            .border_color(t.border)
+                                            .cursor_pointer()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(4.0))
+                                            .text_size(px(10.5))
+                                            .text_color(t.text_soft)
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                let url = this.state.vpn_prefs.balancer_url.clone();
+                                                let inc = this
+                                                    .state
+                                                    .vpn_prefs
+                                                    .balancer_include_regex
+                                                    .clone();
+                                                let exc = this
+                                                    .state
+                                                    .vpn_prefs
+                                                    .balancer_exclude_regex
+                                                    .clone();
+                                                let words = this
+                                                    .state
+                                                    .vpn_prefs
+                                                    .balancer_excluded_countries
+                                                    .join(", ");
+                                                this.bal_url_input_state
+                                                    .update(cx, |st, cx| st.set_value(url, window, cx));
+                                                this.bal_include_input_state
+                                                    .update(cx, |st, cx| st.set_value(inc, window, cx));
+                                                this.bal_exclude_input_state
+                                                    .update(cx, |st, cx| st.set_value(exc, window, cx));
+                                                this.bal_words_input_state.update(cx, |st, cx| {
+                                                    st.set_value(words, window, cx)
+                                                });
+                                                this.modal = ModalKind::Balancer;
+                                                cx.notify();
+                                            }))
+                                            .child(
+                                                svg()
+                                                    .path("icons/sliders.svg")
+                                                    .size(px(11.0))
+                                                    .text_color(t.text_dim),
+                                            )
+                                            .child(self.tr("Настройки", "Settings")),
+                                    )
+                                    .child(
+                                        div()
                                             .id("btn-open-subs-from-nodes")
                                             .px(px(8.0))
                                             .py(px(3.0))
@@ -7101,7 +7507,7 @@ impl TachyonApp {
                                             .text_color(t.text_dim)
                                             .child(self.tr("Допуск RTT:", "Tolerance:")),
                                     )
-                                    .children([20u32, 40, 80, 150].into_iter().map(|tol| {
+                                    .children([30u32, 50, 80, 120, 200].into_iter().map(|tol| {
                                         let act = self.state.vpn_prefs.balancer_tolerance == tol;
                                         div()
                                             .id(SharedString::from(format!("bm-tol-{tol}")))
@@ -7312,15 +7718,20 @@ impl TachyonApp {
                                     .hover(|s| s.bg(t.bg_hover))
                                     .text_size(px(10.5))
                                     .text_color(t.text_soft)
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                    .on_click(cx.listener(|this, _, window, cx| {
                                         this.cycle_auto_ping_interval();
+                                        let norm = format_interval_short(
+                                            this.state.auto_ping.interval_s,
+                                            this.is_en(),
+                                        );
+                                        this.auto_ping_interval_input
+                                            .update(cx, |s, cx| s.set_value(norm, window, cx));
                                         cx.notify();
                                     }))
-                                    .child(if self.is_en() {
-                                        format!("{}s", self.state.auto_ping.interval_s)
-                                    } else {
-                                        format!("{}с", self.state.auto_ping.interval_s)
-                                    }),
+                                    .child(format_interval_short(
+                                        self.state.auto_ping.interval_s,
+                                        self.is_en(),
+                                    )),
                             )
                             .child(
                                 div()
@@ -7471,6 +7882,17 @@ impl TachyonApp {
                                         || self.state.auto_ping.ids.contains(&srv.id));
                                 let srv_uri = srv.vless.clone();
                                 let proto = detect_protocol_badge(&srv.vless);
+                                let stale_thresh =
+                                    (self.state.auto_ping.interval_s * 2).max(300);
+                                let (ping_icon_col, ping_text_col, ping_label) = ping_badge_style(
+                                    srv.ping_ms,
+                                    srv.ping_at,
+                                    now_unix_secs(),
+                                    stale_thresh,
+                                    self.is_en(),
+                                    false,
+                                    t,
+                                );
 
                                 div()
                                     .id(SharedString::from(format!("node-row-{}", srv.id)))
@@ -7599,35 +8021,13 @@ impl TachyonApp {
                                                         svg()
                                                             .path("icons/bolt.svg")
                                                             .size(px(10.0))
-                                                            .text_color(match srv.ping_ms {
-                                                                Some(ms) if ms > 0 => t.green,
-                                                                Some(_) => t.red,
-                                                                None => t.text_dim,
-                                                            }),
+                                                            .text_color(ping_icon_col),
                                                     )
                                                     .child(
                                                         div()
                                                             .text_size(px(10.5))
-                                                            .text_color(match srv.ping_ms {
-                                                                Some(ms) if ms > 0 => t.green,
-                                                                Some(_) => t.red,
-                                                                None => t.text_soft,
-                                                            })
-                                                            .child(match srv.ping_ms {
-                                                                Some(ms) if ms > 0 => {
-                                                                    if self.is_en() {
-                                                                        format!("{ms} ms")
-                                                                    } else {
-                                                                        format!("{ms} мс")
-                                                                    }
-                                                                }
-                                                                Some(_) => self
-                                                                    .tr("Недоступен", "Dead")
-                                                                    .to_string(),
-                                                                None => self
-                                                                    .tr("Пинг", "Ping")
-                                                                    .to_string(),
-                                                            }),
+                                                            .text_color(ping_text_col)
+                                                            .child(ping_label),
                                                     ),
                                             )
                                             .child(
@@ -9587,7 +9987,45 @@ impl TachyonApp {
                                                                         .vpn_prefs
                                                                         .log_level =
                                                                         lvl.to_string();
-                                                                    this.reconnect_if_active();
+                                                                    this.log_filter_level =
+                                                                        lvl.to_string();
+                                                                    this.state.save();
+                                                                    this.log_tail = this
+                                                                        .vpn
+                                                                        .get_log_tail_filtered(
+                                                                            200,
+                                                                            &this.log_filter_level,
+                                                                        );
+                                                                    if this.vpn_status == "connected"
+                                                                    {
+                                                                        let v = this.vpn.clone();
+                                                                        let eq =
+                                                                            this.event_queue.clone();
+                                                                        let lvl_str =
+                                                                            lvl.to_string();
+                                                                        let is_en = this.is_en();
+                                                                        this.rt.spawn(async move {
+                                                                            let ok = v
+                                                                                .set_live_log_level(
+                                                                                    &lvl_str,
+                                                                                )
+                                                                                .await;
+                                                                            let msg = if ok {
+                                                                                if is_en {
+                                                                                    format!("toast:Log level updated: {}", lvl_str.to_uppercase())
+                                                                                } else {
+                                                                                    format!("toast:Уровень лога изменён: {}", lvl_str.to_uppercase())
+                                                                                }
+                                                                            } else if is_en {
+                                                                                "toast:Log level saved (applies on reconnect)".to_string()
+                                                                            } else {
+                                                                                "toast:Уровень лога сохранён (применится при переподключении)".to_string()
+                                                                            };
+                                                                            if let Ok(mut g) = eq.lock() {
+                                                                                g.push(msg);
+                                                                            }
+                                                                        });
+                                                                    }
                                                                     cx.notify();
                                                                 },
                                                             ))
@@ -9765,6 +10203,120 @@ impl TachyonApp {
                     .child(
                         div()
                             .w_full()
+                            .p(px(10.0))
+                            .rounded(px(8.0))
+                            .bg(t.bg_elev)
+                            .border_1()
+                            .border_color(t.border)
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .flex_wrap()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(150.0))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(12.0))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(t.text)
+                                            .child(self.tr(
+                                                "Интервал автопинга узлов",
+                                                "Node Auto-Ping Interval",
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(10.5))
+                                            .text_color(t.text_dim)
+                                            .child(self.tr(
+                                                "Задаётся в секундах, минутах или часах (например 60s, 10m, 1h)",
+                                                "Enter seconds, minutes or hours (e.g. 60s, 10m, 1h)",
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .flex_wrap()
+                                    .gap(px(4.0))
+                                    .child(
+                                        div()
+                                            .id("input-autoping-interval")
+                                            .w(px(84.0))
+                                            .h(px(28.0))
+                                            .child(styled_input(
+                                                &self.auto_ping_interval_input,
+                                                px(28.0),
+                                                11.0,
+                                                t,
+                                            )),
+                                    )
+                                    .children(
+                                        [15u64, 60, 300, 600, 1800, 3600]
+                                            .into_iter()
+                                            .map(|sec| {
+                                                let act = self.state.auto_ping.interval_s == sec;
+                                                div()
+                                                    .id(SharedString::from(format!(
+                                                        "opt-ap-iv-{sec}"
+                                                    )))
+                                                    .px(px(6.0))
+                                                    .py(px(3.0))
+                                                    .rounded(px(4.0))
+                                                    .cursor_pointer()
+                                                    .bg(if act {
+                                                        t.accent_bg
+                                                    } else {
+                                                        t.bg_card
+                                                    })
+                                                    .border_1()
+                                                    .border_color(if act {
+                                                        t.accent_border
+                                                    } else {
+                                                        t.border
+                                                    })
+                                                    .text_size(px(10.0))
+                                                    .text_color(if act {
+                                                        t.accent
+                                                    } else {
+                                                        t.text_dim
+                                                    })
+                                                    .on_click(cx.listener(
+                                                        move |this, _, window, cx| {
+                                                            this.state.auto_ping.interval_s = sec;
+                                                            this.state.save();
+                                                            let norm = format_interval_short(
+                                                                sec,
+                                                                this.is_en(),
+                                                            );
+                                                            this.auto_ping_interval_input.update(
+                                                                cx,
+                                                                |s, cx| {
+                                                                    s.set_value(norm, window, cx)
+                                                                },
+                                                            );
+                                                            cx.notify();
+                                                        },
+                                                    ))
+                                                    .child(format_interval_short(
+                                                        sec,
+                                                        self.is_en(),
+                                                    ))
+                                            }),
+                                    ),
+                            ),
+                    )
+                    .children(self.render_macos_helper_row(t, cx))
+                    .child(
+                        div()
+                            .w_full()
                             .pt(px(2.0))
                             .flex()
                             .items_center()
@@ -9858,6 +10410,125 @@ impl TachyonApp {
             )
     }
 
+    #[cfg(target_os = "macos")]
+    fn render_macos_helper_row(&self, t: Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let installed = self.macos_helper_installed;
+        let busy = self.macos_helper_busy;
+        Some(
+            div()
+                .w_full()
+                .p(px(10.0))
+                .rounded(px(8.0))
+                .bg(t.bg_elev)
+                .border_1()
+                .border_color(if installed {
+                    t.green_border
+                } else {
+                    t.border
+                })
+                .flex()
+                .items_center()
+                .justify_between()
+                .flex_wrap()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(160.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(t.text)
+                                        .child(self.tr(
+                                            "Системный помощник macOS",
+                                            "macOS Privileged Helper",
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .px(px(6.0))
+                                        .py(px(1.0))
+                                        .rounded(px(4.0))
+                                        .bg(if installed {
+                                            t.green_bg
+                                        } else {
+                                            t.bg_card
+                                        })
+                                        .text_size(px(9.5))
+                                        .text_color(if installed {
+                                            t.green
+                                        } else {
+                                            t.text_dim
+                                        })
+                                        .child(if busy {
+                                            self.tr("Выполняется...", "Working...")
+                                        } else if installed {
+                                            self.tr("Установлен", "Installed")
+                                        } else {
+                                            self.tr("Не установлен", "Not installed")
+                                        }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(t.text_dim)
+                                .child(self.tr(
+                                    "LaunchDaemon для запуска TUN и маршрутов без повторного запроса пароля",
+                                    "LaunchDaemon to manage TUN and routes without repeated admin prompts",
+                                )),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("btn-macos-helper-action")
+                        .px(px(10.0))
+                        .py(px(5.0))
+                        .rounded(px(6.0))
+                        .bg(if installed {
+                            t.red_bg
+                        } else {
+                            t.accent_bg
+                        })
+                        .border_1()
+                        .border_color(if installed {
+                            t.red
+                        } else {
+                            t.accent_border
+                        })
+                        .cursor_pointer()
+                        .hover(|s| s.opacity(0.9))
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(if installed { t.red } else { t.accent })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.trigger_macos_helper_action(!installed);
+                            cx.notify();
+                        }))
+                        .child(if installed {
+                            self.tr("Удалить", "Uninstall")
+                        } else {
+                            self.tr("Установить", "Install")
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn render_macos_helper_row(&self, _t: Theme, _cx: &mut Context<Self>) -> Option<AnyElement> {
+        None
+    }
+
     fn render_toggle_row<F>(
         &self,
         id: &'static str,
@@ -9934,6 +10605,844 @@ impl TachyonApp {
             )
     }
 
+    // ───────────────────────── Balancer settings modal ─────────────────────────
+
+    fn bal_chip(
+        &self,
+        key: String,
+        label: String,
+        active: bool,
+        t: Theme,
+        cx: &mut Context<Self>,
+        on: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> AnyElement {
+        div()
+            .id(SharedString::from(format!("balc-{key}")))
+            .px(px(7.0))
+            .py(px(3.0))
+            .rounded(px(5.0))
+            .cursor_pointer()
+            .border_1()
+            .border_color(if active { t.accent_border } else { t.border })
+            .bg(if active { t.accent_bg } else { t.bg_elev })
+            .text_size(px(10.5))
+            .text_color(if active { t.accent } else { t.text_dim })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                on(this, window, cx);
+                this.reconnect_if_active();
+                cx.notify();
+            }))
+            .child(label)
+            .into_any_element()
+    }
+
+    fn bal_title(text: &str, t: Theme) -> AnyElement {
+        div()
+            .pt(px(4.0))
+            .text_size(px(11.0))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(t.text_soft)
+            .child(text.to_string())
+            .into_any_element()
+    }
+
+    fn bal_hint(text: &str, t: Theme) -> AnyElement {
+        div()
+            .text_size(px(10.0))
+            .text_color(t.text_mute)
+            .child(text.to_string())
+            .into_any_element()
+    }
+
+    fn bal_row(chips: Vec<AnyElement>) -> AnyElement {
+        div()
+            .w_full()
+            .flex()
+            .flex_wrap()
+            .gap(px(5.0))
+            .children(chips)
+            .into_any_element()
+    }
+
+    fn bal_toggle_in(list: &mut Vec<String>, value: &str) {
+        if list.iter().any(|x| x.eq_ignore_ascii_case(value)) {
+            list.retain(|x| !x.eq_ignore_ascii_case(value));
+        } else {
+            list.push(value.to_string());
+        }
+    }
+
+    fn render_balancer_modal(
+        &self,
+        m: LayoutMetrics,
+        t: Theme,
+        max_h: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let en = self.is_en();
+        let pf = &self.state.vpn_prefs;
+        let mut body: Vec<AnyElement> = Vec::new();
+
+        // Live status
+        if self.vpn_status == "connected"
+            && let Some(lb) = self.live_balancer.as_ref()
+        {
+            let mode = lb.get("mode").and_then(Value::as_str).unwrap_or("-");
+            let now = lb
+                .get("now")
+                .or_else(|| lb.get("selected"))
+                .and_then(Value::as_str)
+                .unwrap_or("-");
+            let cnt = lb
+                .get("all")
+                .and_then(Value::as_array)
+                .map(|a| a.len())
+                .unwrap_or(0);
+            body.push(
+                div()
+                    .w_full()
+                    .p(px(8.0))
+                    .rounded(px(8.0))
+                    .bg(t.green_bg)
+                    .border_1()
+                    .border_color(t.green_border)
+                    .text_size(px(10.5))
+                    .text_color(t.green)
+                    .child(if en {
+                        format!("Active node: {now} · core mode: {mode} · nodes in pool: {cnt}")
+                    } else {
+                        format!("Активный узел: {now} · режим ядра: {mode} · узлов: {cnt}")
+                    })
+                    .into_any_element(),
+            );
+        }
+
+        // Multi-URL
+        body.push(Self::bal_title(
+            self.tr(
+                "Мульти-URL балансировщик по сервисам",
+                "Per-service multi-URL balancer",
+            ),
+            t,
+        ));
+        body.push(Self::bal_hint(
+            self.tr(
+                "Отдельный пул urltest со своим проверочным URL для каждого сервиса. Работает, когда выбран балансировщик.",
+                "A dedicated urltest pool with its own probe URL per service. Active when a balancer is selected.",
+            ),
+            t,
+        ));
+        let multi_on = pf.balancer_multi_service;
+        let mut svc_chips = vec![self.bal_chip(
+            "multi-toggle".into(),
+            if multi_on {
+                self.tr("Включён", "Enabled").to_string()
+            } else {
+                self.tr("Выключен", "Disabled").to_string()
+            },
+            multi_on,
+            t,
+            cx,
+            |this, _, _| {
+                this.state.vpn_prefs.balancer_multi_service =
+                    !this.state.vpn_prefs.balancer_multi_service;
+            },
+        )];
+        for (sid, title) in [
+            ("youtube", "YouTube"),
+            ("telegram", "Telegram"),
+            ("discord", "Discord"),
+            ("instagram", "Instagram"),
+            ("openai", "ChatGPT / AI"),
+            ("https", "HTTPS"),
+        ] {
+            let active = pf.balancer_multi_services.iter().any(|x| x == sid);
+            svc_chips.push(self.bal_chip(
+                format!("svc-{sid}"),
+                title.to_string(),
+                active,
+                t,
+                cx,
+                move |this, _, _| {
+                    let list = &mut this.state.vpn_prefs.balancer_multi_services;
+                    if list.iter().any(|x| x == sid) {
+                        // хотя бы один сервис должен остаться выбранным
+                        if list.len() > 1 {
+                            list.retain(|x| x != sid);
+                        }
+                    } else {
+                        list.push(sid.to_string());
+                    }
+                },
+            ));
+        }
+        body.push(Self::bal_row(svc_chips));
+
+        // Algorithms
+        body.push(Self::bal_title(
+            self.tr("Алгоритм выбора узла", "Node selection algorithm"),
+            t,
+        ));
+        const MODES: [(&str, &str, &str, &str, &str, &str); 12] = [
+            (
+                "stability",
+                "Стабильность (EWMA + Jitter)",
+                "Stability (EWMA + Jitter)",
+                "STABILITY",
+                "Сглаженный пинг с учётом джиттера и автокарантином нестабильных узлов",
+                "Smoothed latency with jitter and auto-quarantine of unstable nodes",
+            ),
+            (
+                "least_test",
+                "Минимальный пинг (Least Test)",
+                "Lowest ping (Least Test)",
+                "LEAST RTT",
+                "Переключение на сервер с наименьшей задержкой отклика",
+                "Switch to the server with the lowest response latency",
+            ),
+            (
+                "sticky",
+                "Липкие сессии (Sticky Hash)",
+                "Sticky sessions (Sticky Hash)",
+                "STICKY",
+                "Привязка доменов и IP к одному узлу из пула без смены выходного адреса",
+                "Pin domains and IPs to one pool node without changing the exit address",
+            ),
+            (
+                "least_load",
+                "Наименьшая нагрузка (Least Load)",
+                "Least load",
+                "LEAST LOAD",
+                "Выбор менее загруженного узла с учётом активных соединений (Power of 2)",
+                "Pick the less loaded node by active connections (Power of 2)",
+            ),
+            (
+                "weighted",
+                "Взвешенный (Smooth WRR)",
+                "Weighted (Smooth WRR)",
+                "WEIGHTED",
+                "Распределение потоков пропорционально скорости отклика серверов",
+                "Distribute flows proportionally to server response speed",
+            ),
+            (
+                "hedged",
+                "Параллельный старт (Hedged)",
+                "Parallel start (Hedged)",
+                "HEDGED",
+                "Резервная попытка через второй узел при задержке рукопожатия",
+                "Backup attempt via a second node when the handshake is slow",
+            ),
+            (
+                "throughput",
+                "Пиковая скорость (Throughput)",
+                "Peak speed (Throughput)",
+                "THROUGHPUT",
+                "Приоритет узлу с максимальной измеренной пропускной способностью",
+                "Prefer the node with the highest measured throughput",
+            ),
+            (
+                "passive",
+                "Пассивный (Zero Probes)",
+                "Passive (Zero Probes)",
+                "PASSIVE",
+                "Без фоновых HTTP-проб, переключение только при ошибке соединения",
+                "No background HTTP probes, switch only on connection failure",
+            ),
+            (
+                "priority",
+                "Приоритетный (Priority Tier)",
+                "Priority (Priority Tier)",
+                "PRIORITY",
+                "Строгий порядок по списку с автовозвратом на основной сервер",
+                "Strict list order with automatic return to the primary server",
+            ),
+            (
+                "quota",
+                "Квота трафика (Quota)",
+                "Traffic quota (Quota)",
+                "QUOTA",
+                "Автоматическая ротация серверов по лимиту переданных мегабайт",
+                "Rotate servers automatically by transferred megabytes",
+            ),
+            (
+                "round_robin",
+                "По кругу (Round Robin)",
+                "Round Robin",
+                "ROUND ROBIN",
+                "Равномерное чередование быстрых серверов из Top-N пула",
+                "Even rotation across the fastest servers of the Top-N pool",
+            ),
+            (
+                "failover",
+                "Отказоустойчивый (Failover)",
+                "Failover",
+                "FAILOVER",
+                "Удержание текущего рабочего узла до полного отказа",
+                "Keep the current working node until it fails completely",
+            ),
+        ];
+        for (id, ru_t, en_t, badge, ru_s, en_s) in MODES {
+            let active = pf.balancer_mode == id;
+            body.push(
+                div()
+                    .id(SharedString::from(format!("balc-mode-{id}")))
+                    .w_full()
+                    .px(px(9.0))
+                    .py(px(6.0))
+                    .rounded(px(7.0))
+                    .cursor_pointer()
+                    .bg(if active { t.accent_bg } else { t.bg_elev })
+                    .border_1()
+                    .border_color(if active { t.accent_border } else { t.border })
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.state.vpn_prefs.balancer_mode = id.to_string();
+                        this.reconnect_if_active();
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(if active { t.accent } else { t.text })
+                                    .child(if en { en_t } else { ru_t }),
+                            )
+                            .child(
+                                div()
+                                    .px(px(4.0))
+                                    .rounded(px(3.0))
+                                    .bg(t.bg_card)
+                                    .text_size(px(9.0))
+                                    .text_color(if active { t.accent } else { t.text_mute })
+                                    .child(badge),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(t.text_mute)
+                            .child(if en { en_s } else { ru_s }),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        // Pool / tolerance / interval
+        body.push(Self::bal_title(
+            self.tr("Кандидатов в пуле (Top-N)", "Candidates in pool (Top-N)"),
+            t,
+        ));
+        body.push(Self::bal_row(
+            [2usize, 3, 4, 6, 8, 12, 16, 24]
+                .into_iter()
+                .map(|n| {
+                    self.bal_chip(
+                        format!("pool-{n}"),
+                        format!("Top-{n}"),
+                        pf.balancer_pool == n,
+                        t,
+                        cx,
+                        move |this, _, _| this.state.vpn_prefs.balancer_pool = n,
+                    )
+                })
+                .collect(),
+        ));
+        body.push(Self::bal_title(
+            self.tr(
+                "Допуск гистерезиса по задержке",
+                "Latency hysteresis tolerance",
+            ),
+            t,
+        ));
+        body.push(Self::bal_hint(
+            self.tr(
+                "Защищает от лишних переключений при небольших колебаниях пинга.",
+                "Prevents needless switching on small ping fluctuations.",
+            ),
+            t,
+        ));
+        body.push(Self::bal_row(
+            [30u32, 50, 80, 120, 200]
+                .into_iter()
+                .map(|ms| {
+                    self.bal_chip(
+                        format!("tol-{ms}"),
+                        format!("{ms} ms"),
+                        pf.balancer_tolerance == ms,
+                        t,
+                        cx,
+                        move |this, _, _| this.state.vpn_prefs.balancer_tolerance = ms,
+                    )
+                })
+                .collect(),
+        ));
+        body.push(Self::bal_title(
+            self.tr("Интервал проверки доступности", "Probe interval"),
+            t,
+        ));
+        body.push(Self::bal_row(
+            ["15s", "30s", "1m", "3m", "5m"]
+                .into_iter()
+                .map(|iv| {
+                    self.bal_chip(
+                        format!("iv-{iv}"),
+                        iv.to_string(),
+                        pf.balancer_interval == iv,
+                        t,
+                        cx,
+                        move |this, _, _| this.state.vpn_prefs.balancer_interval = iv.to_string(),
+                    )
+                })
+                .collect(),
+        ));
+
+        // URL test
+        body.push(Self::bal_title(
+            self.tr(
+                "URL проверки доступности (URL-Test)",
+                "Probe URL (URL-Test)",
+            ),
+            t,
+        ));
+        body.push(Self::bal_row(
+            [
+                ("https://www.gstatic.com/generate_204", "Gstatic (HTTPS)"),
+                ("http://cp.cloudflare.com/generate_204", "Cloudflare (HTTP)"),
+                (
+                    "https://cp.cloudflare.com/generate_204",
+                    "Cloudflare (HTTPS)",
+                ),
+                (
+                    "http://connectivitycheck.gstatic.com/generate_204",
+                    "Connectivity check",
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (url, label))| {
+                self.bal_chip(
+                    format!("url-{i}"),
+                    label.to_string(),
+                    pf.balancer_url == url,
+                    t,
+                    cx,
+                    move |this, window, cx| {
+                        this.state.vpn_prefs.balancer_url = url.to_string();
+                        this.bal_url_input_state
+                            .update(cx, |st, cx| st.set_value(url, window, cx));
+                    },
+                )
+            })
+            .collect(),
+        ));
+        body.push(
+            div()
+                .w_full()
+                .h(px(30.0))
+                .child(styled_input(&self.bal_url_input_state, px(30.0), 11.0, t))
+                .into_any_element(),
+        );
+        body.push(Self::bal_hint(
+            self.tr(
+                "Свой http/https адрес (200/204). Применяется по Enter.",
+                "Custom http/https address (200/204). Applied on Enter.",
+            ),
+            t,
+        ));
+
+        // Sticky keys
+        if pf.balancer_mode == "sticky" {
+            body.push(Self::bal_title(
+                self.tr(
+                    "Ключи консистентного хеширования (Sticky)",
+                    "Consistent-hash keys (Sticky)",
+                ),
+                t,
+            ));
+            body.push(Self::bal_row(
+                [
+                    ("domain", "Домен (SNI)", "Domain (SNI)"),
+                    ("dest_ip", "IP назначения", "Destination IP"),
+                    ("dest_port", "Порт", "Port"),
+                    ("source_ip", "IP источника", "Source IP"),
+                    ("process", "Процесс", "Process"),
+                ]
+                .into_iter()
+                .map(|(key, ru, enl)| {
+                    let active = pf.balancer_sticky_hash.iter().any(|x| x == key);
+                    self.bal_chip(
+                        format!("sticky-{key}"),
+                        (if en { enl } else { ru }).to_string(),
+                        active,
+                        t,
+                        cx,
+                        move |this, _, _| {
+                            let list = &mut this.state.vpn_prefs.balancer_sticky_hash;
+                            if list.iter().any(|x| x == key) {
+                                if list.len() > 1 {
+                                    list.retain(|x| x != key);
+                                }
+                            } else {
+                                list.push(key.to_string());
+                            }
+                        },
+                    )
+                })
+                .collect(),
+            ));
+        }
+
+        // Quota
+        if pf.balancer_mode == "quota" {
+            body.push(Self::bal_title(
+                self.tr("Квота трафика на один узел", "Traffic quota per node"),
+                t,
+            ));
+            body.push(Self::bal_row(
+                [0u32, 100, 256, 512, 1024, 2048]
+                    .into_iter()
+                    .map(|q| {
+                        let lbl = if q == 0 {
+                            self.tr("Выкл", "Off").to_string()
+                        } else if q >= 1024 {
+                            if en {
+                                format!("{} GB", q / 1024)
+                            } else {
+                                format!("{} ГБ", q / 1024)
+                            }
+                        } else if en {
+                            format!("{q} MB")
+                        } else {
+                            format!("{q} МБ")
+                        };
+                        self.bal_chip(
+                            format!("quota-{q}"),
+                            lbl,
+                            pf.balancer_quota_mib == q,
+                            t,
+                            cx,
+                            move |this, _, _| this.state.vpn_prefs.balancer_quota_mib = q,
+                        )
+                    })
+                    .collect(),
+            ));
+        }
+
+        // Filters: countries
+        body.push(Self::bal_title(
+            self.tr("Исключить страны", "Exclude countries"),
+            t,
+        ));
+        let mut country_chips: Vec<AnyElement> = balancer_country_presets()
+            .map(|(code, title)| {
+                let active = pf
+                    .balancer_excluded_countries
+                    .iter()
+                    .any(|x| x.eq_ignore_ascii_case(code));
+                let _ = title;
+                let flag_opt = flag_image(&code.to_ascii_lowercase());
+                div()
+                    .id(SharedString::from(format!("balc-cc-{code}")))
+                    .px(px(7.0))
+                    .py(px(3.0))
+                    .rounded(px(5.0))
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(if active { t.accent_border } else { t.border })
+                    .bg(if active { t.accent_bg } else { t.bg_elev })
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .text_size(px(10.5))
+                    .text_color(if active { t.accent } else { t.text_dim })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        Self::bal_toggle_in(
+                            &mut this.state.vpn_prefs.balancer_excluded_countries,
+                            code,
+                        );
+                        let txt = this.state.vpn_prefs.balancer_excluded_countries.join(", ");
+                        this.bal_words_input_state
+                            .update(cx, |st, cx| st.set_value(txt, window, cx));
+                        this.reconnect_if_active();
+                        cx.notify();
+                    }))
+                    .when_some(flag_opt, |el, fimg| {
+                        el.child(img(fimg).w(px(14.0)).h(px(10.0)).rounded(px(2.0)))
+                    })
+                    .child(code.to_string())
+                    .into_any_element()
+            })
+            .collect();
+        country_chips.push(self.bal_chip(
+            "cc-reset".into(),
+            self.tr("Сбросить", "Reset").to_string(),
+            false,
+            t,
+            cx,
+            |this, window, cx| {
+                this.state.vpn_prefs.balancer_excluded_countries.clear();
+                this.bal_words_input_state
+                    .update(cx, |st, cx| st.set_value("", window, cx));
+            },
+        ));
+        body.push(Self::bal_row(country_chips));
+        body.push(
+            div()
+                .w_full()
+                .h(px(30.0))
+                .child(styled_input(&self.bal_words_input_state, px(30.0), 11.0, t))
+                .into_any_element(),
+        );
+        body.push(Self::bal_hint(
+            self.tr(
+                "Коды стран или слова через запятую. Применяется по Enter.",
+                "Country codes or words separated by commas. Applied on Enter.",
+            ),
+            t,
+        ));
+
+        // Filters: protocols
+        body.push(Self::bal_title(
+            self.tr("Исключить протоколы", "Exclude protocols"),
+            t,
+        ));
+        let mut proto_chips: Vec<AnyElement> = [
+            ("vless", "VLESS"),
+            ("tewfai", "Tewfai"),
+            ("wdtt", "WDTT / CSQTT"),
+            ("vmess", "VMess"),
+            ("trojan", "Trojan"),
+            ("shadowsocks", "Shadowsocks"),
+            ("hysteria2", "Hysteria 2"),
+            ("tuic", "TUIC"),
+            ("wireguard", "WireGuard / AWG"),
+            ("anytls", "AnyTLS"),
+            ("naive", "NaiveProxy"),
+            ("snell", "Snell"),
+            ("shadowtls", "ShadowTLS"),
+            ("fptn", "FPTN"),
+            ("masque", "MASQUE"),
+            ("mieru", "Mieru"),
+            ("trusttunnel", "TrustTunnel"),
+            ("openconnect", "OpenConnect"),
+            ("openvpn-client", "OpenVPN"),
+            ("tailscale", "Tailscale"),
+            ("mtproto", "MTProto"),
+            ("ssh", "SSH"),
+            ("socks", "SOCKS / HTTP"),
+        ]
+        .into_iter()
+        .map(|(id, label)| {
+            let active = pf.balancer_excluded_protocols.iter().any(|x| x == id);
+            self.bal_chip(
+                format!("proto-{id}"),
+                label.to_string(),
+                active,
+                t,
+                cx,
+                move |this, _, _| {
+                    Self::bal_toggle_in(&mut this.state.vpn_prefs.balancer_excluded_protocols, id)
+                },
+            )
+        })
+        .collect();
+        proto_chips.push(self.bal_chip(
+            "proto-reset".into(),
+            self.tr("Сбросить", "Reset").to_string(),
+            false,
+            t,
+            cx,
+            |this, _, _| this.state.vpn_prefs.balancer_excluded_protocols.clear(),
+        ));
+        body.push(Self::bal_row(proto_chips));
+
+        // Filters: RegExp
+        body.push(Self::bal_title(
+            self.tr("Фильтр по регулярному выражению (RegExp)", "RegExp filter"),
+            t,
+        ));
+        body.push(Self::bal_hint(
+            self.tr(
+                "Оставить только серверы с нужным шаблоном или скрыть лишние. Применяется по Enter.",
+                "Keep only matching servers or hide unwanted ones. Applied on Enter.",
+            ),
+            t,
+        ));
+        body.push(Self::bal_hint(self.tr("Включить:", "Include:"), t));
+        body.push(
+            div()
+                .w_full()
+                .h(px(30.0))
+                .child(styled_input(
+                    &self.bal_include_input_state,
+                    px(30.0),
+                    11.0,
+                    t,
+                ))
+                .into_any_element(),
+        );
+        body.push(Self::bal_hint(self.tr("Исключить:", "Exclude:"), t));
+        body.push(
+            div()
+                .w_full()
+                .h(px(30.0))
+                .child(styled_input(
+                    &self.bal_exclude_input_state,
+                    px(30.0),
+                    11.0,
+                    t,
+                ))
+                .into_any_element(),
+        );
+        body.push(Self::bal_row(vec![self.bal_chip(
+            "re-reset".into(),
+            self.tr("Сбросить RegExp", "Reset RegExp").to_string(),
+            false,
+            t,
+            cx,
+            |this, window, cx| {
+                this.state.vpn_prefs.balancer_include_regex.clear();
+                this.state.vpn_prefs.balancer_exclude_regex.clear();
+                this.bal_include_input_state
+                    .update(cx, |st, cx| st.set_value("", window, cx));
+                this.bal_exclude_input_state
+                    .update(cx, |st, cx| st.set_value("", window, cx));
+            },
+        )]));
+
+        div()
+            .id("modal-backdrop-balancer")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .p(px(12.0))
+            .occlude()
+            .bg(gpui::rgba(0x000000A6))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w(px((m.width - 32.0).clamp(300.0, 660.0)))
+                    .h(px(max_h.min(640.0)))
+                    .p(px(16.0))
+                    .rounded(px(14.0))
+                    .bg(t.bg_card)
+                    .border_1()
+                    .border_color(t.border_hi)
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.0))
+                    .child(
+                        div()
+                            .w_full()
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(14.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(t.text)
+                                    .child(
+                                        self.tr("Настройки балансировщика", "Balancer settings"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("btn-close-balancer-modal")
+                                    .w(px(26.0))
+                                    .h(px(26.0))
+                                    .rounded(px(6.0))
+                                    .bg(t.bg_elev)
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let mut changed = false;
+                                        let u = this
+                                            .bal_url_input_state
+                                            .read(cx)
+                                            .value()
+                                            .trim()
+                                            .to_string();
+                                        if (u.starts_with("http://") || u.starts_with("https://"))
+                                            && u != this.state.vpn_prefs.balancer_url
+                                        {
+                                            this.state.vpn_prefs.balancer_url = u;
+                                            changed = true;
+                                        }
+                                        let inc = this
+                                            .bal_include_input_state
+                                            .read(cx)
+                                            .value()
+                                            .trim()
+                                            .to_string();
+                                        if inc != this.state.vpn_prefs.balancer_include_regex {
+                                            this.state.vpn_prefs.balancer_include_regex = inc;
+                                            changed = true;
+                                        }
+                                        let exc = this
+                                            .bal_exclude_input_state
+                                            .read(cx)
+                                            .value()
+                                            .trim()
+                                            .to_string();
+                                        if exc != this.state.vpn_prefs.balancer_exclude_regex {
+                                            this.state.vpn_prefs.balancer_exclude_regex = exc;
+                                            changed = true;
+                                        }
+                                        let words: Vec<String> = this
+                                            .bal_words_input_state
+                                            .read(cx)
+                                            .value()
+                                            .split(',')
+                                            .map(|x| x.trim().to_string())
+                                            .filter(|x| !x.is_empty())
+                                            .collect();
+                                        if words != this.state.vpn_prefs.balancer_excluded_countries
+                                        {
+                                            this.state.vpn_prefs.balancer_excluded_countries =
+                                                words;
+                                            changed = true;
+                                        }
+                                        if changed {
+                                            this.reconnect_if_active();
+                                        }
+                                        this.modal = ModalKind::None;
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        svg()
+                                            .path("icons/close.svg")
+                                            .size(px(12.0))
+                                            .text_color(t.text_dim),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("balancer-modal-scroll")
+                            .flex_1()
+                            .min_h(px(0.0))
+                            .w_full()
+                            .overflow_y_scroll()
+                            .child(div().w_full().flex().flex_col().gap(px(7.0)).children(body)),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_modal_overlay(
         &self,
         m: LayoutMetrics,
@@ -9943,6 +11452,7 @@ impl TachyonApp {
         let modal_max_h = (m.height - 48.0).max(260.0);
         match self.modal {
             ModalKind::None => None,
+            ModalKind::Balancer => Some(self.render_balancer_modal(m, t, modal_max_h, cx)),
             ModalKind::Subscriptions => Some(
                 div()
                     .id("modal-backdrop-subs")
@@ -10213,7 +11723,61 @@ impl TachyonApp {
                                         div()
                                             .flex()
                                             .flex_wrap()
+                                            .items_center()
                                             .gap(px(6.0))
+                                            .children(
+                                                ["all", "debug", "info", "warn", "error"]
+                                                    .into_iter()
+                                                    .map(|flvl| {
+                                                        let act = this_log_filter_eq(
+                                                            &self.log_filter_level,
+                                                            flvl,
+                                                        );
+                                                        div()
+                                                            .id(SharedString::from(format!(
+                                                                "log-flt-{flvl}"
+                                                            )))
+                                                            .px(px(7.0))
+                                                            .py(px(3.0))
+                                                            .rounded(px(5.0))
+                                                            .cursor_pointer()
+                                                            .bg(if act {
+                                                                t.accent_bg
+                                                            } else {
+                                                                t.bg_elev
+                                                            })
+                                                            .border_1()
+                                                            .border_color(if act {
+                                                                t.accent_border
+                                                            } else {
+                                                                t.border
+                                                            })
+                                                            .text_size(px(10.0))
+                                                            .font_weight(FontWeight::SEMIBOLD)
+                                                            .text_color(if act {
+                                                                t.accent
+                                                            } else {
+                                                                t.text_dim
+                                                            })
+                                                            .on_click(cx.listener(
+                                                                move |this, _, _, cx| {
+                                                                    this.log_filter_level =
+                                                                        flvl.to_string();
+                                                                    this.log_tail = this
+                                                                        .vpn
+                                                                        .get_log_tail_filtered(
+                                                                            200, flvl,
+                                                                        );
+                                                                    cx.notify();
+                                                                },
+                                                            ))
+                                                            .child(if flvl == "all" {
+                                                                self.tr("Все", "All").to_string()
+                                                            } else {
+                                                                flvl.to_uppercase()
+                                                            })
+                                                    }),
+                                            )
                                             .child(
                                                 div()
                                                     .id("btn-refresh-log")
@@ -10225,10 +11789,45 @@ impl TachyonApp {
                                                     .text_size(px(11.0))
                                                     .text_color(t.text_soft)
                                                     .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.log_tail = this.vpn.get_log_tail(140);
+                                                        this.log_tail =
+                                                            this.vpn.get_log_tail_filtered(
+                                                                200,
+                                                                &this.log_filter_level,
+                                                            );
+                                                        let cnt = this
+                                                            .log_tail
+                                                            .lines()
+                                                            .filter(|l| !l.trim().is_empty())
+                                                            .count();
+                                                        this.show_toast(if this.is_en() {
+                                                            format!("Log refreshed: {cnt} lines")
+                                                        } else {
+                                                            format!("Лог обновлён: {cnt} строк")
+                                                        });
                                                         cx.notify();
                                                     }))
                                                     .child(self.tr("Обновить", "Refresh")),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("btn-clear-log")
+                                                    .px(px(10.0))
+                                                    .py(px(4.0))
+                                                    .rounded(px(6.0))
+                                                    .bg(t.bg_elev)
+                                                    .cursor_pointer()
+                                                    .hover(|s| s.bg(t.red_bg))
+                                                    .text_size(px(11.0))
+                                                    .text_color(t.red)
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.vpn.clear_log_file();
+                                                        this.log_tail.clear();
+                                                        this.show_toast(
+                                                            this.tr("Журнал очищен", "Log cleared"),
+                                                        );
+                                                        cx.notify();
+                                                    }))
+                                                    .child(self.tr("Очистить", "Clear")),
                                             )
                                             .child(
                                                 div()
@@ -10292,9 +11891,38 @@ impl TachyonApp {
                                     .text_size(px(10.5))
                                     .text_color(t.text_soft)
                                     .child(if self.log_tail.trim().is_empty() {
-                                        self.tr("Журнал пуст.", "Log is empty.").to_string()
+                                        div()
+                                            .w_full()
+                                            .text_color(t.text_dim)
+                                            .child(
+                                                self.tr("Журнал пуст.", "Log is empty.")
+                                                    .to_string(),
+                                            )
+                                            .into_any_element()
                                     } else {
-                                        self.log_tail.clone()
+                                        div()
+                                            .w_full()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(2.0))
+                                            .children(self.log_tail.lines().map(|line| {
+                                                let col = if line.contains("[ERROR]")
+                                                    || line.contains("[FATAL]")
+                                                {
+                                                    t.red
+                                                } else if line.contains("[WARN]") {
+                                                    t.amber
+                                                } else if line.contains("[DEBUG]") {
+                                                    t.text_dim
+                                                } else {
+                                                    t.text_soft
+                                                };
+                                                div()
+                                                    .w_full()
+                                                    .text_color(col)
+                                                    .child(line.to_string())
+                                            }))
+                                            .into_any_element()
                                     }),
                             ),
                     )
@@ -10435,9 +12063,13 @@ fn pick_conf_files_native() -> Vec<PathBuf> {
     Vec::new()
 }
 
+fn this_log_filter_eq(cur: &str, candidate: &str) -> bool {
+    cur.trim().eq_ignore_ascii_case(candidate)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{adaptive_card_width, parse_custom_rule_entries};
+    use super::{adaptive_card_width, parse_custom_rule_entries, parse_duration_secs};
 
     #[test]
     fn test_adaptive_card_width_fits_all_viewports() {
@@ -10496,5 +12128,21 @@ mod tests {
             parse_custom_rule_entries("domain", "keyword:googlevideo"),
             vec![("domain".to_string(), "keyword:googlevideo".to_string())]
         );
+    }
+
+    #[test]
+    fn test_parse_duration_secs() {
+        assert_eq!(parse_duration_secs("60"), Some(60));
+        assert_eq!(parse_duration_secs("60s"), Some(60));
+        assert_eq!(parse_duration_secs("60с"), Some(60));
+        assert_eq!(parse_duration_secs("10m"), Some(600));
+        assert_eq!(parse_duration_secs("10м"), Some(600));
+        assert_eq!(parse_duration_secs("1h"), Some(3600));
+        assert_eq!(parse_duration_secs("2ч"), Some(7200));
+        assert_eq!(parse_duration_secs("2"), Some(5));
+        assert_eq!(parse_duration_secs("48h"), Some(86_400));
+        assert_eq!(parse_duration_secs("0"), None);
+        assert_eq!(parse_duration_secs(""), None);
+        assert_eq!(parse_duration_secs("abc"), None);
     }
 }

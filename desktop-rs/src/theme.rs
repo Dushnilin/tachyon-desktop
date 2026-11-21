@@ -18,6 +18,7 @@ pub struct Theme {
     pub bg_card: Rgba,
     pub bg_elev: Rgba,
     pub bg_hover: Rgba,
+    #[allow(dead_code)]
     pub bg_glass: Rgba,
     pub border: Rgba,
     pub border_hi: Rgba,
@@ -26,6 +27,7 @@ pub struct Theme {
     pub text_dim: Rgba,
     pub text_mute: Rgba,
     pub accent: Rgba,
+    #[allow(dead_code)]
     pub accent_2: Rgba,
     pub accent_bg: Rgba,
     pub accent_border: Rgba,

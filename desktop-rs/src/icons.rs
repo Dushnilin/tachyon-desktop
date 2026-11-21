@@ -119,10 +119,10 @@ pub fn flag_image(cc: &str) -> Option<Arc<Image>> {
         return None;
     }
     let cache = FLAG_IMAGE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(guard) = cache.lock() {
-        if let Some(found) = guard.get(&clean) {
-            return found.clone();
-        }
+    if let Ok(guard) = cache.lock()
+        && let Some(found) = guard.get(&clean)
+    {
+        return found.clone();
     }
     let img = render_flag_png(&clean)
         .map(|png_bytes| Arc::new(Image::from_bytes(ImageFormat::Png, png_bytes)))

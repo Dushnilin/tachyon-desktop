@@ -8,7 +8,10 @@ mod imp {
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread::JoinHandle;
 
-    use windows_sys::Win32::Foundation::{BOOL, HMODULE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+    use windows_sys::Win32::Foundation::{
+        BOOL, CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HMODULE, HWND, LPARAM, LRESULT,
+        POINT, WPARAM,
+    };
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
     use windows_sys::Win32::UI::Shell::{
@@ -16,18 +19,20 @@ mod imp {
         Shell_NotifyIconW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-        DispatchMessageW, EnumThreadWindows, GW_OWNER, GetCursorPos, GetMessageW, GetWindow,
-        GetWindowTextW, IDI_APPLICATION, IsIconic, IsWindow, IsWindowVisible, IsZoomed, LoadIconW,
-        MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassW,
-        RegisterWindowMessageW, SW_HIDE, SW_MAXIMIZE, SW_RESTORE, SW_SHOW, SetForegroundWindow,
-        ShowWindow, ShowWindowAsync, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON,
-        TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY,
-        WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
+        AllowSetForegroundWindow, AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+        DestroyMenu, DestroyWindow, DispatchMessageW, EnumThreadWindows, FindWindowW, GW_OWNER,
+        GetCursorPos, GetMessageW, GetWindow, GetWindowTextW, IDI_APPLICATION, IsIconic, IsWindow,
+        IsWindowVisible, IsZoomed, LoadIconW, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG,
+        PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SW_HIDE,
+        SW_MAXIMIZE, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow, ShowWindowAsync,
+        TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP,
+        WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL,
+        WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
     };
 
     const WM_APP_TRAY: u32 = WM_APP + 1;
     const WM_APP_UPDATE_TIP: u32 = WM_APP + 2;
+    const WM_APP_SHOW_MAIN: u32 = WM_APP + 3;
 
     const TRAY_ICON_ID: u32 = 1;
     const IDM_SHOW: usize = 1001;
@@ -35,6 +40,7 @@ mod imp {
     const IDM_EXIT: usize = 1003;
 
     static EVENT_QUEUE: OnceLock<Arc<Mutex<Vec<String>>>> = OnceLock::new();
+    static INSTANCE_MUTEX: AtomicIsize = AtomicIsize::new(0);
     static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
     static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
     static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
@@ -184,6 +190,10 @@ mod imp {
             }
             WM_APP_UPDATE_TIP => {
                 unsafe { add_or_update_tray_icon(hwnd, false) };
+                0
+            }
+            WM_APP_SHOW_MAIN => {
+                show_from_tray();
                 0
             }
             WM_COMMAND => {
@@ -390,6 +400,46 @@ mod imp {
         }
     }
 
+    pub fn acquire_single_instance_or_focus_existing() -> bool {
+        unsafe extern "system" {
+            fn CreateMutexW(
+                lp_mutex_attributes: *const std::ffi::c_void,
+                b_initial_owner: i32,
+                lp_name: *const u16,
+            ) -> windows_sys::Win32::Foundation::HANDLE;
+        }
+        let name = to_wide("Local\\TachyonDesktopSingleInstance");
+        let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+        if handle.is_null() {
+            return true;
+        }
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            unsafe {
+                let _ = CloseHandle(handle);
+                let _ = AllowSetForegroundWindow(0xFFFF_FFFF);
+                let tray_cls = to_wide("TachyonTrayMsgWindow");
+                let tray_hwnd = FindWindowW(tray_cls.as_ptr(), std::ptr::null());
+                if !tray_hwnd.is_null() {
+                    let _ = PostMessageW(tray_hwnd, WM_APP_SHOW_MAIN, 0, 0);
+                } else {
+                    let win_title = to_wide("Tachyon");
+                    let win_hwnd = FindWindowW(std::ptr::null(), win_title.as_ptr());
+                    if !win_hwnd.is_null() {
+                        if IsIconic(win_hwnd) != 0 {
+                            let _ = ShowWindowAsync(win_hwnd, SW_RESTORE);
+                        } else {
+                            let _ = ShowWindowAsync(win_hwnd, SW_SHOW);
+                        }
+                        let _ = SetForegroundWindow(win_hwnd);
+                    }
+                }
+            }
+            return false;
+        }
+        INSTANCE_MUTEX.store(handle as isize, Ordering::Release);
+        true
+    }
+
     pub fn shutdown() {
         SHUTDOWN_REQ.store(true, Ordering::Release);
         let hwnd = TRAY_HWND.load(Ordering::Acquire) as HWND;
@@ -411,6 +461,33 @@ mod imp {
 mod imp {
     use std::sync::{Arc, Mutex};
 
+    #[cfg(unix)]
+    static LOCK_FILE: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+
+    pub fn acquire_single_instance_or_focus_existing() -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let lock_path = crate::vpn::app_data_dir().join("tachyon.lock");
+            if let Ok(file) = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+            {
+                let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                if rc != 0 {
+                    let err = std::io::Error::last_os_error().raw_os_error();
+                    if err == Some(libc::EWOULDBLOCK) || err == Some(libc::EAGAIN) {
+                        return false;
+                    }
+                }
+                let _ = LOCK_FILE.set(file);
+            }
+        }
+        true
+    }
+
     pub fn init(_event_queue: Arc<Mutex<Vec<String>>>) {}
     pub fn register_main_window() {}
     pub fn toggle_maximize_window() -> bool {
@@ -423,6 +500,10 @@ mod imp {
     pub fn show_from_tray() {}
     pub fn update_status(_connected: bool, _is_en: bool) {}
     pub fn shutdown() {}
+}
+
+pub fn acquire_single_instance_or_focus_existing() -> bool {
+    imp::acquire_single_instance_or_focus_existing()
 }
 
 pub fn init(event_queue: Arc<Mutex<Vec<String>>>) {
