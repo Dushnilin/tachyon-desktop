@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+#[cfg(not(target_os = "macos"))]
+use std::process::Stdio;
+use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -5194,6 +5196,7 @@ fn apply_self_binary_update(
     asset_name: &str,
 ) -> Result<bool, String> {
     let lower = asset_name.to_ascii_lowercase();
+    let _ = &lower;
 
     #[cfg(target_os = "windows")]
     {
@@ -5661,7 +5664,7 @@ mod macos_helper {
 
     use core_runtime::BoxInstance;
     use serde_json::{Value, json};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+    use tokio::io::{AsyncWriteExt, BufReader as TokioBufReader};
     use tokio::net::UnixListener;
 
     pub const HELPER_BIN: &str = "/Library/PrivilegedHelperTools/io.tachyon.desktop.helper";
@@ -5792,13 +5795,13 @@ launchctl bootstrap system '{HELPER_PLIST}' || launchctl load -w '{HELPER_PLIST}
             "do shell script \"{}\" with administrator privileges",
             shell_cmd.replace('\\', "\\\\").replace('"', "\\\"")
         );
-        let status = Command::new("osascript")
+        let osa_status = Command::new("osascript")
             .args(["-e", &osa_script])
             .status()
             .map_err(|e| format!("osascript error: {e}"))?;
         let _ = fs::remove_file(&tmp_plist);
 
-        if !status.success() {
+        if !osa_status.success() {
             return Err("Установка службы macOS отменена или завершилась с ошибкой".to_string());
         }
 

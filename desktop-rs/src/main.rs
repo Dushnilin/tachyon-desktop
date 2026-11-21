@@ -11,6 +11,7 @@ mod ui;
 mod vpn;
 
 use std::fs;
+#[cfg(not(target_os = "macos"))]
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
