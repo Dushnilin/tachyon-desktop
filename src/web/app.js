@@ -2206,8 +2206,15 @@
         { name: 'battlenet', title: 'Blizzard Battle.net', desc: 'Лаунчер и игры Blizzard Entertainment' },
         { name: 'ea', title: 'EA App / Origin', desc: 'Electronic Arts, Apex Legends, Battlefield' },
         { name: 'ubisoft', title: 'Ubisoft Connect', desc: 'Сервисы и игры Ubisoft' },
-        { name: 'playstation', title: 'PlayStation Network', desc: 'PSN, магазин и облачные функции Sony' },
-        { name: 'xbox', title: 'Xbox Live / Game Pass', desc: 'Игровые сервисы Microsoft Xbox' }
+        { name: 'consoles_all', title: 'Игровые приставки (все)', desc: 'Xbox, PlayStation, Nintendo Switch / Switch 2 и VR-гарнитуры' },
+        { name: 'consoles_cdn', title: 'CDN загрузок приставок (Direct)', desc: 'Скачивание игр и прошивок Xbox, PSN, Nintendo, Quest, SteamOS напрямую' },
+        { name: 'playstation', title: 'PlayStation Network (PSN + AS33353)', desc: 'PSN, авторизация Sony, Remote Play и подсети AS33353' },
+        { name: 'xbox', title: 'Xbox Live / Game Pass', desc: 'Xbox Live, Game Pass, вход Microsoft и Bethesda' },
+        { name: 'nintendo', title: 'Nintendo Switch / Switch 2', desc: 'eShop, Switch Online, NPLN и аккаунты Nintendo' },
+        { name: 'handheld_consoles', title: 'Портативные приставки и эмуляторы', desc: 'Steam Deck / SteamOS, ROG Ally, Legion Go, RetroArch, EmuDeck' },
+        { name: 'console_homebrew', title: 'Ретро-сети и Homebrew приставок', desc: 'Pretendo, Wiimmfi, Insignia, Switch CFW, PS HEN, HShop' },
+        { name: 'meta_quest', title: 'VR-гарнитуры (Quest / Pico / Vive)', desc: 'Meta Quest, Pico VR, HTC Vive, Pimax и Virtual Desktop' },
+        { name: 'tv_boxes', title: 'ТВ-приставки и медиаплееры', desc: 'Apple TV, Android TV, NVIDIA Shield, Fire TV, Roku, Plex, Kodi' }
       ]
     },
     {
