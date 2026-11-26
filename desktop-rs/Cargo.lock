@@ -131,6 +131,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -1074,7 +1075,7 @@ dependencies = [
 
 [[package]]
 name = "core-config"
-version = "0.6.1"
+version = "0.6.7"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1090,7 +1091,7 @@ dependencies = [
 
 [[package]]
 name = "core-crypto"
-version = "0.6.1"
+version = "0.6.7"
 dependencies = [
  "aead",
  "aes-gcm",
@@ -1117,12 +1118,13 @@ dependencies = [
  "sha2 0.10.9",
  "sha3",
  "signature",
+ "subtle",
  "x25519-dalek",
 ]
 
 [[package]]
 name = "core-experimental"
-version = "0.6.1"
+version = "0.6.7"
 
 [[package]]
 name = "core-foundation"
@@ -1213,7 +1215,7 @@ dependencies = [
 
 [[package]]
 name = "core-runtime"
-version = "0.6.1"
+version = "0.6.7"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1243,7 +1245,6 @@ dependencies = [
  "http",
  "if-addrs",
  "libc",
- "log",
  "lru",
  "lz4_flex",
  "md-5",
@@ -1283,7 +1284,7 @@ dependencies = [
 
 [[package]]
 name = "core-tls"
-version = "0.6.1"
+version = "0.6.7"
 dependencies = [
  "aes-gcm",
  "brotli",
@@ -2282,10 +2283,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
 dependencies = [
  "cfg-if",
- "js-sys",
  "libc",
  "wasi",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -6985,7 +6984,7 @@ dependencies = [
 
 [[package]]
 name = "tachyon-desktop"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

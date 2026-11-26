@@ -8,7 +8,7 @@ ROOT_DIR="$(cd "${PROJECT_DIR}/.." && pwd)"
 VERSION="${1:-}"
 if [[ -z "${VERSION}" ]]; then
   VERSION="$(awk -F'=' '/^version[[:space:]]*=/{gsub(/["[:space:]]/, "", $2); print $2; exit}' "${PROJECT_DIR}/Cargo.toml")"
-  VERSION="${VERSION:-0.4.1}"
+  VERSION="${VERSION:-0.4.2}"
 fi
 VERSION="${VERSION#v}"
 ARCH_RAW="$(uname -m)"

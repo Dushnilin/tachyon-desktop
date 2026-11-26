@@ -13,7 +13,7 @@ if ([string]::IsNullOrWhiteSpace($Version)) {
     if ($CargoLine) {
         $Version = $CargoLine.Matches[0].Groups[1].Value
     } else {
-        $Version = "0.4.1"
+        $Version = "0.4.2"
     }
 }
 $Version = $Version.TrimStart('v')
@@ -64,7 +64,7 @@ if ((-not (Test-Path -LiteralPath $BannerBmp)) -or (-not (Test-Path -LiteralPath
 if ($Version -match '^(\d+\.\d+\.\d+)') {
     $MsiVersion = $Matches[1]
 } else {
-    $MsiVersion = "0.4.1"
+    $MsiVersion = "0.4.2"
 }
 
 Write-Host "==> Building Windows Installer MSI (v$MsiVersion)..."
