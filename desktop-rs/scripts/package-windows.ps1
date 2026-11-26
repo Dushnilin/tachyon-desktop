@@ -1,14 +1,22 @@
 ﻿param(
-    [string]$Version = "0.4.1"
+    [string]$Version = ""
 )
 
 $ErrorActionPreference = "Stop"
 
-$Version = $Version.TrimStart('v')
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectDir = Split-Path -Parent $ScriptDir
 $RootDir = Split-Path -Parent $ProjectDir
 $ManifestPath = Join-Path $ProjectDir "Cargo.toml"
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    $CargoLine = Select-String -Path $ManifestPath -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+    if ($CargoLine) {
+        $Version = $CargoLine.Matches[0].Groups[1].Value
+    } else {
+        $Version = "0.4.1"
+    }
+}
+$Version = $Version.TrimStart('v')
 $TargetExe = Join-Path $ProjectDir "target\release\tachyon.exe"
 $DistDir = Join-Path $RootDir "dist"
 
@@ -47,6 +55,9 @@ $DialogBmp = Join-Path $WixDir "dialog.bmp"
 if ((-not (Test-Path -LiteralPath $BannerBmp)) -or (-not (Test-Path -LiteralPath $DialogBmp))) {
     $GenScript = Join-Path $WixDir "generate-branding.ps1"
     & powershell -ExecutionPolicy Bypass -File $GenScript -OutDir $WixDir
+    if ($LASTEXITCODE -ne 0) {
+        throw "generate-branding.ps1 failed with exit code $LASTEXITCODE"
+    }
 }
 
 # Windows Installer требует числовую версию Major.Minor.Patch[.Build]

@@ -12,7 +12,7 @@
   </p>
 </div>
 
-**tachyon-desktop** — кроссплатформенный десктопный клиент для **Windows**, **Linux** и **macOS**, написанный целиком на **Rust** (`Wry`/`Tao` + встроенное ядро [`tachyon-core`](https://github.com/Dushnilin/tachyon-core)). В одном нативном исполняемом файле объединены современные транспортные и туннельные протоколы (**VLESS REALITY**, **XHTTP**, **Hysteria2**, **TUIC v5**, **AmneziaWG**) и локальный самообучающийся движок адаптивной сегментации трафика (**AdaptiveBrain L1–L3**), обеспечивающий устойчивую сетевую связность как через удалённый шлюз, так и при прямом соединении.
+**tachyon-desktop** — кроссплатформенный десктопный клиент для **Windows**, **Linux** и **macOS**, написанный целиком на **Rust** (графический интерфейс `GPUI` / `gpui-kit` + встроенное ядро [`tachyon-core`](https://github.com/Dushnilin/tachyon-core)). В одном нативном исполняемом файле объединены современные транспортные и туннельные протоколы (**VLESS REALITY**, **XHTTP**, **Hysteria2**, **TUIC v5**, **AmneziaWG**) и локальный самообучающийся движок адаптивной сегментации трафика (**AdaptiveBrain L1–L3**), обеспечивающий устойчивую сетевую связность как через удалённый шлюз, так и при прямом соединении.
 
 ### Скачать и обновить
 
@@ -20,17 +20,17 @@
 
 | Платформа | Файл в релизе | Особенности запуска и установки |
 | :--- | :--- | :--- |
-| **Windows 10 / 11** (`x86_64`) | `Tachyon-0.4.1-x86_64.msi`<br/>`Tachyon-windows-x86_64.exe`<br/>`Tachyon-windows-x86_64.zip` | Установщик Windows Installer `Tachyon-0.4.1-x86_64.msi` (ярлыки, исключения брандмауэра, URI `tachyon://`, тихая установка `msiexec /i Tachyon-0.4.1-x86_64.msi /qn`) или портативный одиночный `.exe` без внешних `.dll`. |
+| **Windows 10 / 11** (`x86_64`) | `Tachyon-0.4.1-x86_64.msi`<br/>`Tachyon-windows-x86_64.exe`<br/>`Tachyon-windows-x86_64.zip` | Установщик Windows Installer `Tachyon-0.4.1-x86_64.msi` (ярлыки, исключения брандмауэра для LAN, URI `tachyon://`, тихая установка `msiexec /i Tachyon-0.4.1-x86_64.msi /qn`) или портативный одиночный `.exe` без внешних `.dll`. |
 | **Linux** (`x86_64` / `amd64`) | `tachyon_0.4.1_amd64.deb`<br/>`tachyon-linux-amd64.tar.gz` | Пакет `.deb` для Ubuntu/Debian/Mint или архив с `install.sh` для Arch/Fedora. Автоматически выставляет `cap_net_admin,cap_net_raw+eip` через `setcap`. |
 | **macOS 11+** (`Universal`) | `Tachyon-0.4.1-macOS.dmg` | Универсальный образ (`Apple Silicon M1–M4 + Intel x86_64`). Перетащите `Tachyon.app` в `Applications`. |
 
-> **Автообновление из клиента:** в разделе **Опции → Движок и обновления** встроена прямая проверка релизов `Dushnilin/tachyon-desktop` через GitHub Releases API с загрузкой свежего бинарного файла под текущую ОС и атомарной заменой на лету.
+> **Автообновление и синхронизация ядра:** в разделе **Опции -> Движок и обновления** встроена проверка релизов `Dushnilin/tachyon-desktop` с проверкой SHA-256 контрольной суммы, а CI-пайплайн (`sync-core-release.yml`) автоматически собирает новый релиз клиента при выходе свежей версии `Dushnilin/tachyon-core`.
 
 ---
 
 ## Чем отличается
 
-- **Единый бинарник на чистом Rust (`Zero-C/FFI`):** клиент не зависит от `.NET`, Electron или внешних процессов `sing-box` / `xray`. Графическая оболочка (`Wry`/`Tao`), веб-ассеты, драйвер `Wintun` и сетевое ядро [`tachyon-core`](https://github.com/Dushnilin/tachyon-core) скомпилированы в один самодостаточный исполняемый файл.
+- **Единый бинарник на чистом Rust:** клиент не зависит от `.NET`, Electron, WebView или внешних процессов `sing-box` / `xray`. Графический интерфейс (`GPUI` / `gpui-kit`), встроенная реализация `Wintun` на чистом Rust и сетевое ядро [`tachyon-core`](https://github.com/Dushnilin/tachyon-core) скомпилированы в один самодостаточный исполняемый файл.
 - **Два независимых контура в одном окне:**
   1. **Защищённый туннель** (`VLESS REALITY`, `XHTTP`, `gRPC`, `WS`, `Hysteria2`, `TUIC v5`, `Trojan`, `VMess`, `Shadowsocks-2022`, `WireGuard`, `AmneziaWG`, `ShadowTLS v3`, `AnyTLS`) для шифрования потока и маршрутизации через внешние узлы.
   2. **Адаптивный шейпер пакетов (`AdaptiveBrain L1/L2/L3`)** на уровне TCP/UDP-сегментов (сегментация `ClientHello` по `midsld`/`sniext`, калибровочные пакеты с коротким TTL и `TCP MD5 Option 19`, преамбулы `UDP` для голосовых и STUN-сессий, управление `QUIC UDP:443`) для прямой оптимизации соединений на полной скорости канала без транзитного сервера.
@@ -50,8 +50,8 @@
 
 | Слой | Компонент | Роль в системе |
 | :--- | :--- | :--- |
-| **1. UI & IPC Host** | `desktop-rs/src/main.rs` + `src/web/` | Нативное окно без системных рамок (`Tao` + `Wry`), двухколоночный адаптивный интерфейс (Bento-сетка, тёмная графитовая `#0B0B0D` и светлая темы), парсинг подписок, пинг узлов и управление правилами. |
-| **2. Сетевой стек ОС** | `desktop-rs/src/vpn.rs` | Поднятие виртуального сетевого интерфейса (`Wintun` на Windows, `/dev/net/tun` на Linux, `utun` на macOS) или системного HTTP/SOCKS5 прокси (`127.0.0.1:7897`), Firewall Kill Switch и автообновление. |
+| **1. UI & Состояние** | `desktop-rs/src/ui.rs` + `state.rs` | Нативное окно без системных рамок на базе `GPUI` (`gpui-kit`), адаптивная Bento-сетка (тёмная графитовая `#0B0B0D` и светлая темы), парсинг подписок, пинг узлов и управление правилами. |
+| **2. Сетевой стек ОС** | `desktop-rs/src/vpn.rs` | Поднятие виртуального сетевого интерфейса (`Wintun` на Windows, `/dev/net/tun` на Linux, `utun` на macOS) или системного HTTP/SOCKS5 прокси (`127.0.0.1:7897`), маршрутизация LAN и автообновление с проверкой SHA-256. |
 | **3. Встроенное ядро** | [`tachyon-core`](https://github.com/Dushnilin/tachyon-core) (`core-runtime`) | Исполняется непосредственно внутри процесса клиента (или в привилегированном воркере `--run-core`). Обрабатывает L3/L4-пакеты, `FakeIP` (`198.18.0.0/15`), сниффинг `TLS SNI` / `HTTP Host` и правила `.trs`. |
 | **4. Аутбаунды** | `proxy` · `desync` · `direct` · `block` | Распределяет соединения между прокси-туннелем (с опциональным `detour`), адаптивным шейпером `AdaptiveBrain`, прямым сокетом для `.ru`/`.рф` и локальным фильтром рекламы и `QUIC`. |
 
@@ -75,7 +75,7 @@
   - `Умный маршрут (РФ напрямую)` — российские сайты, банки и Госуслуги идут напрямую мимо туннеля с минимальным пингом; внешний трафик защищён.
   - `Селективный (По категориям)` — через туннель направляются только выбранные категории из каталога [`tachyon-lists`](https://github.com/Dushnilin/tachyon-lists) (`openai`, `claude`, `gemini`, `github`, `steam`, `spotify`, `youtube`, `discord`, `telegram`, `habr` и др.).
   - `Весь трафик (Глобальный)` — полное туннелирование всех соединений.
-- **Split-Tunneling по приложениям:** привязка конкретных процессов (`.exe` на Windows, бинарников на Linux и `.app` на macOS) и доменов к нужному действию (`Через VPN`, `Напрямую`, `Каскад / Узел`, `Блокировать`).
+- **Split-Tunneling и LAN:** привязка конкретных процессов (`.exe` на Windows, бинарников на Linux и `.app` на macOS) и доменов в режимах включения/исключения, а также встроенное правило **Локальная сеть (LAN / Роутер / NAS)** (`192.168.0.0/16`, `10.0.0.0/8`, `172.16.0.0/12`, `100.64.0.0/10`, `.local`, `.lan`).
 
 ### 4. DNS, FakeIP и диагностика
 - **Зашифрованный DNS (DoH) + Раздельный DNS:** домены `.ru` / `.рф` резолвятся через быстрый российский DNS (`77.88.8.8`), а внешние — через защищённый резолвер внутри туннеля.
@@ -105,12 +105,12 @@ powershell -ExecutionPolicy Bypass -File .\desktop-rs\scripts\package-windows.ps
 ### Linux (`Ubuntu / Debian / Arch / Fedora`)
 
 ```bash
-# Зависимости WebKitGTK (Ubuntu 24.04 / Debian 12+)
-sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev pkg-config dpkg-dev
+# Системные зависимости GPUI (Ubuntu 22.04 / Debian 12+)
+sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libwayland-dev libvulkan-dev pkg-config dpkg-dev
 
 # Сборка .deb и портативного .tar.gz в папку ./dist/
 chmod +x desktop-rs/scripts/package-linux.sh
-./desktop-rs/scripts/package-linux.sh 0.4.1
+./desktop-rs/scripts/package-linux.sh
 ```
 
 ### macOS (`Universal: Apple Silicon + Intel`)
@@ -118,34 +118,29 @@ chmod +x desktop-rs/scripts/package-linux.sh
 ```bash
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
 chmod +x desktop-rs/scripts/package-macos.sh
-./desktop-rs/scripts/package-macos.sh --universal 0.4.1
-# Готовый образ: ./dist/Tachyon-0.4.1-macOS.dmg
+./desktop-rs/scripts/package-macos.sh --universal
+# Готовый образ: ./dist/Tachyon-<version>-macOS.dmg
 ```
 
 ---
 
 ## Связанные репозитории
 
-- [**Dushnilin/tachyon-core**](https://github.com/Dushnilin/tachyon-core) — высокопроизводительное Pure-Rust ядро маршрутизации, туннелирования и адаптивной сегментации трафика (`AdaptiveBrain`).
-- [**Dushnilin/tachyon-proxy**](https://github.com/Dushnilin/tachyon-proxy) — нативный клиент Tachyon для Android, Android TV и iOS (`Flutter` + `tachyon-core`).
+- [**Dushnilin/tachyon-core**](https://github.com/Dushnilin/tachyon-core) — сетевое ядро маршрутизации, туннелирования и адаптивной сегментации трафика (`AdaptiveBrain`) на чистом Rust.
+- [**Dushnilin/tachyon-proxy**](https://github.com/Dushnilin/tachyon-proxy) — клиент Tachyon для Android, Android TV и iOS (`Flutter` + `tachyon-core`).
 - [**Dushnilin/tachyon-lists**](https://github.com/Dushnilin/tachyon-lists) — автоматически обновляемый каталог бинарных гео-баз и списков маршрутизации (`.trs`).
 
 ---
 
-## 💖 Поддержать разработку
+## Поддержать разработку
 
-Если Tachyon помогает вам и делает работу в сети комфортной, вы можете поддержать проект и автора! ☕ 🧀 🌭
+Если Tachyon помогает вам в работе с сетью, поддержать развитие проекта можно по следующим реквизитам:
 
-⭐ **Boosty (подписки, донаты, эксклюзив):**  
-👉 [**Поддержать на Boosty**](https://boosty.to/tachyon)
+- **Boosty (подписки и донаты):** [Поддержать на Boosty](https://boosty.to/tachyon)
+- **СБП (Ozon Банк):** [Поддержать через СБП (Ozon Банк)](https://finance.ozon.ru/apps/sbp/ozonbankpay/019af2ed-d158-77a9-a698-2805a5e61be5)
+- **Карты РФ / СБП / Tinkoff Pay:** [Поддержать проект на CloudTips](https://pay.cloudtips.ru/p/449c5ef9)
 
-🏦 **СБП (Ozon Банк):**  
-👉 [**Поддержать через СБП (Ozon Банк)**](https://finance.ozon.ru/apps/sbp/ozonbankpay/019af2ed-d158-77a9-a698-2805a5e61be5)
-
-💳 **Карты РФ / СБП / Tinkoff Pay:**  
-👉 [**Поддержать проект на CloudTips**](https://pay.cloudtips.ru/p/449c5ef9)
-
-🪙 **Криптовалюта:**
+Криптовалюта:
 * **Bitcoin (BTC):** `bc1q9ehdv7y9g948jejyflkq7xmau3tytgunxgh35h`
 * **Ethereum (ETH / ERC-20):** `0x6CB7a4547eD62EF64990D5C6B5D9fdA58EB223E6`
 * **TON:** `UQDPhLRjMz5KltDLACAT3YXXHDVEtIDOHky2i33ZIOtsMEoR`

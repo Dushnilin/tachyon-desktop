@@ -6,7 +6,7 @@ PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ROOT_DIR="$(cd "${PROJECT_DIR}/.." && pwd)"
 
 UNIVERSAL=0
-VERSION="0.4.1"
+VERSION=""
 for arg in "$@"; do
   if [[ "${arg}" == "--universal" ]]; then
     UNIVERSAL=1
@@ -14,6 +14,11 @@ for arg in "$@"; do
     VERSION="${arg#v}"
   fi
 done
+if [[ -z "${VERSION}" ]]; then
+  VERSION="$(awk -F'=' '/^version[[:space:]]*=/{gsub(/["[:space:]]/, "", $2); print $2; exit}' "${PROJECT_DIR}/Cargo.toml")"
+  VERSION="${VERSION:-0.4.1}"
+fi
+export MACOSX_DEPLOYMENT_TARGET=11.0
 
 DIST_DIR="${ROOT_DIR}/dist"
 mkdir -p "${DIST_DIR}"
@@ -46,6 +51,22 @@ mkdir -p "${APP_BUNDLE}/Contents/Resources"
 cp "${BIN_PATH}" "${APP_BUNDLE}/Contents/MacOS/tachyon"
 chmod 0755 "${APP_BUNDLE}/Contents/MacOS/tachyon"
 
+if [[ -f "${ROOT_DIR}/src/app.ico" ]] && command -v sips >/dev/null 2>&1 && command -v iconutil >/dev/null 2>&1; then
+  ICONSET_DIR="${DIST_DIR}/AppIcon.iconset"
+  rm -rf "${ICONSET_DIR}"
+  mkdir -p "${ICONSET_DIR}"
+  BASE_PNG="${DIST_DIR}/appicon_base.png"
+  if sips -s format png "${ROOT_DIR}/src/app.ico" --out "${BASE_PNG}" >/dev/null 2>&1; then
+    for sz in 16 32 128 256 512; do
+      sips -z "${sz}" "${sz}" "${BASE_PNG}" --out "${ICONSET_DIR}/icon_${sz}x${sz}.png" >/dev/null 2>&1 || true
+      sz2=$((sz * 2))
+      sips -z "${sz2}" "${sz2}" "${BASE_PNG}" --out "${ICONSET_DIR}/icon_${sz}x${sz}@2x.png" >/dev/null 2>&1 || true
+    done
+    iconutil -c icns "${ICONSET_DIR}" -o "${APP_BUNDLE}/Contents/Resources/AppIcon.icns" || true
+  fi
+  rm -rf "${ICONSET_DIR}" "${BASE_PNG}"
+fi
+
 cat > "${APP_BUNDLE}/Contents/Info.plist" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -55,6 +76,8 @@ cat > "${APP_BUNDLE}/Contents/Info.plist" << EOF
     <string>Tachyon</string>
     <key>CFBundleExecutable</key>
     <string>tachyon</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>io.tachyon.desktop</string>
     <key>CFBundleInfoDictionaryVersion</key>
@@ -67,6 +90,17 @@ cat > "${APP_BUNDLE}/Contents/Info.plist" << EOF
     <string>${VERSION}</string>
     <key>CFBundleVersion</key>
     <string>${VERSION}</string>
+    <key>CFBundleURLTypes</key>
+    <array>
+      <dict>
+        <key>CFBundleURLName</key>
+        <string>Tachyon Protocol</string>
+        <key>CFBundleURLSchemes</key>
+        <array>
+          <string>tachyon</string>
+        </array>
+      </dict>
+    </array>
     <key>LSMinimumSystemVersion</key>
     <string>11.0</string>
     <key>NSHighResolutionCapable</key>
@@ -77,7 +111,7 @@ EOF
 
 # Ad-hoc sign the bundle so macOS Gatekeeper allows local execution cleanly
 if command -v codesign >/dev/null 2>&1; then
-  codesign --force --deep --sign - "${APP_BUNDLE}" || true
+  codesign --force --deep --sign - "${APP_BUNDLE}"
 fi
 
 DMG_STAGE="${DIST_DIR}/dmg-stage"

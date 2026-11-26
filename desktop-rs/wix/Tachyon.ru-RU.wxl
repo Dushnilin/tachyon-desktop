@@ -3,6 +3,7 @@
   <String Id="DowngradeError" Value="На этом компьютере уже установлена более новая версия Tachyon." />
   <String Id="AppDescription" Value="Клиент селективной маршрутизации и туннелирования Tachyon" />
   <String Id="LaunchAfterInstall" Value="Запустить Tachyon после завершения установки" />
+  <String Id="InstallDirDlgWindowTitle" Value="Установка Tachyon" />
   <String Id="InstallDirTitle" Value="{\WixUI_Font_Title}Папка установки и параметры" />
   <String Id="InstallDirDescription" Value="Нажмите «Далее» для установки в папку по умолчанию или выберите другую папку и параметры запуска." />
   <String Id="DesktopShortcutCheckbox" Value="Создать ярлык на рабочем столе" />

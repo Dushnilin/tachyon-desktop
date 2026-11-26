@@ -5,7 +5,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ROOT_DIR="$(cd "${PROJECT_DIR}/.." && pwd)"
 
-VERSION="${1:-0.4.1}"
+VERSION="${1:-}"
+if [[ -z "${VERSION}" ]]; then
+  VERSION="$(awk -F'=' '/^version[[:space:]]*=/{gsub(/["[:space:]]/, "", $2); print $2; exit}' "${PROJECT_DIR}/Cargo.toml")"
+  VERSION="${VERSION:-0.4.1}"
+fi
+VERSION="${VERSION#v}"
 ARCH_RAW="$(uname -m)"
 case "${ARCH_RAW}" in
   x86_64|amd64) DEB_ARCH="amd64" ;;
@@ -35,32 +40,34 @@ chmod 0755 "${STAGE_DEB}/usr/bin/tachyon"
 cat > "${STAGE_DEB}/usr/share/applications/tachyon.desktop" << 'EOF'
 [Desktop Entry]
 Type=Application
-Name=Tachyon VPN
-GenericName=VPN & Routing Client
+Name=Tachyon
+GenericName=Routing & Tunneling Client
 Comment=Нативный клиент маршрутизации и туннелирования Tachyon (Desync)
-Exec=/usr/bin/tachyon
+Exec=/usr/bin/tachyon %u
 Icon=tachyon
 Terminal=false
 Categories=Network;Security;VPN;
+MimeType=x-scheme-handler/tachyon;
 StartupWMClass=tachyon
 EOF
 
 cat > "${STAGE_DEB}/usr/share/icons/hicolor/scalable/apps/tachyon.svg" << 'EOF'
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
-  <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#17152b"/>
-      <stop offset="100%" stop-color="#0b0b0f"/>
-    </linearGradient>
-    <linearGradient id="bolt" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#c4b5fd"/>
-      <stop offset="100%" stop-color="#7c5cff"/>
-    </linearGradient>
-  </defs>
-  <rect width="256" height="256" rx="56" fill="url(#bg)"/>
-  <path d="M146 36L68 140h54l-12 80 78-104h-54L146 36z" fill="url(#bolt)"/>
+  <rect width="256" height="256" rx="56" fill="#0B0B0D"/>
+  <rect x="4" y="4" width="248" height="248" rx="52" fill="none" stroke="#26262B" stroke-width="4"/>
+  <path d="M146 36L68 140h54l-12 80 78-104h-54L146 36z" fill="#6FD08C"/>
 </svg>
 EOF
+
+INSTALLED_SIZE="$(du -sk "${STAGE_DEB}/usr" | awk '{print $1}')"
+BASE_DEPS="libxkbcommon0, libxkbcommon-x11-0, libxcb1, libwayland-client0, libvulkan1 | mesa-vulkan-drivers, libcap2-bin, policykit-1"
+DEB_DEPS="${BASE_DEPS}"
+if command -v dpkg-shlibdeps >/dev/null 2>&1; then
+  SHLIB_OUT="$(dpkg-shlibdeps -O "${STAGE_DEB}/usr/bin/tachyon" 2>/dev/null | sed -n 's/^shlibs:Depends=//p' || true)"
+  if [[ -n "${SHLIB_OUT}" ]]; then
+    DEB_DEPS="${SHLIB_OUT}, libcap2-bin, policykit-1"
+  fi
+fi
 
 cat > "${STAGE_DEB}/DEBIAN/control" << EOF
 Package: tachyon
@@ -68,7 +75,8 @@ Version: ${VERSION}
 Section: net
 Priority: optional
 Architecture: ${DEB_ARCH}
-Depends: libxkbcommon0, libxkbcommon-x11-0, libxcb1, libvulkan1 | mesa-vulkan-drivers, libcap2-bin, policykit-1
+Installed-Size: ${INSTALLED_SIZE}
+Depends: ${DEB_DEPS}
 Maintainer: Dushnilin <https://github.com/Dushnilin>
 Description: Tachyon Routing & Tunneling Client (tachyon-core embedded)
  Нативный кроссплатформенный клиент Tachyon со встроенным движком tachyon-core,
@@ -84,6 +92,14 @@ fi
 exit 0
 EOF
 chmod 0755 "${STAGE_DEB}/DEBIAN/postinst"
+
+cat > "${STAGE_DEB}/DEBIAN/prerm" << 'EOF'
+#!/bin/sh
+set -e
+pkill -x tachyon >/dev/null 2>&1 || true
+exit 0
+EOF
+chmod 0755 "${STAGE_DEB}/DEBIAN/prerm"
 
 DEB_OUT="${DIST_DIR}/tachyon_${VERSION}_${DEB_ARCH}.deb"
 dpkg-deb --build --root-owner-group "${STAGE_DEB}" "${DEB_OUT}"

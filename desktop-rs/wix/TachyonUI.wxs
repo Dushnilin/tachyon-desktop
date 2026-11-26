@@ -13,10 +13,12 @@
       <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchApplication"
                Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed" Order="1" />
 
-      <Dialog Id="TachyonInstallDirDlg" Width="370" Height="270" Title="!(loc.InstallDirTitle)">
+      <Dialog Id="TachyonInstallDirDlg" Width="370" Height="270" Title="!(loc.InstallDirDlgWindowTitle)">
         <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="!(loc.WixUINext)">
           <Publish Event="SetTargetPath" Value="[WIXUI_INSTALLDIR]" Order="1" />
-          <Publish Event="NewDialog" Value="VerifyReadyDlg" Order="2" />
+          <Publish Event="DoAction" Value="WixUIValidatePath_X64" Order="2" />
+          <Publish Event="SpawnDialog" Value="InvalidDirDlg" Condition="WIXUI_INSTALLDIR_VALID&lt;&gt;&quot;1&quot;" Order="3" />
+          <Publish Event="NewDialog" Value="VerifyReadyDlg" Condition="WIXUI_INSTALLDIR_VALID=&quot;1&quot;" Order="4" />
         </Control>
         <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="!(loc.WixUIBack)">
           <Publish Event="NewDialog" Value="WelcomeDlg" Order="1" />

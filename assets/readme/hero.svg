@@ -2,7 +2,7 @@
      width="1200" height="390" viewBox="0 0 1200 390"
      role="img" aria-labelledby="title desc">
   <title id="title">tachyon-desktop — Нативный кроссплатформенный клиент маршрутизации и туннелирования (Windows, Linux, macOS)</title>
-  <desc id="desc">Шапка репозитория tachyon-desktop: десктопный клиент на чистом Rust (Wry/Tao + встроенное ядро tachyon-core) с поддержкой VLESS REALITY, XHTTP, Hysteria2, TUIC, AmneziaWG и самообучающегося шейпера пакетов AdaptiveBrain.</desc>
+  <desc id="desc">Шапка репозитория tachyon-desktop: десктопный клиент на чистом Rust (GPUI / gpui-kit + встроенное ядро tachyon-core) с поддержкой VLESS REALITY, XHTTP, Hysteria2, TUIC, AmneziaWG и самообучающегося шейпера пакетов AdaptiveBrain.</desc>
 
   <defs>
     <pattern id="dotGrid" width="28" height="28" patternUnits="userSpaceOnUse">
@@ -91,7 +91,7 @@
     <rect x="116" y="15" width="40" height="16" rx="5" fill="#1E1E22" stroke="#26262B"/>
     <text x="136" y="26" text-anchor="middle"
           font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
-          font-size="10" font-weight="600" fill="#A8A8AD">0.3.0</text>
+          font-size="10" font-weight="600" fill="#A8A8AD">0.4.1</text>
 
     <!-- Window Buttons -->
     <g transform="translate(324, 18)" stroke="#70707A" stroke-width="1.4" stroke-linecap="round">

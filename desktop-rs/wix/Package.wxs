@@ -25,6 +25,13 @@
     <Property Id="INSTALLDESKTOPSHORTCUT" Value="1" Secure="yes" />
     <Property Id="INSTALLAUTOSTART" Secure="yes" />
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    <Property Id="INSTALLFOLDER" Secure="yes">
+      <RegistrySearch Id="RememberInstallFolder"
+                      Root="HKLM"
+                      Key="Software\Tachyon"
+                      Name="InstallDir"
+                      Type="raw" />
+    </Property>
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="!(loc.LaunchAfterInstall)" />
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
     <Property Id="WixShellExecTarget" Value="[#TachyonExe]" />
@@ -33,6 +40,9 @@
     <util:CloseApplication Id="CloseTachyonExe"
                            Target="Tachyon.exe"
                            CloseMessage="yes"
+                           ElevatedCloseMessage="yes"
+                           TerminateProcess="1"
+                           Timeout="5"
                            RebootPrompt="no" />
 
     <!-- Запуск приложения после установки при включённом чекбоксе -->
@@ -59,21 +69,25 @@
                 Source="$(var.BinaryPath)"
                 KeyPath="yes" />
 
-          <!-- Исключения брандмауэра Windows для входящих и исходящих соединений -->
+          <!-- Исключения брандмауэра Windows для локальной сети -->
           <fw:FirewallException Id="TachyonFirewallTcp"
                                 Name="Tachyon (TCP)"
                                 Program="[#TachyonExe]"
                                 Protocol="tcp"
-                                Scope="any"
-                                Profile="all"
+                                Scope="localSubnet"
+                                Profile="private"
                                 IgnoreFailure="yes" />
           <fw:FirewallException Id="TachyonFirewallUdp"
                                 Name="Tachyon (UDP)"
                                 Program="[#TachyonExe]"
                                 Protocol="udp"
-                                Scope="any"
-                                Profile="all"
+                                Scope="localSubnet"
+                                Profile="private"
                                 IgnoreFailure="yes" />
+
+          <RegistryKey Root="HKLM" Key="Software\Tachyon">
+            <RegistryValue Name="InstallDir" Type="string" Value="[INSTALLFOLDER]" />
+          </RegistryKey>
 
           <!-- Регистрация схемы ссылок tachyon:// -->
           <RegistryKey Root="HKLM" Key="Software\Classes\tachyon">
