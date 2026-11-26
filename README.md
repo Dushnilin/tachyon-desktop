@@ -20,9 +20,9 @@
 
 | Платформа | Файл в релизе | Особенности запуска и установки |
 | :--- | :--- | :--- |
-| **Windows 10 / 11** (`x86_64`) | `Tachyon-0.4.2-x86_64.msi`<br/>`Tachyon-windows-x86_64.exe`<br/>`Tachyon-windows-x86_64.zip` | Установщик Windows Installer `Tachyon-0.4.2-x86_64.msi` (ярлыки, исключения брандмауэра для LAN, URI `tachyon://`, тихая установка `msiexec /i Tachyon-0.4.2-x86_64.msi /qn`) или портативный одиночный `.exe` без внешних `.dll`. |
-| **Linux** (`x86_64` / `amd64`) | `tachyon_0.4.2_amd64.deb`<br/>`tachyon-linux-amd64.tar.gz` | Пакет `.deb` для Ubuntu/Debian/Mint или архив с `install.sh` для Arch/Fedora. Автоматически выставляет `cap_net_admin,cap_net_raw+eip` через `setcap`. |
-| **macOS 11+** (`Universal`) | `Tachyon-0.4.2-macOS.dmg` | Универсальный образ (`Apple Silicon M1–M4 + Intel x86_64`). Перетащите `Tachyon.app` в `Applications`. |
+| **Windows 10 / 11** (`x86_64`) | `Tachyon-0.4.3-x86_64.msi`<br/>`Tachyon-windows-x86_64.exe`<br/>`Tachyon-windows-x86_64.zip` | Установщик Windows Installer `Tachyon-0.4.3-x86_64.msi` (ярлыки, исключения брандмауэра для LAN, URI `tachyon://`, тихая установка `msiexec /i Tachyon-0.4.3-x86_64.msi /qn`) или портативный одиночный `.exe` без внешних `.dll`. |
+| **Linux** (`x86_64` / `amd64`) | `tachyon_0.4.3_amd64.deb`<br/>`tachyon-linux-amd64.tar.gz` | Пакет `.deb` для Ubuntu/Debian/Mint или архив с `install.sh` для Arch/Fedora. Автоматически выставляет `cap_net_admin,cap_net_raw+eip` через `setcap`. |
+| **macOS 11+** (`Universal`) | `Tachyon-0.4.3-macOS.dmg` | Универсальный образ (`Apple Silicon M1–M4 + Intel x86_64`). Перетащите `Tachyon.app` в `Applications`. |
 
 > **Автообновление и синхронизация ядра:** в разделе **Опции -> Движок и обновления** встроена проверка релизов `Dushnilin/tachyon-desktop` с проверкой SHA-256 контрольной суммы, а CI-пайплайн (`sync-core-release.yml`) автоматически собирает новый релиз клиента при выходе свежей версии `Dushnilin/tachyon-core`.
 
@@ -98,8 +98,8 @@ cd tachyon-desktop
 ### Windows (`x86_64`)
 
 ```powershell
-# Сборка портативного .exe, .zip и MSI-установщика Tachyon-0.4.2-x86_64.msi в папку ./dist/
-powershell -ExecutionPolicy Bypass -File .\desktop-rs\scripts\package-windows.ps1 0.4.2
+# Сборка портативного .exe, .zip и MSI-установщика Tachyon-0.4.3-x86_64.msi в папку ./dist/
+powershell -ExecutionPolicy Bypass -File .\desktop-rs\scripts\package-windows.ps1 0.4.3
 ```
 
 ### Linux (`Ubuntu / Debian / Arch / Fedora`)

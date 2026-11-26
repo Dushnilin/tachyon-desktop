@@ -3,7 +3,7 @@
     <InstallerPlatform>x64</InstallerPlatform>
     <OutputName>Tachyon</OutputName>
     <Cultures>ru-RU</Cultures>
-    <ProductVersion Condition="'$(ProductVersion)' == ''">0.4.2</ProductVersion>
+    <ProductVersion Condition="'$(ProductVersion)' == ''">0.4.3</ProductVersion>
     <BinaryPath Condition="'$(BinaryPath)' == ''">$(MSBuildThisFileDirectory)..\target\release\tachyon.exe</BinaryPath>
     <IconPath Condition="'$(IconPath)' == ''">$(MSBuildThisFileDirectory)..\..\src\app.ico</IconPath>
     <BannerBmp Condition="'$(BannerBmp)' == ''">$(MSBuildThisFileDirectory)banner.bmp</BannerBmp>
