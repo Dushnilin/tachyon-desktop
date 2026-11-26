@@ -238,6 +238,15 @@ pub fn parse_node_uri(raw: &str) -> Result<Value, String> {
     parse_share_uri(trimmed)
 }
 
+/// Проверяет, является ли ссылка MTProto-прокси (только TCP, не поддерживает UDP).
+pub fn is_mtproto_uri(raw: &str) -> bool {
+    let lower = raw.trim().to_ascii_lowercase();
+    lower.starts_with("tg://proxy")
+        || lower.starts_with("mtproto://")
+        || lower.starts_with("https://t.me/proxy")
+        || lower.starts_with("http://t.me/proxy")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BalancerMember {
     pub name: String,
@@ -2091,8 +2100,14 @@ impl VpnManager {
             // 1. Разбираем всех участников, помечая тех, кто проходит фильтры
             //    (страны / протоколы / RegExp из настроек балансировщика).
             let mut candidates: Vec<(String, bool, Value, Option<String>, bool)> = Vec::new();
+            let mut skipped_mtproto = false;
             for (idx, m) in bal.members.iter().enumerate() {
-                if m.vless.trim().is_empty() || m.vless.trim().starts_with(BALANCER_URI_PREFIX) {
+                let m_uri = m.vless.trim();
+                if m_uri.is_empty() || m_uri.starts_with(BALANCER_URI_PREFIX) {
+                    continue;
+                }
+                if is_mtproto_uri(m_uri) {
+                    skipped_mtproto = true;
                     continue;
                 }
                 let m_tag = Self::alloc_unique_member_tag(&m.name, tag, idx, used_tags);
@@ -2100,6 +2115,11 @@ impl VpnManager {
                     Self::prepare_parsed_node(&m.vless, &m_tag, tls_fragment, detour_tag)
                 {
                     let node_type = val.get("type").and_then(Value::as_str).unwrap_or("");
+                    if node_type.eq_ignore_ascii_case("mtproto") {
+                        skipped_mtproto = true;
+                        used_tags.remove(&m_tag);
+                        continue;
+                    }
                     let sni = val
                         .pointer("/tls/server_name")
                         .and_then(Value::as_str)
@@ -2115,6 +2135,12 @@ impl VpnManager {
                 } else {
                     used_tags.remove(&m_tag);
                 }
+            }
+            if candidates.is_empty() && skipped_mtproto {
+                return Err(
+                    "MTProto-узлы несовместимы с балансировщиком (только TCP без UDP). Выберите одиночный узел или добавьте в пул другие протоколы."
+                        .to_string(),
+                );
             }
 
             // Если фильтры отсекли все узлы — используем полный список (как в Android),
@@ -2522,9 +2548,22 @@ impl VpnManager {
                 json!("fe80::/10"),
             ];
             if opts.bypass_lan {
+                // Разбиваем 172.16.0.0/12 так, чтобы исключить подсеть TUN (172.19.0.0/24),
+                // иначе на macOS/Windows системные таблицы маршрутизации могут конфликтовать с 172.19.0.1/30.
                 tun_excludes.extend([
                     json!("10.0.0.0/8"),
-                    json!("172.16.0.0/12"),
+                    json!("172.16.0.0/15"),
+                    json!("172.18.0.0/16"),
+                    json!("172.19.1.0/24"),
+                    json!("172.19.2.0/23"),
+                    json!("172.19.4.0/22"),
+                    json!("172.19.8.0/21"),
+                    json!("172.19.16.0/20"),
+                    json!("172.19.32.0/19"),
+                    json!("172.19.64.0/18"),
+                    json!("172.19.128.0/17"),
+                    json!("172.20.0.0/14"),
+                    json!("172.24.0.0/13"),
                     json!("192.168.0.0/16"),
                     json!("100.64.0.0/10"),
                     json!("fc00::/7"),
@@ -2954,6 +2993,12 @@ impl VpnManager {
             "final": final_outbound,
             "rules": rules
         });
+        #[cfg(target_os = "macos")]
+        if !opts.proxy_mode
+            && let Some(phys_iface) = detect_macos_phys_interface()
+        {
+            route_obj["default_interface"] = json!(phys_iface);
+        }
         if !rule_sets.is_empty() {
             route_obj["rule_set"] = Value::Array(rule_sets);
         }
@@ -3529,7 +3574,7 @@ impl VpnManager {
             }
         }
 
-        self.emit_vpn(json!({ "state": "connecting" }));
+        self.emit_vpn(json!({ "state": "connecting", "stage": "rulesets" }));
         self.stop_stats_loop();
         self.ensure_community_rulesets(&opts, false).await;
 
@@ -3557,6 +3602,7 @@ impl VpnManager {
             return;
         }
 
+        self.emit_vpn(json!({ "state": "connecting", "stage": "config" }));
         self.rotate_log_if_oversized();
 
         // Определяем, активен ли в текущей сети шлюз с тем же FakeIP-пулом (198.18.0.0/15),
@@ -3584,6 +3630,11 @@ impl VpnManager {
         #[cfg(target_os = "windows")]
         refresh_cached_windows_phys_ifindex();
 
+        self.emit_vpn(json!({
+            "state": "connecting",
+            "stage": if opts.proxy_mode || opts.block_only { "core" } else { "tun" }
+        }));
+
         let mut started_in_proc: Option<BoxInstance> = None;
         let mut started_worker: Option<Child> = None;
         let mut started_worker_pid: Option<u32> = None;
@@ -3598,6 +3649,7 @@ impl VpnManager {
         let try_in_proc_first = opts.proxy_mode || opts.block_only || is_current_process_elevated();
 
         if try_in_proc_first {
+            self.emit_vpn(json!({ "state": "connecting", "stage": "core" }));
             match core_runtime::start(&cfg_val).await {
                 Ok(mut bx) => {
                     let tun_failed_passively = !opts.proxy_mode
@@ -3606,6 +3658,7 @@ impl VpnManager {
 
                     if tun_failed_passively {
                         bx.shutdown_wait().await;
+                        self.emit_vpn(json!({ "state": "connecting", "stage": "tun" }));
                         match spawn_elevated_worker(&cfg_path, &self.secret).await {
                             Ok(w) => {
                                 started_worker = w.child;
@@ -3637,6 +3690,7 @@ impl VpnManager {
                             || err_str.to_ascii_lowercase().contains("tun"));
 
                     if need_elevation {
+                        self.emit_vpn(json!({ "state": "connecting", "stage": "tun" }));
                         match spawn_elevated_worker(&cfg_path, &self.secret).await {
                             Ok(w) => {
                                 started_worker = w.child;
@@ -3663,6 +3717,7 @@ impl VpnManager {
                 }
             }
         } else {
+            self.emit_vpn(json!({ "state": "connecting", "stage": "tun" }));
             match spawn_elevated_worker(&cfg_path, &self.secret).await {
                 Ok(w) => {
                     started_worker = w.child;
@@ -3693,6 +3748,7 @@ impl VpnManager {
             };
             aborted.stop().await;
             cleanup_orphaned_wintun_routes();
+            cleanup_orphaned_macos_routes();
             flush_os_dns();
             return;
         }
@@ -3749,6 +3805,7 @@ impl VpnManager {
         }
         apply_kill_switch(false);
         cleanup_orphaned_wintun_routes();
+        cleanup_orphaned_macos_routes();
         flush_os_dns();
         self.emit_vpn(json!({ "state": "off" }));
     }
@@ -3904,6 +3961,186 @@ impl VpnManager {
     #[allow(dead_code)]
     pub async fn probe_delay(&self) -> Option<u64> {
         probe_proxy_delay(&self.secret).await
+    }
+
+    pub async fn test_https_via_tunnel(&self) -> String {
+        if !self.is_running().await {
+            return json!({
+                "ok": false,
+                "error": "Туннель не запущен"
+            })
+            .to_string();
+        }
+        let clash_urls = [
+            (
+                "https://www.gstatic.com/generate_204",
+                "https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204",
+            ),
+            (
+                "https://cp.cloudflare.com/generate_204",
+                "https%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204",
+            ),
+        ];
+        for (plain, enc) in clash_urls {
+            let path = format!("/proxies/PROXY/delay?timeout=5000&url={enc}");
+            if let Ok((200, body)) =
+                clash_api_request(API_PORT, &self.secret, "GET", &path, None).await
+                && let Ok(doc) = serde_json::from_str::<Value>(&body)
+                && let Some(d) = doc.get("delay").and_then(Value::as_u64)
+                && d > 0
+            {
+                return json!({
+                    "ok": true,
+                    "delay_ms": d,
+                    "url": plain,
+                    "via": "clash"
+                })
+                .to_string();
+            }
+        }
+
+        let sw = Instant::now();
+        match fetch_url(
+            "https://www.gstatic.com/generate_204",
+            "GET",
+            &[],
+            None,
+            Some(PROXY_PORT),
+            Duration::from_secs(5),
+        )
+        .await
+        {
+            Ok(resp) if (200..400).contains(&resp.status) => json!({
+                "ok": true,
+                "delay_ms": (sw.elapsed().as_millis() as u64).max(1),
+                "status": resp.status,
+                "url": "https://www.gstatic.com/generate_204",
+                "via": "http_proxy"
+            })
+            .to_string(),
+            Ok(resp) => json!({
+                "ok": false,
+                "error": format!("HTTP {}", resp.status)
+            })
+            .to_string(),
+            Err(e) => json!({
+                "ok": false,
+                "error": e.to_string()
+            })
+            .to_string(),
+        }
+    }
+
+    pub async fn self_repair_network(&self) -> String {
+        let mut steps: Vec<Value> = Vec::new();
+        self.disconnect().await;
+
+        let mut stale_killed = false;
+        if let Some(pid) = read_core_pid_file()
+            && is_pid_alive(pid)
+        {
+            terminate_pid(pid);
+            stale_killed = true;
+        }
+        let _ = fs::remove_file(app_data_dir().join("config.stop"));
+        let _ = fs::remove_file(core_pid_path());
+        let _ = fs::remove_file(core_err_path());
+        steps.push(json!({
+            "id": "repair-proc",
+            "name": "Очистка фоновых процессов",
+            "ok": true,
+            "status": "ok",
+            "detail": if stale_killed { "Завершён зависший процесс ядра" } else { "Зависшие процессы не обнаружены" }
+        }));
+
+        let proxy_cleared = if proxy_points_to_us() {
+            set_system_proxy(false);
+            true
+        } else {
+            false
+        };
+        steps.push(json!({
+            "id": "repair-proxy",
+            "name": "Системный прокси",
+            "ok": true,
+            "status": "ok",
+            "detail": if proxy_cleared { "Сброшен прокси 127.0.0.1:7897" } else { "Не требовал сброса" }
+        }));
+
+        cleanup_orphaned_wintun_routes();
+        cleanup_orphaned_macos_routes();
+        steps.push(json!({
+            "id": "repair-routes",
+            "name": "Таблица маршрутов TUN",
+            "ok": true,
+            "status": "ok",
+            "detail": "Осиротевшие маршруты очищены"
+        }));
+
+        flush_os_dns();
+        steps.push(json!({
+            "id": "repair-dns",
+            "name": "Кэш DNS системы",
+            "ok": true,
+            "status": "ok",
+            "detail": "Сброс выполнен"
+        }));
+
+        #[cfg(target_os = "windows")]
+        {
+            refresh_cached_windows_phys_ifindex();
+            let phys_idx = default_windows_phys_ifindex();
+            let ok = phys_idx.is_some();
+            steps.push(json!({
+                "id": "repair-iface",
+                "name": "Физический интерфейс",
+                "ok": ok,
+                "status": if ok { "ok" } else { "warn" },
+                "detail": phys_idx
+                    .map(|idx| format!("ifIndex={idx}"))
+                    .unwrap_or_else(|| "Не найден маршрут по умолчанию".to_string())
+            }));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let phys = detect_macos_phys_interface();
+            let (helper_alive, helper_ver) = macos_helper_status();
+            let detail = match (&phys, helper_alive) {
+                (Some(p), true) => format!(
+                    "NIC: {p}, helper: {}",
+                    helper_ver.as_deref().unwrap_or("active")
+                ),
+                (Some(p), false) => format!("NIC: {p}, helper не активен"),
+                (None, _) => "Не определён основной интерфейс (route/netstat/scutil)".to_string(),
+            };
+            steps.push(json!({
+                "id": "repair-iface",
+                "name": "Физический интерфейс и служба macOS",
+                "ok": phys.is_some(),
+                "status": if phys.is_some() { "ok" } else { "warn" },
+                "detail": detail
+            }));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let phys = default_linux_phys_interface();
+            steps.push(json!({
+                "id": "repair-iface",
+                "name": "Физический интерфейс",
+                "ok": phys.is_some(),
+                "status": if phys.is_some() { "ok" } else { "warn" },
+                "detail": phys.unwrap_or_else(|| "Не найден маршрут по умолчанию".to_string())
+            }));
+        }
+
+        let all_ok = steps
+            .iter()
+            .all(|s| s.get("ok").and_then(Value::as_bool) == Some(true));
+        json!({
+            "ok": all_ok,
+            "steps": steps
+        })
+        .to_string()
     }
 
     pub async fn select_balancer_member(&self, member: &str) -> bool {
@@ -5821,8 +6058,9 @@ fn schedule_relaunch_and_exit(target_exe: &Path) {
 
 async fn probe_proxy_delay(secret: &str) -> Option<u64> {
     let urls = [
+        "https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204",
+        "https%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204",
         "http%3A%2F%2Fwww.gstatic.com%2Fgenerate_204",
-        "http%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204",
     ];
     for u in urls {
         let path = format!("/proxies/PROXY/delay?timeout=5000&url={u}");
@@ -5962,6 +6200,38 @@ fn cleanup_orphaned_wintun_routes() {
                 .args(["delete", prefix.0, "mask", prefix.1, "172.19.0.1"])
                 .creation_flags(CREATE_NO_WINDOW)
                 .status();
+        }
+    }
+}
+
+fn cleanup_orphaned_macos_routes() {
+    #[cfg(target_os = "macos")]
+    {
+        if read_core_pid_file().is_some_and(is_pid_alive) {
+            return;
+        }
+        if let Ok(out) = Command::new("/usr/sbin/netstat")
+            .args(["-rn", "-f", "inet"])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let has_utun_split = text.lines().any(|line| {
+                let cols: Vec<&str> = line.split_whitespace().collect();
+                cols.len() >= 4
+                    && (cols[0] == "0/1" || cols[0] == "128.0/1")
+                    && cols.iter().any(|c| c.starts_with("utun"))
+            });
+            if has_utun_split {
+                if macos_helper::status().0 {
+                    macos_helper::stop_tunnel();
+                } else {
+                    for net in ["0.0.0.0/1", "128.0.0.0/1", "198.18.0.0/15"] {
+                        let _ = Command::new("/sbin/route")
+                            .args(["-n", "delete", "-net", net])
+                            .status();
+                    }
+                }
+            }
         }
     }
 }
@@ -6742,6 +7012,7 @@ pub fn cleanup_stale_state_on_startup() {
     let _ = fs::remove_file(core_pid_path());
     let _ = fs::remove_file(core_err_path());
     cleanup_orphaned_wintun_routes();
+    cleanup_orphaned_macos_routes();
     if proxy_points_to_us() {
         set_system_proxy(false);
     }
@@ -7575,13 +7846,151 @@ fn is_fake_or_tun_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let o = v4.octets();
-            (o[0] == 198 && (o[1] == 18 || o[1] == 19)) || (o[0] == 10 && o[1] == 255)
+            (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+                || (o[0] == 10 && o[1] == 255)
+                || (o[0] == 172 && o[1] == 19 && o[2] == 0)
         }
         IpAddr::V6(v6) => {
             let s = v6.segments();
             s[0] == 0xfdfe && s[1] == 0xdcba
         }
     }
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub fn is_virtual_or_tun_adapter_name(desc: &str) -> bool {
+    let lower = desc.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    const MARKERS: [&str; 13] = [
+        "wintun",
+        "wireguard",
+        "amneziawg",
+        "tachyon",
+        "tap-windows",
+        "tap-",
+        "openvpn",
+        "loopback",
+        "utun",
+        "tailscale",
+        "zerotier",
+        "vethernet (wsl)",
+        "sing-box",
+    ];
+    MARKERS.iter().any(|m| lower.contains(m))
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn is_virtual_macos_iface(iface: &str) -> bool {
+    let name = iface.trim();
+    if name.is_empty() {
+        return true;
+    }
+    name == "lo"
+        || name.starts_with("lo0")
+        || name.starts_with("lo1")
+        || name.starts_with("utun")
+        || name.starts_with("tun")
+        || name.starts_with("tap")
+        || name.starts_with("gif")
+        || name.starts_with("stf")
+        || name.starts_with("awdl")
+        || name.starts_with("llw")
+        || name.starts_with("anpi")
+        || name.starts_with("bridge")
+        || name.starts_with("tailscale")
+        || name.starts_with("wg")
+        || name.starts_with("tachyon")
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn parse_macos_route_default(output: &str) -> Option<String> {
+    for line in output.lines() {
+        if let Some(rest) = line.trim().strip_prefix("interface:") {
+            let iface = rest.trim();
+            if !is_virtual_macos_iface(iface) {
+                return Some(iface.to_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn parse_macos_netstat_default(output: &str) -> Option<String> {
+    let mut fallback: Option<String> = None;
+    for line in output.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() >= 4 && cols[0] == "default" {
+            let iface = cols[3];
+            if !is_virtual_macos_iface(iface) {
+                if iface.starts_with("en") {
+                    return Some(iface.to_string());
+                }
+                if fallback.is_none() {
+                    fallback = Some(iface.to_string());
+                }
+            }
+        }
+    }
+    fallback
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn parse_macos_scutil_nwi(output: &str) -> Option<String> {
+    let mut in_ipv4 = false;
+    let mut fallback: Option<String> = None;
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("IPv4 network interface information") {
+            in_ipv4 = true;
+            continue;
+        }
+        if trimmed.starts_with("IPv6 network interface information") {
+            in_ipv4 = false;
+            continue;
+        }
+        if !in_ipv4 && output.contains("IPv4 network interface information") {
+            continue;
+        }
+        if let Some((left, right)) = trimmed.split_once(':') {
+            let cand = left.trim();
+            if !cand.contains(' ') && right.contains("flags") && !is_virtual_macos_iface(cand) {
+                if cand.starts_with("en") {
+                    return Some(cand.to_string());
+                }
+                if fallback.is_none() {
+                    fallback = Some(cand.to_string());
+                }
+            }
+        }
+    }
+    fallback
+}
+
+#[cfg(target_os = "macos")]
+fn detect_macos_phys_interface() -> Option<String> {
+    if let Ok(out) = Command::new("/sbin/route")
+        .args(["-n", "get", "default"])
+        .output()
+        && let Some(iface) = parse_macos_route_default(&String::from_utf8_lossy(&out.stdout))
+    {
+        return Some(iface);
+    }
+    if let Ok(out) = Command::new("/usr/sbin/netstat")
+        .args(["-rn", "-f", "inet"])
+        .output()
+        && let Some(iface) = parse_macos_netstat_default(&String::from_utf8_lossy(&out.stdout))
+    {
+        return Some(iface);
+    }
+    if let Ok(out) = Command::new("/usr/sbin/scutil").args(["--nwi"]).output()
+        && let Some(iface) = parse_macos_scutil_nwi(&String::from_utf8_lossy(&out.stdout))
+    {
+        return Some(iface);
+    }
+    None
 }
 
 async fn connect_bypassing_tun(addr: SocketAddr) -> std::io::Result<tokio::net::TcpStream> {
@@ -7636,12 +8045,21 @@ async fn connect_bypassing_tun(addr: SocketAddr) -> std::io::Result<tokio::net::
     {
         use std::os::windows::io::AsRawSocket;
         if !addr.ip().is_loopback() {
-            let if_idx = core_runtime::inbound::tun::active_win_outbound_if_index()
+            let active_tun_if = core_runtime::inbound::tun::active_win_outbound_if_index();
+            let cached_phys = CACHED_WIN_PHYS_IFINDEX.load(std::sync::atomic::Ordering::Relaxed);
+            let if_idx = active_tun_if
+                .filter(|&idx| windows_if_is_eligible_phys(idx))
                 .or_else(|| {
-                    let cached = CACHED_WIN_PHYS_IFINDEX.load(std::sync::atomic::Ordering::Relaxed);
-                    (cached != 0).then_some(cached)
+                    (cached_phys != 0 && windows_if_is_eligible_phys(cached_phys))
+                        .then_some(cached_phys)
                 })
                 .or_else(default_windows_phys_ifindex);
+            let worker_alive = read_core_pid_file().is_some_and(is_pid_alive);
+            if if_idx.is_none() && (worker_alive || active_tun_if.is_some()) {
+                return Err(std::io::Error::other(
+                    "physical outbound interface unavailable while TUN is active",
+                ));
+            }
             if let Some(idx) = if_idx {
                 #[link(name = "ws2_32")]
                 unsafe extern "system" {
@@ -7693,20 +8111,193 @@ static CACHED_WIN_PHYS_IFINDEX: std::sync::atomic::AtomicU32 = std::sync::atomic
 
 #[cfg(target_os = "windows")]
 pub fn refresh_cached_windows_phys_ifindex() {
-    if let Some(idx) = default_windows_phys_ifindex() {
+    if let Some(idx) = default_windows_phys_ifindex()
+        && windows_if_is_eligible_phys(idx)
+    {
         CACHED_WIN_PHYS_IFINDEX.store(idx, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
 #[cfg(target_os = "windows")]
-fn default_windows_phys_ifindex() -> Option<u32> {
+fn windows_if_has_valid_phys_ipv4(if_idx: u32) -> bool {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct MibIpAddrRow {
+        dw_addr: u32,
+        dw_index: u32,
+        dw_mask: u32,
+        dw_bcast_addr: u32,
+        dw_reasm_size: u32,
+        unused1: u16,
+        w_type: u16,
+    }
     #[link(name = "iphlpapi")]
     unsafe extern "system" {
-        fn GetBestInterface(dwDestAddr: u32, pdwBestIfIndex: *mut u32) -> u32;
+        fn GetIpAddrTable(p_ip_addr_table: *mut u8, pdw_size: *mut u32, border: i32) -> u32;
     }
+
+    let mut size: u32 = 0;
+    let _ = unsafe { GetIpAddrTable(std::ptr::null_mut(), &mut size, 0) };
+    if !(4..=1024 * 1024).contains(&size) {
+        return false;
+    }
+    let mut buf = vec![0u8; size as usize];
+    let rc = unsafe { GetIpAddrTable(buf.as_mut_ptr(), &mut size, 0) };
+    if rc != 0 || buf.len() < 4 {
+        return false;
+    }
+    let count = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    let row_size = std::mem::size_of::<MibIpAddrRow>();
+    let max_rows = (buf.len() - 4) / row_size;
+    for i in 0..count.min(max_rows) {
+        let row = unsafe {
+            std::ptr::read_unaligned(buf.as_ptr().add(4 + i * row_size) as *const MibIpAddrRow)
+        };
+        if row.dw_index == if_idx && row.dw_addr != 0 {
+            let ip = std::net::Ipv4Addr::from(row.dw_addr.to_ne_bytes());
+            let o = ip.octets();
+            if !ip.is_loopback()
+                && !ip.is_unspecified()
+                && !(o[0] == 169 && o[1] == 254)
+                && !is_fake_or_tun_ip(IpAddr::V4(ip))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct MibIfRow {
+    wsz_name: [u16; 256],
+    dw_index: u32,
+    dw_type: u32,
+    dw_mtu: u32,
+    dw_speed: u32,
+    dw_phys_addr_len: u32,
+    b_phys_addr: [u8; 8],
+    dw_admin_status: u32,
+    dw_oper_status: u32,
+    dw_last_change: u32,
+    dw_in_octets: u32,
+    dw_in_ucast_pkts: u32,
+    dw_in_nucast_pkts: u32,
+    dw_in_discards: u32,
+    dw_in_errors: u32,
+    dw_in_unknown_protos: u32,
+    dw_out_octets: u32,
+    dw_out_ucast_pkts: u32,
+    dw_out_nucast_pkts: u32,
+    dw_out_discards: u32,
+    dw_out_errors: u32,
+    dw_out_qlen: u32,
+    dw_descr_len: u32,
+    b_descr: [u8; 256],
+}
+
+#[cfg(target_os = "windows")]
+fn windows_if_is_non_virtual(if_idx: u32) -> bool {
+    const MIB_IF_TYPE_LOOPBACK: u32 = 24;
+    const IF_OPER_STATUS_CONNECTED: u32 = 4;
+    const IF_OPER_STATUS_OPERATIONAL: u32 = 5;
+    #[link(name = "iphlpapi")]
+    unsafe extern "system" {
+        fn GetIfEntry(p_if_row: *mut MibIfRow) -> u32;
+    }
+    if if_idx == 0 {
+        return false;
+    }
+    let mut row: MibIfRow = unsafe { std::mem::zeroed() };
+    row.dw_index = if_idx;
+    if unsafe { GetIfEntry(&mut row) } != 0 {
+        return false;
+    }
+    if row.dw_type == MIB_IF_TYPE_LOOPBACK {
+        return false;
+    }
+    if row.dw_oper_status != IF_OPER_STATUS_CONNECTED
+        && row.dw_oper_status != IF_OPER_STATUS_OPERATIONAL
+    {
+        return false;
+    }
+    let len = (row.dw_descr_len as usize).min(row.b_descr.len());
+    let descr = String::from_utf8_lossy(&row.b_descr[..len]);
+    !is_virtual_or_tun_adapter_name(&descr)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_if_is_eligible_phys(if_idx: u32) -> bool {
+    if_idx != 0 && windows_if_has_valid_phys_ipv4(if_idx) && windows_if_is_non_virtual(if_idx)
+}
+
+#[cfg(target_os = "windows")]
+fn default_windows_phys_ifindex() -> Option<u32> {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct MibIpForwardRow {
+        dw_forward_dest: u32,
+        dw_forward_mask: u32,
+        dw_forward_policy: u32,
+        dw_forward_next_hop: u32,
+        dw_forward_if_index: u32,
+        dw_forward_type: u32,
+        dw_forward_proto: u32,
+        dw_forward_age: u32,
+        dw_forward_next_hop_as: u32,
+        dw_forward_metric1: u32,
+        dw_forward_metric2: u32,
+        dw_forward_metric3: u32,
+        dw_forward_metric4: u32,
+        dw_forward_metric5: u32,
+    }
+    #[link(name = "iphlpapi")]
+    unsafe extern "system" {
+        fn GetIpForwardTable(p_ip_forward_table: *mut u8, pdw_size: *mut u32, b_order: i32) -> u32;
+        fn GetBestInterface(dw_dest_addr: u32, pdw_best_if_index: *mut u32) -> u32;
+    }
+
+    if let Some(core_idx) = core_runtime::inbound::tun::active_win_outbound_if_index()
+        && windows_if_is_eligible_phys(core_idx)
+    {
+        return Some(core_idx);
+    }
+
+    let mut size: u32 = 0;
+    let _ = unsafe { GetIpForwardTable(std::ptr::null_mut(), &mut size, 1) };
+    if (4..=2 * 1024 * 1024).contains(&size) {
+        let mut buf = vec![0u8; size as usize];
+        if unsafe { GetIpForwardTable(buf.as_mut_ptr(), &mut size, 1) } == 0 && buf.len() >= 4 {
+            let count = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+            let row_size = std::mem::size_of::<MibIpForwardRow>();
+            let max_rows = (buf.len() - 4) / row_size;
+            let mut candidates: Vec<(u32, u32)> = Vec::new();
+            for i in 0..count.min(max_rows) {
+                let row = unsafe {
+                    std::ptr::read_unaligned(
+                        buf.as_ptr().add(4 + i * row_size) as *const MibIpForwardRow
+                    )
+                };
+                if row.dw_forward_dest == 0
+                    && row.dw_forward_mask == 0
+                    && row.dw_forward_if_index != 0
+                {
+                    candidates.push((row.dw_forward_metric1, row.dw_forward_if_index));
+                }
+            }
+            candidates.sort_by_key(|c| c.0);
+            for (_, idx) in candidates {
+                if windows_if_is_eligible_phys(idx) {
+                    return Some(idx);
+                }
+            }
+        }
+    }
+
     let mut best_if: u32 = 0;
     let rc = unsafe { GetBestInterface(0x0808_0808, &mut best_if) };
-    if rc == 0 && best_if != 0 {
+    if rc == 0 && windows_if_is_eligible_phys(best_if) {
         Some(best_if)
     } else {
         None
@@ -7737,24 +8328,12 @@ fn default_linux_phys_interface() -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn default_macos_phys_ifindex() -> Option<libc::c_uint> {
-    if let Ok(out) = Command::new("/sbin/route")
-        .args(["-n", "get", "default"])
-        .output()
+    if let Some(iface) = detect_macos_phys_interface()
+        && let Ok(cstr) = std::ffi::CString::new(iface)
     {
-        let text = String::from_utf8_lossy(&out.stdout);
-        for line in text.lines() {
-            if let Some(rest) = line.trim().strip_prefix("interface:") {
-                let iface = rest.trim();
-                if !iface.is_empty()
-                    && !iface.starts_with("utun")
-                    && let Ok(cstr) = std::ffi::CString::new(iface)
-                {
-                    let idx = unsafe { libc::if_nametoindex(cstr.as_ptr()) };
-                    if idx != 0 {
-                        return Some(idx);
-                    }
-                }
-            }
+        let idx = unsafe { libc::if_nametoindex(cstr.as_ptr()) };
+        if idx != 0 {
+            return Some(idx);
         }
     }
     for idx_num in 0..=9 {
@@ -8581,6 +9160,7 @@ pub fn build_subscription_servers_list(nodes: &[Value], handle: &str) -> Vec<Val
         for mt in member_tags {
             if let Some(t_str) = mt.as_str()
                 && let Some(m) = leaf_by_tag.get(t_str)
+                && !is_mtproto_uri(&m.vless)
             {
                 members.push(m.clone());
             }
@@ -8655,9 +9235,10 @@ pub fn build_subscription_servers_list(nodes: &[Value], handle: &str) -> Vec<Val
     if explicit_balancer_count == 0 && leaf_entries.len() >= 2 {
         let valid_members: Vec<BalancerMember> = leaf_entries
             .iter()
-            .filter(|(_, _, _, _, host)| {
+            .filter(|(_, vless, _, _, host)| {
                 let h = host.trim();
-                !h.is_empty()
+                !is_mtproto_uri(vless)
+                    && !h.is_empty()
                     && h != "0.0.0.0"
                     && h != "127.0.0.1"
                     && !h.eq_ignore_ascii_case("localhost")
@@ -9858,5 +10439,216 @@ mod tests {
                 .iter()
                 .any(|r| r["ip_cidr"] == json!(["2001:db8::1/128"]))
         );
+    }
+
+    #[test]
+    fn tun_ip_and_virtual_adapter_filters() {
+        use std::net::{IpAddr, Ipv4Addr};
+        assert!(is_fake_or_tun_ip(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1))));
+        assert!(is_fake_or_tun_ip(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2))));
+        assert!(!is_fake_or_tun_ip(IpAddr::V4(Ipv4Addr::new(172, 20, 0, 1))));
+        assert!(is_fake_or_tun_ip(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1))));
+        assert!(is_fake_or_tun_ip(IpAddr::V4(Ipv4Addr::new(10, 255, 0, 1))));
+        assert!(!is_fake_or_tun_ip(IpAddr::V4(Ipv4Addr::new(
+            192, 168, 1, 10
+        ))));
+
+        assert!(is_virtual_or_tun_adapter_name("Wintun Userspace Tunnel"));
+        assert!(is_virtual_or_tun_adapter_name("WireGuard Tunnel"));
+        assert!(is_virtual_or_tun_adapter_name(
+            "Software Loopback Interface 1"
+        ));
+        assert!(!is_virtual_or_tun_adapter_name(
+            "Intel(R) Wi-Fi 6 AX201 160MHz"
+        ));
+        assert!(!is_virtual_or_tun_adapter_name(
+            "Realtek PCIe GbE Family Controller"
+        ));
+
+        #[cfg(target_os = "windows")]
+        {
+            // Проверяем, что структура MIB_IFROW имеет точный размер Win32 (860 байт),
+            // а поиск физического интерфейса на хосте не возвращает ошибку/панику.
+            assert_eq!(std::mem::size_of::<MibIfRow>(), 860);
+            let _ = default_windows_phys_ifindex();
+        }
+    }
+
+    #[test]
+    fn macos_phys_interface_parsers_skip_utun() {
+        let route_utun_first = "   route to: default\n destination: default\n   interface: utun4\n";
+        assert_eq!(parse_macos_route_default(route_utun_first), None);
+
+        let route_en0 = "   route to: default\n destination: default\n   gateway: 192.168.1.1\n   interface: en0\n";
+        assert_eq!(parse_macos_route_default(route_en0).as_deref(), Some("en0"));
+
+        let netstat_out = "\
+Routing tables\n\
+Internet:\n\
+Destination        Gateway            Flags               Netif Expire\n\
+0/1                link#22            UCSg                utun4\n\
+default            192.168.1.1        UGScg                 en0\n";
+        assert_eq!(
+            parse_macos_netstat_default(netstat_out).as_deref(),
+            Some("en0")
+        );
+
+        let scutil_out = "\
+IPv4 network interface information\n\
+   en0 : flags      : 0x7 (IPv4,IPv6,DNS)\n\
+   utun4 : flags    : 0x5 (IPv4,DNS)\n";
+        assert_eq!(parse_macos_scutil_nwi(scutil_out).as_deref(), Some("en0"));
+    }
+
+    #[test]
+    fn bypass_lan_splits_172_16_without_overlapping_tun_subnet() {
+        let mgr = VpnManager::new(Arc::new(|_| {}));
+        let mut st = crate::state::PersistedState::default();
+        st.vpn_prefs.route = "desync".to_string();
+        st.vpn_prefs.mode = "tun".to_string();
+        st.vpn_prefs.bypass_lan = true;
+        let opts = ConnectOptions::parse(&st.build_connect_payload(None)).unwrap();
+        let (cfg, _) = mgr.build_config(&opts).expect("build_config");
+        let excl = cfg["inbounds"][0]["route_exclude_address"]
+            .as_array()
+            .unwrap();
+        assert!(!excl.iter().any(|v| v == "172.16.0.0/12"));
+        assert!(excl.iter().any(|v| v == "172.16.0.0/15"));
+        assert!(excl.iter().any(|v| v == "172.19.1.0/24"));
+        assert!(excl.iter().any(|v| v == "172.20.0.0/14"));
+    }
+
+    #[test]
+    fn mtproto_excluded_from_auto_and_explicit_balancers() {
+        assert!(is_mtproto_uri(
+            "tg://proxy?server=1.2.3.4&port=443&secret=dd1122"
+        ));
+        assert!(is_mtproto_uri(
+            "https://t.me/proxy?server=1.2.3.4&port=443&secret=00"
+        ));
+        assert!(!is_mtproto_uri(
+            "vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443#NL"
+        ));
+
+        let nodes = vec![
+            json!({
+                "type": "socks",
+                "tag": "SOCKS #1",
+                "server": "198.51.100.1",
+                "server_port": 1080
+            }),
+            json!({
+                "type": "mtproto",
+                "tag": "MTProto #1",
+                "server": "198.51.100.2",
+                "server_port": 443,
+                "secret": "00112233445566778899aabbccddeeff"
+            }),
+            json!({
+                "type": "vless",
+                "tag": "VLESS #1",
+                "server": "198.51.100.3",
+                "server_port": 443,
+                "uuid": "11111111-1111-1111-1111-111111111111"
+            }),
+        ];
+        let srvs = build_subscription_servers_list(&nodes, "TestSub");
+        let bal_uri = srvs[0]["vless"].as_str().unwrap();
+        let bal = decode_balancer_uri(bal_uri).unwrap();
+        assert!(!bal.members.iter().any(|m| is_mtproto_uri(&m.vless)));
+
+        let poisoned = encode_balancer_uri(&BalancerPayload {
+            name: "Mixed".to_string(),
+            mode: "stability".to_string(),
+            url: default_balancer_url(),
+            interval: default_balancer_interval(),
+            tolerance: 50,
+            pool: 4,
+            pool_tolerance: 80,
+            sticky_hash: default_balancer_sticky_hash(),
+            quota_mib: 0,
+            members: vec![
+                BalancerMember {
+                    name: "TG".to_string(),
+                    vless: "tg://proxy?server=198.51.100.2&port=443&secret=00112233445566778899aabbccddeeff".to_string(),
+                    country: "xx".to_string(),
+                },
+                BalancerMember {
+                    name: "VLESS".to_string(),
+                    vless: "vless://11111111-1111-1111-1111-111111111111@198.51.100.3:443#NL".to_string(),
+                    country: "nl".to_string(),
+                },
+            ],
+        });
+        let mut used = HashSet::new();
+        let (_, obs, _) = VpnManager::expand_parsed_target(
+            &poisoned,
+            "PROXY",
+            false,
+            None,
+            &BalancerOptions::default(),
+            &mut used,
+        )
+        .expect("expand_parsed_target filters mtproto");
+        assert!(!obs.iter().any(|o| o["type"] == "mtproto"));
+    }
+
+    #[test]
+    fn per_service_and_custom_rule_node_action_builds_valid_config() {
+        let mgr = VpnManager::new(Arc::new(|_| {}));
+        let mut st = crate::state::PersistedState::default();
+        st.vpn_prefs.route = "selective".to_string();
+        st.servers.push(crate::state::ServerNode {
+            id: "srv-main".to_string(),
+            name: "Main NL".to_string(),
+            vless: "vless://11111111-1111-1111-1111-111111111111@198.51.100.10:443?security=tls&sni=example.com#Main".to_string(),
+            country: "nl".to_string(),
+            sub_id: None,
+            is_balancer: false,
+            balancer_mode: None,
+            member_count: None,
+            ping_ms: None,
+            ping_at: None,
+            alive: None,
+        });
+        st.servers.push(crate::state::ServerNode {
+            id: "srv-de".to_string(),
+            name: "Special DE".to_string(),
+            vless: "vless://22222222-2222-2222-2222-222222222222@198.51.100.20:443?security=tls&sni=de.example.com#DE".to_string(),
+            country: "de".to_string(),
+            sub_id: None,
+            is_balancer: false,
+            balancer_mode: None,
+            member_count: None,
+            ping_ms: None,
+            ping_at: None,
+            alive: None,
+        });
+        st.active_id = "srv-main".to_string();
+        st.list_modes
+            .insert("youtube".to_string(), "NODE_srv-de".to_string());
+        st.custom_rules.push(crate::state::CustomRule {
+            id: "r-node".to_string(),
+            rule_type: "domain".to_string(),
+            value: "custom-site.org".to_string(),
+            action: "NODE_srv-de".to_string(),
+            time_window: String::new(),
+        });
+
+        let opts = ConnectOptions::parse(&st.build_connect_payload(None)).unwrap();
+        let (cfg, _) = mgr.build_config(&opts).expect("build_config NODE_<id>");
+        core_config::check_str(&cfg.to_string()).expect("check_str NODE_<id>");
+        let outbounds = cfg["outbounds"].as_array().unwrap();
+        assert!(outbounds.iter().any(|o| o["tag"] == "NODE_SRV-DE"));
+        let rules = cfg["route"]["rules"].as_array().unwrap();
+        assert!(rules.iter().any(|r| {
+            r["domain_suffix"] == json!(["custom-site.org"]) && r["outbound"] == "NODE_SRV-DE"
+        }));
+        assert!(rules.iter().any(|r| {
+            r["outbound"] == "NODE_SRV-DE"
+                && r["rule_set"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|v| v == "rs-youtube"))
+        }));
     }
 }
