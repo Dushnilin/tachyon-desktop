@@ -6,25 +6,19 @@ use std::path::PathBuf;
 #[allow(dead_code)]
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
 pub struct ServerNode {
     pub id: String,
     pub name: String,
     pub country: String,
     pub vless: String,
-    #[serde(default)]
     pub sub_id: Option<String>,
-    #[serde(default)]
     pub is_balancer: bool,
-    #[serde(default)]
     pub balancer_mode: Option<String>,
-    #[serde(default)]
     pub member_count: Option<usize>,
-    #[serde(default)]
     pub ping_ms: Option<i64>,
-    #[serde(default)]
     pub ping_at: Option<u64>,
-    #[serde(default)]
     pub alive: Option<bool>,
 }
 
@@ -46,16 +40,14 @@ pub struct SubscriptionMeta {
     pub announce: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
 pub struct SubscriptionItem {
     pub id: String,
     pub url: String,
     pub handle: String,
-    #[serde(default)]
     pub count: usize,
-    #[serde(default)]
     pub updated_at: String,
-    #[serde(default)]
     pub meta: Option<SubscriptionMeta>,
 }
 
@@ -63,6 +55,7 @@ pub struct SubscriptionItem {
 pub type SubscriptionEntry = SubscriptionItem;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct CustomRule {
     pub id: String,
     #[serde(default = "default_rule_type")]
@@ -72,6 +65,18 @@ pub struct CustomRule {
     pub action: String, // "vpn" | "desync" | "direct" | "block" | "NODE_<id>"
     #[serde(default)]
     pub time_window: String,
+}
+
+impl Default for CustomRule {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            rule_type: default_rule_type(),
+            value: String::new(),
+            action: default_rule_action(),
+            time_window: String::new(),
+        }
+    }
 }
 
 fn default_rule_type() -> String {
@@ -104,6 +109,8 @@ pub struct VpnPrefs {
     pub tun_mtu: u32,
     #[serde(default)]
     pub allow_lan: bool,
+    #[serde(default = "default_true")]
+    pub bypass_lan: bool,
     #[serde(default = "default_log_level")]
     pub log_level: String, // "warn" | "info" | "debug" | "error"
     #[serde(default)]
@@ -283,6 +290,7 @@ impl Default for VpnPrefs {
             dns_route_mode: default_dns_route_mode(),
             tun_mtu: default_mtu(),
             allow_lan: false,
+            bypass_lan: true,
             log_level: default_log_level(),
             kill_switch: false,
             autostart: false,
@@ -417,7 +425,7 @@ fn default_split_pos() -> String {
     "1,sniext+1,host+1,midsld".to_string()
 }
 fn default_fake_ttl() -> u32 {
-    5
+    6
 }
 fn default_fake_sni() -> String {
     "www.google.com,rzd.ru,vk.com,ya.ru,max.ru".to_string()
@@ -529,7 +537,7 @@ pub const ROUTE_CATALOG: &[RouteCatalogItem] = &[
         id: "russia_inside",
         name: "ITDog Russia-Inside (расширенный список)",
         group: "Базовые списки РФ",
-        desc: "Сервисы и CDN, замедляющиеся при работе из-за рубежа",
+        desc: "Сервисы и CDN с региональной фильтрацией трафика",
         default_action: "off",
     },
     RouteCatalogItem {
@@ -1002,6 +1010,8 @@ pub struct PersistedState {
     pub language: String,
     #[serde(default)]
     pub auto_ping: AutoPingPrefs,
+    #[serde(default)]
+    pub webview_migrated: bool,
 }
 
 fn default_language() -> String {
@@ -1032,6 +1042,7 @@ impl Default for PersistedState {
             light_theme: false,
             language: default_language(),
             auto_ping: AutoPingPrefs::default(),
+            webview_migrated: false,
         }
     }
 }
@@ -1070,46 +1081,96 @@ impl PersistedState {
         changed
     }
 
-    pub fn load() -> Self {
-        let path = Self::state_file_path();
-        if let Ok(raw) = fs::read_to_string(&path)
-            && let Ok(mut parsed) = serde_json::from_str::<Self>(&raw)
+    fn finalize_loaded(mut parsed: Self) -> Self {
+        for item in ROUTE_CATALOG {
+            parsed
+                .list_modes
+                .entry(item.id.to_string())
+                .or_insert_with(|| item.default_action.to_string());
+        }
+        if !parsed.active_id.is_empty() && !parsed.servers.iter().any(|s| s.id == parsed.active_id)
         {
-            for item in ROUTE_CATALOG {
-                parsed
-                    .list_modes
-                    .entry(item.id.to_string())
-                    .or_insert_with(|| item.default_action.to_string());
-            }
-            if parsed.active_id.is_empty() && !parsed.servers.is_empty() {
-                parsed.active_id = parsed.servers[0].id.clone();
-            }
-            let normalized = parsed.normalize_servers();
-            if !parsed.servers.is_empty() || !parsed.subscriptions.is_empty() {
-                if normalized {
-                    parsed.save();
-                }
-                return parsed;
-            }
-            if migrate_from_webview_localstorage(&mut parsed) {
+            parsed.active_id.clear();
+        }
+        if parsed.active_id.is_empty() && !parsed.servers.is_empty() {
+            parsed.active_id = parsed.servers[0].id.clone();
+        }
+        let mut needs_save = parsed.normalize_servers();
+        if !parsed.webview_migrated {
+            if parsed.servers.is_empty()
+                && parsed.subscriptions.is_empty()
+                && migrate_from_webview_localstorage(&mut parsed)
+            {
                 parsed.normalize_servers();
-                parsed.save();
             }
-            return parsed;
+            parsed.webview_migrated = true;
+            needs_save = true;
+        }
+        if needs_save {
+            parsed.save();
+        }
+        parsed
+    }
+
+    pub fn load_from_path(path: &std::path::Path) -> Self {
+        let bak_path = path.with_extension("json.bak");
+        if let Ok(raw) = fs::read_to_string(path) {
+            if let Ok(parsed) = serde_json::from_str::<Self>(&raw) {
+                return Self::finalize_loaded(parsed);
+            }
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let corrupt_path = path.with_extension(format!("json.corrupt.{ts}"));
+            let _ = fs::write(&corrupt_path, &raw);
+        }
+        if let Ok(bak_raw) = fs::read_to_string(&bak_path)
+            && let Ok(parsed) = serde_json::from_str::<Self>(&bak_raw)
+        {
+            return Self::finalize_loaded(parsed);
         }
         let mut state = Self::default();
         if migrate_from_webview_localstorage(&mut state) {
             state.normalize_servers();
-            state.save();
         }
+        state.webview_migrated = true;
+        state.save_to_path(path);
         state
     }
 
-    pub fn save(&self) {
-        let path = Self::state_file_path();
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = fs::write(path, json);
+    pub fn save_to_path(&self, path: &std::path::Path) {
+        use std::io::Write;
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
         }
+        let Ok(json) = serde_json::to_string_pretty(self) else {
+            return;
+        };
+        let tmp_path = path.with_extension("json.tmp");
+        let bak_path = path.with_extension("json.bak");
+        let Ok(mut file) = fs::File::create(&tmp_path) else {
+            return;
+        };
+        if file.write_all(json.as_bytes()).is_err() || file.sync_all().is_err() {
+            let _ = fs::remove_file(&tmp_path);
+            return;
+        }
+        drop(file);
+        if path.exists() {
+            let _ = fs::copy(path, &bak_path);
+        }
+        if fs::rename(&tmp_path, path).is_err() && fs::copy(&tmp_path, path).is_ok() {
+            let _ = fs::remove_file(&tmp_path);
+        }
+    }
+
+    pub fn load() -> Self {
+        Self::load_from_path(&Self::state_file_path())
+    }
+
+    pub fn save(&self) {
+        self.save_to_path(&Self::state_file_path());
     }
 
     pub fn active_server(&self) -> Option<&ServerNode> {
@@ -1193,6 +1254,7 @@ impl PersistedState {
             }
         };
 
+        let mut active_multi_services: Vec<String> = Vec::new();
         for (id, action) in &self.list_modes {
             let act = action.trim();
             if act.is_empty() || act == "off" {
@@ -1206,6 +1268,7 @@ impl PersistedState {
             });
             seen_lists.insert(id.clone());
             if let Some(svc) = svc_override {
+                active_multi_services.push(svc.clone());
                 community_lists.push(serde_json::json!({
                     "name": id,
                     "action": format!("urltest-svc-{svc}"),
@@ -1219,20 +1282,33 @@ impl PersistedState {
         }
 
         for svc in &multi_services {
+            if svc == "https" {
+                active_multi_services.push(svc.clone());
+                continue;
+            }
             let Some(list_id) = multi_svc_list(svc.as_str()) else {
                 continue;
             };
-            if seen_lists.insert(list_id.to_string()) {
+            let explicit_off_or_other = self
+                .list_modes
+                .get(list_id)
+                .map(|m| m.trim())
+                .is_some_and(|m| m != "vpn" && m != "proxy");
+            if !explicit_off_or_other && seen_lists.insert(list_id.to_string()) {
+                active_multi_services.push(svc.clone());
                 community_lists.push(serde_json::json!({
                     "name": list_id,
                     "action": format!("urltest-svc-{svc}"),
                 }));
             }
         }
+        active_multi_services.sort();
+        active_multi_services.dedup();
 
         if self.vpn_prefs.ru_bypass {
             for id in ["ru_domains", "ru_only_inside"] {
-                if !seen_lists.contains(id) {
+                let explicit_mode = self.list_modes.get(id).map(|m| m.trim());
+                if explicit_mode.is_none() && !seen_lists.contains(id) {
                     seen_lists.insert(id.to_string());
                     community_lists.push(serde_json::json!({
                         "name": id,
@@ -1244,7 +1320,8 @@ impl PersistedState {
 
         if self.vpn_prefs.adblock {
             for id in ["ads_all", "adguard", "win_telemetry"] {
-                if !seen_lists.contains(id) {
+                let explicit_mode = self.list_modes.get(id).map(|m| m.trim());
+                if explicit_mode.is_none() && !seen_lists.contains(id) {
                     seen_lists.insert(id.to_string());
                     community_lists.push(serde_json::json!({
                         "name": id,
@@ -1343,7 +1420,7 @@ impl PersistedState {
             "excludedProtocols": self.vpn_prefs.balancer_excluded_protocols,
             "includeRegex": self.vpn_prefs.balancer_include_regex.trim(),
             "excludeRegex": self.vpn_prefs.balancer_exclude_regex.trim(),
-            "multiServices": multi_services
+            "multiServices": active_multi_services
         });
 
         let desync_json = serde_json::json!({
@@ -1377,6 +1454,7 @@ impl PersistedState {
             "udpKeepSocket": self.desync_prefs.udp_keep_socket,
             "autoTune": self.desync_prefs.auto_tune,
             "blockQuic": self.desync_prefs.block_quic,
+            "stunFake": self.desync_prefs.stun_fake,
             "anticheatBypass": self.desync_prefs.anticheat_bypass,
             "listsOverrideGameBypass": self.desync_prefs.lists_override_game_bypass,
         });
@@ -1408,6 +1486,7 @@ impl PersistedState {
             "ntpServer": self.vpn_prefs.ntp_server.trim(),
             "mtu": self.vpn_prefs.tun_mtu,
             "allowLan": self.vpn_prefs.allow_lan,
+            "bypassLan": self.vpn_prefs.bypass_lan,
             "proxyTlsFragment": self.vpn_prefs.tls_fragment,
             "logLevel": self.vpn_prefs.log_level,
             "killSwitch": self.vpn_prefs.kill_switch,
@@ -1431,16 +1510,29 @@ pub fn extract_host_port_from_uri(uri: &str) -> Option<(String, u16)> {
     {
         return None;
     }
-    if let Ok(node) = core_config::subscription::parse_share_uri(trimmed) {
-        let server = node.get("server").and_then(|v| v.as_str())?.trim();
-        if server.is_empty() {
-            return None;
+    if let Ok(node) = crate::vpn::parse_node_uri(trimmed) {
+        if let Some(server) = node
+            .get("server")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let port = node
+                .get("server_port")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(443) as u16;
+            return Some((server.to_string(), port));
         }
-        let port = node
-            .get("server_port")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(443) as u16;
-        return Some((server.to_string(), port));
+        if let Some(peer0) = node.pointer("/peers/0")
+            && let Some(addr) = peer0
+                .get("address")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        {
+            let port = peer0.get("port").and_then(|v| v.as_u64()).unwrap_or(51820) as u16;
+            return Some((addr.to_string(), port));
+        }
     }
     let after_scheme = trimmed.split_once("://")?.1;
     let authority = after_scheme.split(['/', '?', '#']).next()?;
@@ -1508,8 +1600,12 @@ pub fn detect_country_code(name: &str) -> String {
         i += 1;
     }
 
-    // 2. Check Russian & English country / city names
+    // 2. Check Russian & English country / city names (word-boundary safe for short tokens)
     let lower = name.to_lowercase();
+    let lower_words: Vec<&str> = lower
+        .split(|c: char| !c.is_alphabetic() && !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .collect();
     for (needles, cc) in [
         (&["финлянд", "finland", "хельсинки", "helsinki"][..], "fi"),
         (&["эстон", "estonia", "таллин", "tallinn"][..], "ee"),
@@ -1543,10 +1639,7 @@ pub fn detect_country_code(name: &str) -> String {
             &["испан", "spain", "мадрид", "madrid", "барселон"][..],
             "es",
         ),
-        (
-            &["итали", "italy", "милан", "milan", "рим", "rome"][..],
-            "it",
-        ),
+        (&["итали", "italy", "милан", "milan", "rome"][..], "it"),
         (&["латви", "latvia", "рига", "riga"][..], "lv"),
         (&["литв", "lithuania", "вильнюс", "vilnius"][..], "lt"),
         (
@@ -1565,7 +1658,6 @@ pub fn detect_country_code(name: &str) -> String {
             &[
                 "сша",
                 "америк",
-                "usa",
                 "united states",
                 "нью-йорк",
                 "new york",
@@ -1618,9 +1710,12 @@ pub fn detect_country_code(name: &str) -> String {
         (&["украин", "ukraine", "киев", "kyiv"][..], "ua"),
         (&["сингапур", "singapore"][..], "sg"),
         (&["япони", "japan", "токио", "tokyo", "осака"][..], "jp"),
-        (&["коре", "korea", "сеул", "seoul"][..], "kr"),
+        (
+            &["корея", "корее", "корей", "korea", "сеул", "seoul"][..],
+            "kr",
+        ),
         (&["гонконг", "hong kong", "hongkong"][..], "hk"),
-        (&["оаэ", "эмират", "дубай", "dubai", "uae"][..], "ae"),
+        (&["оаэ", "эмират", "дубай", "dubai"][..], "ae"),
         (
             &["канад", "canada", "торонто", "toronto", "монреаль"][..],
             "ca",
@@ -1632,7 +1727,7 @@ pub fn detect_country_code(name: &str) -> String {
         (&["дани", "denmark", "копенгаген", "copenhagen"][..], "dk"),
         (&["ирланд", "ireland", "дублин", "dublin"][..], "ie"),
         (&["израил", "israel", "тель-авив"][..], "il"),
-        (&["инди", "india", "мумбаи", "mumbai"][..], "in"),
+        (&["индия", "индии", "india", "мумбаи", "mumbai"][..], "in"),
         (&["бразил", "brazil", "сан-паулу"][..], "br"),
         (&["австрал", "australia", "сидней", "sydney"][..], "au"),
         (&["молдов", "moldova", "кишин"][..], "md"),
@@ -1649,19 +1744,28 @@ pub fn detect_country_code(name: &str) -> String {
             return cc.to_string();
         }
     }
+    for (words, cc) in [
+        (&["рим", "рима", "риме"][..], "it"),
+        (&["usa"][..], "us"),
+        (&["uae"][..], "ae"),
+    ] {
+        if words.iter().any(|w| lower_words.contains(w)) {
+            return cc.to_string();
+        }
+    }
 
-    // 3. Fallback: explicit 2-letter ISO code token
+    // 3. Fallback: explicit uppercase 2-letter ISO code token (avoids false positives on English words like "in", "at", "be", "no", "it")
     const KNOWN_CODES: &[&str] = &[
-        "nl", "de", "fi", "us", "gb", "uk", "fr", "se", "pl", "tr", "kz", "ru", "ee", "lv", "lt",
-        "ch", "at", "cz", "it", "es", "be", "sg", "jp", "kr", "hk", "ae", "ca", "bg", "ro", "hu",
-        "no", "dk", "ie", "il", "in", "br", "au", "ua", "by", "md", "ge", "am", "az", "uz", "eu",
+        "NL", "DE", "FI", "US", "GB", "UK", "FR", "SE", "PL", "TR", "KZ", "RU", "EE", "LV", "LT",
+        "CH", "AT", "CZ", "IT", "ES", "BE", "SG", "JP", "KR", "HK", "AE", "CA", "BG", "RO", "HU",
+        "NO", "DK", "IE", "IL", "IN", "BR", "AU", "UA", "BY", "MD", "GE", "AM", "AZ", "UZ", "EU",
     ];
-    for token in lower.split(|c: char| !c.is_alphabetic()) {
+    for token in name.split(|c: char| !c.is_ascii_alphanumeric()) {
         if token.len() == 2 && KNOWN_CODES.contains(&token) {
-            return if token == "uk" {
+            return if token == "UK" {
                 "gb".to_string()
             } else {
-                token.to_string()
+                token.to_ascii_lowercase()
             };
         }
     }
@@ -2309,4 +2413,83 @@ fn extract_balanced_json_object(slice: &[u8]) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atomic_save_and_corrupt_backup_recovery() {
+        let dir = std::env::temp_dir().join(format!("tachyon-state-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+
+        let mut st = PersistedState {
+            active_id: "s-1".to_string(),
+            ..Default::default()
+        };
+        st.servers.push(ServerNode {
+            id: "s-1".to_string(),
+            name: "DE-1".to_string(),
+            country: "de".to_string(),
+            vless: "vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443#DE".to_string(),
+            ..Default::default()
+        });
+        st.save_to_path(&path);
+
+        st.language = "en".to_string();
+        st.save_to_path(&path);
+        assert!(path.with_extension("json.bak").exists());
+
+        fs::write(&path, "{corrupted json").unwrap();
+        let recovered = PersistedState::load_from_path(&path);
+        assert_eq!(recovered.servers.len(), 1);
+        assert_eq!(recovered.servers[0].id, "s-1");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explicit_off_list_overrides_ru_bypass_and_adblock_in_payload() {
+        let mut st = PersistedState::default();
+        st.list_modes
+            .insert("ru_domains".to_string(), "off".to_string());
+        st.list_modes
+            .insert("ads_all".to_string(), "off".to_string());
+        st.vpn_prefs.ru_bypass = true;
+        st.vpn_prefs.adblock = true;
+        st.vpn_prefs.bypass_lan = false;
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&st.build_connect_payload(None)).unwrap();
+        assert_eq!(payload["bypassLan"], false);
+        let lists = payload["communityLists"].as_array().unwrap();
+        assert!(!lists.iter().any(|x| x["name"] == "ru_domains"));
+        assert!(!lists.iter().any(|x| x["name"] == "ads_all"));
+    }
+
+    #[test]
+    fn extract_host_port_supports_tachyon_node_uri() {
+        let node = serde_json::json!({
+            "type": "masque",
+            "tag": "CF WARP",
+            "server": "162.159.198.1",
+            "server_port": 443
+        });
+        let uri = crate::vpn::encode_inline_node_uri(&node);
+        let res = extract_host_port_from_uri(&uri);
+        assert_eq!(res, Some(("162.159.198.1".to_string(), 443)));
+    }
+
+    #[test]
+    fn detect_country_code_avoids_false_positives() {
+        assert_eq!(detect_country_code("Fast node in Europe"), "eu");
+        assert_eq!(detect_country_code("High speed server"), "auto");
+        assert_eq!(detect_country_code("DE Frankfurt #1"), "de");
+        assert_eq!(detect_country_code("Америка / Нью-Йорк"), "us");
+        assert_eq!(detect_country_code("Корейский сервер"), "kr");
+        assert_eq!(detect_country_code("Сервер Рим"), "it");
+    }
 }

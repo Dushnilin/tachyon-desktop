@@ -29,6 +29,7 @@ pub struct Theme {
     pub accent: Rgba,
     #[allow(dead_code)]
     pub accent_2: Rgba,
+    pub on_accent: Rgba,
     pub accent_bg: Rgba,
     pub accent_border: Rgba,
     pub green: Rgba,
@@ -59,6 +60,7 @@ impl Theme {
             text_mute: rgb_hex(0x52525E),
             accent: rgb_hex(0xB9A8FF),
             accent_2: rgb_hex(0x9179F2),
+            on_accent: rgb_hex(0x0B0B0D),
             accent_bg: rgba_hex(0xB9A8FF1C),
             accent_border: rgba_hex(0xB9A8FF59),
             green: rgb_hex(0x4CC38A),
@@ -89,6 +91,7 @@ impl Theme {
             text_mute: rgb_hex(0x9898A3),
             accent: rgb_hex(0x5B3FD6),
             accent_2: rgb_hex(0x472CB8),
+            on_accent: rgb_hex(0xFFFFFF),
             accent_bg: rgba_hex(0x5B3FD617),
             accent_border: rgba_hex(0x5B3FD64D),
             green: rgb_hex(0x18794E),

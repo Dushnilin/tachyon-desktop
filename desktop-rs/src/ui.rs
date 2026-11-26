@@ -2,19 +2,19 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(not(target_os = "windows"))]
+use gpui::MouseDownEvent;
 use gpui::component::Sizable as _;
 use gpui::component::input::{Input, InputEvent, InputState};
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, Entity, FontWeight, Render, SharedString,
-    Subscription, Window, WindowControlArea, div, img, px, svg,
+    AnyElement, App, ClipboardItem, Context, Entity, FontWeight, KeyDownEvent, MouseButton, Render,
+    SharedString, Subscription, Window, WindowControlArea, div, img, px, svg,
 };
-#[cfg(not(target_os = "windows"))]
-use gpui::{MouseButton, MouseDownEvent};
 use serde_json::{Value, json};
 
 use crate::icons::flag_image;
@@ -117,6 +117,12 @@ pub struct ActiveConnectionRow {
     pub rule: String,
     pub dl: u64,
     pub ul: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ToastKind {
+    Info,
+    Error,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -222,7 +228,7 @@ pub struct TachyonApp {
     pub speedtest: SpeedtestStatus,
     pub log_tail: String,
     pub log_filter_level: String,
-    pub toast: Option<(String, Instant)>,
+    pub toast: Option<(String, ToastKind, Instant)>,
     pub update_banner: UpdateBanner,
     pub last_conns_poll: Instant,
     // Живой RTT через туннель (не затирает прямой пинг узла)
@@ -230,6 +236,10 @@ pub struct TachyonApp {
     // Автопинг
     pub last_auto_ping: Instant,
     pub auto_ping_busy: Option<Instant>,
+    pub exit_info_gen: u64,
+    pub apps_scanning: bool,
+    pub auto_desync_fallback: bool,
+    pub last_uptime_tick: Instant,
     // Трей и новые функции ядра
     pub close_to_tray_flag: Arc<AtomicBool>,
     pub desync_probe_domain: String,
@@ -494,7 +504,6 @@ impl TachyonApp {
                 |this, state, event, _, cx| match event {
                     InputEvent::Change => {
                         this.state.vpn_prefs.custom_dns = state.read(cx).value().trim().to_string();
-                        this.state.save();
                         cx.notify();
                     }
                     InputEvent::PressEnter { .. } | InputEvent::Blur => {
@@ -529,7 +538,6 @@ impl TachyonApp {
                 |this, state, event, _, cx| match event {
                     InputEvent::Change => {
                         this.state.vpn_prefs.ntp_server = state.read(cx).value().trim().to_string();
-                        this.state.save();
                         cx.notify();
                     }
                     InputEvent::PressEnter { .. } | InputEvent::Blur => {
@@ -549,7 +557,6 @@ impl TachyonApp {
                 |this, state, event, _, cx| match event {
                     InputEvent::Change => {
                         this.state.desync_prefs.fake_sni = state.read(cx).value().to_string();
-                        this.state.save();
                         cx.notify();
                     }
                     InputEvent::PressEnter { .. } | InputEvent::Blur => {
@@ -569,7 +576,6 @@ impl TachyonApp {
                     InputEvent::Change => {
                         this.state.desync_prefs.udp_out_range =
                             state.read(cx).value().trim().to_string();
-                        this.state.save();
                         cx.notify();
                     }
                     InputEvent::PressEnter { .. } | InputEvent::Blur => {
@@ -589,7 +595,6 @@ impl TachyonApp {
                     InputEvent::Change => {
                         this.state.desync_prefs.udp_fake_payload =
                             state.read(cx).value().trim().to_string();
-                        this.state.save();
                         cx.notify();
                     }
                     InputEvent::PressEnter { .. } | InputEvent::Blur => {
@@ -786,6 +791,10 @@ impl TachyonApp {
             live_rtt_ms: None,
             last_auto_ping: Instant::now(),
             auto_ping_busy: None,
+            exit_info_gen: 0,
+            apps_scanning: false,
+            auto_desync_fallback: false,
+            last_uptime_tick: Instant::now(),
             close_to_tray_flag,
             desync_probe_domain: "www.youtube.com".to_string(),
             desync_probe_busy: false,
@@ -806,6 +815,9 @@ impl TachyonApp {
 
         // Initial background tasks
         app.ping_all_nodes();
+        if let Some(pending) = crate::take_pending_uri() {
+            app.add_single_server_uri(&pending, None);
+        }
         if app.state.vpn_prefs.auto_connect && app.state.active_server().is_some() {
             app.toggle_connection();
         }
@@ -837,13 +849,17 @@ impl TachyonApp {
     }
 
     pub fn show_toast(&mut self, msg: impl Into<String>) {
-        self.toast = Some((msg.into(), Instant::now()));
+        self.toast = Some((msg.into(), ToastKind::Info, Instant::now()));
+    }
+
+    pub fn show_error_toast(&mut self, msg: impl Into<String>) {
+        self.toast = Some((msg.into(), ToastKind::Error, Instant::now()));
     }
 
     pub fn quit_app(&mut self) {
         let v = self.vpn.clone();
         self.rt.block_on(async move {
-            v.disconnect().await;
+            let _ = tokio::time::timeout(Duration::from_secs(3), v.disconnect()).await;
         });
         crate::tray::shutdown();
         std::process::exit(0);
@@ -869,14 +885,18 @@ impl TachyonApp {
         }
 
         let mut needs_notify = false;
-        if let Some((_, ts)) = &self.toast
+        if let Some((_, _, ts)) = &self.toast
             && ts.elapsed() > Duration::from_secs(4)
         {
             self.toast = None;
             needs_notify = true;
         }
         if self.vpn_status == "connected" {
-            needs_notify = true;
+            if self.tab == Tab::Tunnel && self.last_uptime_tick.elapsed() >= Duration::from_secs(1)
+            {
+                self.last_uptime_tick = Instant::now();
+                needs_notify = true;
+            }
             if self.tab == Tab::Traffic
                 && self.last_conns_poll.elapsed() >= Duration::from_millis(1800)
             {
@@ -932,6 +952,9 @@ impl TachyonApp {
                                 self.rx_bps = 0;
                                 self.tx_bps = 0;
                                 self.live_balancer = None;
+                                self.live_rtt_ms = None;
+                                self.exit_info = ExitNodeInfo::default();
+                                self.exit_info_gen = self.exit_info_gen.wrapping_add(1);
                                 if prev != "disconnected" {
                                     self.trigger_auto_ping_debounced();
                                 }
@@ -941,12 +964,16 @@ impl TachyonApp {
                                 self.connected_since = None;
                                 self.rx_bps = 0;
                                 self.tx_bps = 0;
+                                self.live_balancer = None;
+                                self.live_rtt_ms = None;
+                                self.exit_info = ExitNodeInfo::default();
+                                self.exit_info_gen = self.exit_info_gen.wrapping_add(1);
                                 let err = doc
                                     .get("error")
                                     .and_then(Value::as_str)
                                     .unwrap_or("Ошибка запуска туннеля");
                                 self.last_error = err.to_string();
-                                self.show_toast(err.to_string());
+                                self.show_error_toast(err.to_string());
                             }
                             _ => {}
                         }
@@ -998,13 +1025,19 @@ impl TachyonApp {
                     self.tx_bps = 0;
                     self.live_balancer = None;
                     self.live_rtt_ms = None;
+                    self.exit_info = ExitNodeInfo::default();
+                    self.exit_info_gen = self.exit_info_gen.wrapping_add(1);
                     if prev != "disconnected" {
                         self.trigger_auto_ping_debounced();
                     }
                 }
             } else if let Some(err) = msg.strip_prefix("error:") {
                 self.last_error = err.to_string();
-                self.show_toast(format!("Ошибка: {err}"));
+                self.show_error_toast(if self.is_en() {
+                    format!("Error: {err}")
+                } else {
+                    format!("Ошибка: {err}")
+                });
             } else if let Some(sp) = msg.strip_prefix("speed:") {
                 let parts: Vec<&str> = sp.split('|').collect();
                 if parts.len() >= 4 {
@@ -1055,6 +1088,10 @@ impl TachyonApp {
                 self.handle_subscription_result(sub_str);
             } else if msg == "tray:toggle-vpn" {
                 self.toggle_connection();
+            } else if msg == "tray:show" {
+                if let Some(pending) = crate::take_pending_uri() {
+                    self.add_single_server_uri(&pending, None);
+                }
             } else if msg == "tray:exit" {
                 self.quit_app();
             } else if let Some(warp_str) = msg.strip_prefix("warp:result:") {
@@ -1083,12 +1120,22 @@ impl TachyonApp {
                             .get("error")
                             .and_then(Value::as_str)
                             .unwrap_or("Не удалось зарегистрировать WARP");
-                        self.show_toast(format!("WARP: {e}"));
+                        self.show_error_toast(format!("WARP: {e}"));
                     }
                 }
             } else if let Some(geo_str) = msg.strip_prefix("exit:geo:") {
+                let (gen_match, json_str) = if let Some((g_str, rest)) = geo_str.split_once(':')
+                    && let Ok(g_num) = g_str.parse::<u64>()
+                {
+                    (g_num == self.exit_info_gen, rest)
+                } else {
+                    (true, geo_str)
+                };
+                if !gen_match {
+                    continue;
+                }
                 self.exit_info.loading = false;
-                if let Ok(doc) = serde_json::from_str::<Value>(geo_str) {
+                if let Ok(doc) = serde_json::from_str::<Value>(json_str) {
                     if doc.get("ok").and_then(Value::as_bool) == Some(true) {
                         self.exit_info.ok = true;
                         self.exit_info.ip = doc
@@ -1382,7 +1429,11 @@ impl TachyonApp {
                 self.show_toast("Обновление установлено, перезапуск...");
             } else if let Some(err_str) = msg.strip_prefix("core-update:error:") {
                 self.update_banner.downloading = false;
-                self.show_toast(format!("Обновление: {err_str}"));
+                self.show_error_toast(if self.is_en() {
+                    format!("Update: {err_str}")
+                } else {
+                    format!("Обновление: {err_str}")
+                });
             } else if let Some(upd_str) = msg.strip_prefix("update:status:") {
                 if let Ok(doc) = serde_json::from_str::<Value>(upd_str) {
                     let st = doc.get("status").and_then(Value::as_str).unwrap_or("");
@@ -1401,7 +1452,10 @@ impl TachyonApp {
                                 .to_string();
                         }
                         "up-to-date" => {
-                            self.show_toast("Установлена актуальная версия Tachyon");
+                            self.show_toast(self.tr(
+                                "Установлена актуальная версия Tachyon",
+                                "Tachyon is up to date",
+                            ));
                         }
                         "downloading" => {
                             self.update_banner.downloading = true;
@@ -1414,16 +1468,23 @@ impl TachyonApp {
                                 .get("message")
                                 .and_then(Value::as_str)
                                 .unwrap_or("Ошибка обновления");
-                            self.show_toast(err.to_string());
+                            self.show_error_toast(err.to_string());
                         }
                         _ => {}
                     }
                 }
             } else if let Some(prog) = msg.strip_prefix("lists-update:progress:") {
-                self.show_toast(format!("Обновление списков маршрутизации: {prog}"));
+                self.show_toast(if self.is_en() {
+                    format!("Updating route lists: {prog}")
+                } else {
+                    format!("Обновление списков маршрутизации: {prog}")
+                });
             } else if let Some(done) = msg.strip_prefix("lists-update:done:") {
-                self.show_toast(format!("Списки маршрутов .trs обновлены ({done})"));
-                self.reconnect_if_active();
+                self.show_toast(if self.is_en() {
+                    format!("Route lists (.trs) updated ({done})")
+                } else {
+                    format!("Списки маршрутов .trs обновлены ({done})")
+                });
             } else if let Some(done_str) = msg.strip_prefix("lists:refreshed:") {
                 if let Ok(doc) = serde_json::from_str::<Value>(done_str) {
                     let ok = doc.get("ok").and_then(Value::as_u64).unwrap_or(0);
@@ -1553,7 +1614,7 @@ impl TachyonApp {
                 self.diag_busy = false;
                 if let Ok(doc) = serde_json::from_str::<Value>(dm) {
                     if let Some(err) = doc.get("error").and_then(Value::as_str) {
-                        self.show_toast(format!("Memory: {err}"));
+                        self.show_error_toast(format!("Memory: {err}"));
                     } else {
                         let rss = doc.get("rss_bytes").and_then(Value::as_u64).unwrap_or(0);
                         let lvl = doc
@@ -1571,7 +1632,7 @@ impl TachyonApp {
                         self.memory_report = Some(doc.clone());
                         self.inspector_report = Some(format!(
                             "RSS: {} · Pressure: {lvl} · Conns: {conns} · FakeIP: {fk}",
-                            format_bytes_human(rss)
+                            format_bytes_human(rss, self.is_en())
                         ));
                     }
                 }
@@ -1588,6 +1649,56 @@ impl TachyonApp {
                 self.show_toast(tmsg.to_string());
             } else if let Some(mh) = msg.strip_prefix("macos_helper:done:") {
                 self.handle_macos_helper_event(mh);
+            } else if let Some(raw_items) = msg.strip_prefix("conf:import-items:") {
+                if let Ok(items) = serde_json::from_str::<Vec<(String, String)>>(raw_items) {
+                    let count = items.len();
+                    for (stem, content) in items {
+                        self.add_single_server_uri(&content, Some(&stem));
+                    }
+                    if count > 0 {
+                        self.show_toast(if self.is_en() {
+                            format!("Imported configuration files: {count}")
+                        } else {
+                            format!("Импортировано файлов конфигурации: {count}")
+                        });
+                    }
+                }
+            } else if let Some(apps_raw) = msg.strip_prefix("apps:scanned:") {
+                self.apps_scanning = false;
+                let (with_toast, json_part) = if let Some(rest) = apps_raw.strip_prefix("toast:") {
+                    (true, rest)
+                } else {
+                    (false, apps_raw)
+                };
+                if let Ok(apps) = serde_json::from_str::<Vec<RunningApp>>(json_part) {
+                    self.running_apps = apps;
+                    if with_toast {
+                        self.show_toast(if self.is_en() {
+                            format!("Found active processes: {}", self.running_apps.len())
+                        } else {
+                            format!("Найдено активных процессов: {}", self.running_apps.len())
+                        });
+                    }
+                }
+            } else if let Some(tail_raw) = msg.strip_prefix("log:tail:") {
+                let (with_toast, body) = if let Some(rest) = tail_raw.strip_prefix("toast:") {
+                    (true, rest)
+                } else {
+                    (false, tail_raw)
+                };
+                self.log_tail = body.to_string();
+                if with_toast {
+                    let cnt = self
+                        .log_tail
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .count();
+                    self.show_toast(if self.is_en() {
+                        format!("Log refreshed: {cnt} lines")
+                    } else {
+                        format!("Лог обновлён: {cnt} строк")
+                    });
+                }
             }
         }
 
@@ -1609,10 +1720,12 @@ impl TachyonApp {
                 // Автоматический запуск в режиме пакетной десинхронизации (Desync) без подписок и серверов
                 self.state.desync_prefs.enabled = true;
                 self.state.vpn_prefs.route = "desync".to_string();
+                self.auto_desync_fallback = true;
                 self.state.save();
-                self.show_toast(
+                self.show_toast(self.tr(
                     "Запуск в режиме прямой пакетной десинхронизации (Desync) без прокси-сервера",
-                );
+                    "Starting in direct packet desync mode (no proxy server)",
+                ));
             }
             let payload = self.state.build_connect_payload(None);
             let v = self.vpn.clone();
@@ -1635,12 +1748,14 @@ impl TachyonApp {
 
     pub fn refresh_exit_info(&mut self) {
         self.exit_info.loading = true;
+        self.exit_info_gen = self.exit_info_gen.wrapping_add(1);
+        let exit_gen = self.exit_info_gen;
         let v = self.vpn.clone();
         let eq = self.event_queue.clone();
         self.rt.spawn(async move {
             let res = v.check_exit_node_info().await;
             if let Ok(mut g) = eq.lock() {
-                g.push(format!("exit:geo:{res}"));
+                g.push(format!("exit:geo:{exit_gen}:{res}"));
             }
         });
     }
@@ -1648,7 +1763,10 @@ impl TachyonApp {
     async fn probe_single_uri_ms(uri: &str) -> i64 {
         let badge = detect_protocol_badge(uri);
         if let Some((host, port)) = extract_host_port_from_uri(uri) {
-            let is_udp = matches!(badge, "AWG" | "WG" | "HY2" | "TUIC" | "WDTT");
+            let is_udp = matches!(
+                badge,
+                "AWG" | "WG" | "HY2" | "TUIC" | "WDTT" | "QWDTT" | "CSQTT" | "MASQUE"
+            );
             probe_endpoint_median_ms(&host, port, is_udp).await
         } else {
             -1
@@ -1941,11 +2059,15 @@ impl TachyonApp {
             let best_name = best.name.clone();
             let best_ms = best.ping_ms.unwrap_or(0);
             self.state.active_id = best_id;
-            self.show_toast(format!("Выбран быстрый узел: {best_name} ({best_ms} мс)"));
+            self.show_toast(if self.is_en() {
+                format!("Fastest node selected: {best_name} ({best_ms} ms)")
+            } else {
+                format!("Выбран быстрый узел: {best_name} ({best_ms} мс)")
+            });
             self.reconnect_if_active();
         } else {
             self.ping_all_nodes();
-            self.show_toast("Запущен замер задержки узлов...");
+            self.show_toast(self.tr("Запущен замер задержки узлов...", "Pinging nodes..."));
         }
     }
 
@@ -1966,25 +2088,72 @@ impl TachyonApp {
     }
 
     pub fn import_conf_file_dialog(&mut self) {
-        let paths = pick_conf_files_native();
-        if paths.is_empty() {
+        let eq = self.event_queue.clone();
+        std::thread::spawn(move || {
+            let paths = pick_conf_files_native();
+            if paths.is_empty() {
+                return;
+            }
+            let mut items: Vec<(String, String)> = Vec::new();
+            for path in paths {
+                if let Ok(content) = fs::read_to_string(&path) {
+                    let stem = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("AWG Config")
+                        .to_string();
+                    items.push((stem, content));
+                }
+            }
+            if !items.is_empty()
+                && let Ok(payload) = serde_json::to_string(&items)
+                && let Ok(mut g) = eq.lock()
+            {
+                g.push(format!("conf:import-items:{payload}"));
+            }
+        });
+    }
+
+    pub fn refresh_apps_async(&mut self, with_toast: bool) {
+        if self.apps_scanning {
             return;
         }
-        let mut added = 0usize;
-        for path in paths {
-            if let Ok(content) = fs::read_to_string(&path) {
-                let stem = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("AWG Config")
-                    .to_string();
-                self.add_single_server_uri(&content, Some(&stem));
-                added += 1;
+        self.apps_scanning = true;
+        let eq = self.event_queue.clone();
+        self.rt.spawn(async move {
+            let apps = tokio::task::spawn_blocking(enumerate_apps)
+                .await
+                .unwrap_or_default();
+            if let Ok(json) = serde_json::to_string(&apps)
+                && let Ok(mut g) = eq.lock()
+            {
+                let prefix = if with_toast {
+                    "apps:scanned:toast:"
+                } else {
+                    "apps:scanned:"
+                };
+                g.push(format!("{prefix}{json}"));
             }
-        }
-        if added > 0 {
-            self.show_toast(format!("Импортировано файлов конфигурации: {added}"));
-        }
+        });
+    }
+
+    pub fn refresh_log_async(&mut self, with_toast: bool) {
+        let v = self.vpn.clone();
+        let lvl = self.log_filter_level.clone();
+        let eq = self.event_queue.clone();
+        self.rt.spawn(async move {
+            let tail = tokio::task::spawn_blocking(move || v.get_log_tail_filtered(200, &lvl))
+                .await
+                .unwrap_or_default();
+            if let Ok(mut g) = eq.lock() {
+                let prefix = if with_toast {
+                    "log:tail:toast:"
+                } else {
+                    "log:tail:"
+                };
+                g.push(format!("{prefix}{tail}"));
+            }
+        });
     }
 
     fn handle_subscription_result(&mut self, sub_str: &str) {
@@ -1996,7 +2165,11 @@ impl TachyonApp {
                 .get("error")
                 .and_then(Value::as_str)
                 .unwrap_or("Не удалось разобрать ссылку или конфиг");
-            self.show_toast(format!("Ошибка импорта: {err}"));
+            self.show_error_toast(if self.is_en() {
+                format!("Import error: {err}")
+            } else {
+                format!("Ошибка импорта: {err}")
+            });
             return;
         }
 
@@ -2010,13 +2183,14 @@ impl TachyonApp {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let is_remote_sub = url.starts_with("http://") || url.starts_with("https://");
+        let is_remote_sub =
+            url.starts_with("http://") || url.starts_with("https://") || url.starts_with("happ://");
 
         let sub_id = if is_remote_sub {
             if let Some(existing) = self.state.subscriptions.iter().find(|s| s.url == url) {
                 Some(existing.id.clone())
             } else {
-                Some(format!("sub-{}", self.state.subscriptions.len() + 1))
+                Some(gen_unique_id("sub"))
             }
         } else {
             None
@@ -2065,11 +2239,7 @@ impl TachyonApp {
                     .get("memberCount")
                     .and_then(Value::as_u64)
                     .map(|n| n as usize);
-                let id = format!(
-                    "node-{}-{}",
-                    self.state.servers.len() + 1,
-                    imported_count + 1
-                );
+                let id = gen_unique_id("node");
                 if first_added_id.is_none() {
                     first_added_id = Some(id.clone());
                 }
@@ -2103,7 +2273,7 @@ impl TachyonApp {
                     id: sid,
                     handle: handle.clone(),
                     url,
-                    updated_at: "только что".to_string(),
+                    updated_at: self.tr("только что", "just now").to_string(),
                     count: imported_count,
                     meta,
                 });
@@ -2112,6 +2282,10 @@ impl TachyonApp {
 
         if let Some(fid) = first_added_id {
             self.state.active_id = fid;
+            if self.auto_desync_fallback && self.state.vpn_prefs.route == "desync" {
+                self.state.vpn_prefs.route = "all".to_string();
+                self.auto_desync_fallback = false;
+            }
         }
         self.state.save();
         if imported_count > 0 {
@@ -2122,12 +2296,21 @@ impl TachyonApp {
                 self.ping_all_nodes();
             }
         }
-        self.show_toast(format!("Добавлено узлов: {imported_count}"));
+        self.show_toast(if self.is_en() {
+            format!("Nodes added: {imported_count}")
+        } else {
+            format!("Добавлено узлов: {imported_count}")
+        });
     }
 
     pub fn sync_input_placeholders(&self, window: &mut Window, cx: &mut Context<Self>) {
         let srv_ph = self.tr("Поиск страны или узла...", "Search country or node...");
-        let route_ph = self.tr("Поиск из 55 сервисов...", "Search 55 services...");
+        let cat_count = ROUTE_CATALOG.len();
+        let route_ph = if self.is_en() {
+            format!("Search {cat_count} services...")
+        } else {
+            format!("Поиск из {cat_count} сервисов...")
+        };
         let rule_ph = self.tr(
             "example.com, 1.2.3.0/24 или game.exe...",
             "example.com, 1.2.3.0/24 or game.exe...",
@@ -2184,18 +2367,23 @@ impl TachyonApp {
     }
 
     fn apply_custom_rules_raw(&mut self, raw: &str) -> bool {
-        let entries = parse_custom_rule_entries(&self.custom_rule_type, raw);
-        if entries.is_empty() {
+        if !self.custom_rule_time_window.is_empty()
+            && !is_valid_time_window(&self.custom_rule_time_window)
+        {
+            self.show_error_toast(self.tr(
+                "Некорректное окно времени (ожидается ЧЧ:ММ-ЧЧ:ММ, например 09:00-18:00)",
+                "Invalid time window (expected HH:MM-HH:MM, e.g. 09:00-18:00)",
+            ));
             return false;
         }
-        let mut next_num = self
-            .state
-            .custom_rules
-            .iter()
-            .filter_map(|r| r.id.strip_prefix("rule-")?.parse::<u64>().ok())
-            .max()
-            .unwrap_or(0)
-            + 1;
+        let entries = parse_custom_rule_entries(&self.custom_rule_type, raw);
+        if entries.is_empty() {
+            self.show_error_toast(self.tr(
+                "Некорректное правило: проверьте формат домена, CIDR, regex или порта",
+                "Invalid rule: check domain, CIDR, regex, or port format",
+            ));
+            return false;
+        }
 
         for (rtype, val) in entries {
             if let Some(existing) = self
@@ -2207,8 +2395,7 @@ impl TachyonApp {
                 existing.action = self.custom_rule_action.clone();
                 existing.time_window = self.custom_rule_time_window.clone();
             } else {
-                let id = format!("rule-{next_num}");
-                next_num += 1;
+                let id = gen_unique_id("rule");
                 self.state.custom_rules.push(CustomRule {
                     id,
                     rule_type: rtype,
@@ -2451,8 +2638,12 @@ pub fn parse_custom_rule_entries(selected_type: &str, raw: &str) -> Vec<(String,
         if sel == "port" || sel == "port_range" {
             let norm = token.replace('-', ":");
             if let Some((a, b)) = norm.split_once(':') {
-                if a.trim().parse::<u16>().is_ok() && b.trim().parse::<u16>().is_ok() {
-                    out.push(("port".to_string(), format!("{}:{}", a.trim(), b.trim())));
+                if let (Ok(pa), Ok(pb)) = (a.trim().parse::<u16>(), b.trim().parse::<u16>())
+                    && pa > 0
+                    && pb > 0
+                    && pa <= pb
+                {
+                    out.push(("port".to_string(), format!("{pa}:{pb}")));
                 }
             } else if let Ok(p) = token.parse::<u16>()
                 && p > 0
@@ -2462,7 +2653,9 @@ pub fn parse_custom_rule_entries(selected_type: &str, raw: &str) -> Vec<(String,
             continue;
         }
         if sel == "cidr" || sel == "ip" {
-            out.push(("cidr".to_string(), token.to_string()));
+            if is_ip_or_cidr(token) {
+                out.push(("cidr".to_string(), token.to_string()));
+            }
             continue;
         }
         if sel == "process" {
@@ -2527,19 +2720,168 @@ fn format_mb_per_sec(bps: u64) -> String {
     format!("{mbs:.1}")
 }
 
-fn format_bytes_human(bytes: u64) -> String {
+fn route_catalog_text(
+    entry: &crate::state::RouteCatalogItem,
+    is_en: bool,
+) -> (&'static str, &'static str, &'static str) {
+    if !is_en {
+        return (entry.name, entry.group, entry.desc);
+    }
+    let group = match entry.group {
+        "Базовые списки РФ" => "RU Core Lists",
+        "Видео и стриминг" => "Video & Streaming",
+        "Мессенджеры и соцсети" => "Messengers & Social",
+        "AI и нейросети" => "AI Services",
+        "Игры и лаунчеры" => "Games & Launchers",
+        "Разработка и облака" => "Dev & Cloud",
+        "Блокировка и приватность" => "Blocking & Privacy",
+        other => other,
+    };
+    let (name, desc) = match entry.id {
+        "ru_domains" => (
+            "RU Domains (.ru / .рф / .su)",
+            "Government portals, banks, marketplaces and domestic sites — always direct",
+        ),
+        "geoip_ru" => (
+            "RU IP Ranges (GeoIP RU)",
+            "Major domestic ISP and data center subnets — direct route",
+        ),
+        "ru_only_inside" => (
+            "RU Services (Strict Local IP)",
+            "Banks, Gosuslugi, Tax, Mos.ru, RZD, Kinopoisk, VK, Ozon, WB",
+        ),
+        "ru_whitelist" => (
+            "Critical Domestic Allowlist",
+            "Critical infrastructure, marketplaces, banking and public portals",
+        ),
+        "ru_blocked" => (
+            "Combined Filtered Resources Registry",
+            "Merged domain & CIDR database (Antifilter + Reestr + Community)",
+        ),
+        "russia_inside" => (
+            "ITDog Russia-Inside (Extended)",
+            "Services and CDNs with regional traffic filtering",
+        ),
+        "antifilter" => (
+            "Antifilter Community Domains",
+            "Curated community list of domains with restricted direct reachability",
+        ),
+        "reestr" => (
+            "Full Exported Domain Registry",
+            "Large domain dataset from official export (higher RAM usage)",
+        ),
+        "ai_all" => (
+            "All AI Services (Bundle)",
+            "ChatGPT, Claude, Gemini, Grok, Perplexity, Copilot, Cursor, Midjourney, HuggingFace",
+        ),
+        "steam" => (
+            "Steam (Store & CDN)",
+            "steampowered.com, steamcommunity.com, steamcontent.com",
+        ),
+        "roblox" => ("Roblox", "roblox.com, rbxcdn.com, Roblox game servers"),
+        "consoles_all" => (
+            "Gaming Consoles (All)",
+            "Xbox, PlayStation, Nintendo Switch / Switch 2 and VR headsets",
+        ),
+        "consoles_cdn" => (
+            "Console Downloads CDN (Direct)",
+            "Direct game & firmware downloads for Xbox, PSN, Nintendo, Quest, SteamOS",
+        ),
+        "handheld_consoles" => (
+            "Handhelds & Emulators",
+            "Steam Deck (steamos.cloud), ROG Ally, Legion Go, Anbernic, RetroArch, EmuDeck",
+        ),
+        "console_homebrew" => (
+            "Retro Networks & Console Homebrew",
+            "Pretendo, Wiimmfi, Insignia, Switch CFW, PS HEN, HShop",
+        ),
+        "meta_quest" => (
+            "VR Headsets (Quest / Pico / Vive / Pimax)",
+            "oculus.com, oculuscdn.com, meta.com, picoxr.com, vive.com, pimax.com",
+        ),
+        "tv_boxes" => (
+            "TV Boxes & Media Players",
+            "Apple TV, Android TV / Google TV, NVIDIA Shield, Fire TV, Roku, Plex, Kodi",
+        ),
+        "docker" => (
+            "Docker Hub & Container Registries",
+            "docker.io, docker.com, registry-1.docker.io, quay.io, k8s.io",
+        ),
+        "jetbrains" => (
+            "JetBrains & IDE Downloads",
+            "jetbrains.com, jetbrains.ai, plugins.jetbrains.com",
+        ),
+        "hetzner" => (
+            "Hetzner Cloud (DC Subnets)",
+            "hetzner.com, hetzner.de, your-server.de and IP ranges",
+        ),
+        "torrents" => (
+            "Torrent Trackers (RuTracker, Rutor, NNM)",
+            "Access to tracker web mirrors",
+        ),
+        "ads_all" => (
+            "Ads, Trackers & Analytics (Bundle)",
+            "Large ad network, banner and telemetry blocklist (OISD + AdAway)",
+        ),
+        "adguard" => (
+            "Base Ad Domains (AdGuard Base)",
+            "DoubleClick, Google Ads, Yandex.Direct, mobile ad SDKs",
+        ),
+        "win_telemetry" => (
+            "Windows Telemetry & Collectors",
+            "vortex.data.microsoft.com, settings-win.data.microsoft.com, watson",
+        ),
+        _ => (entry.name, entry.desc),
+    };
+    (name, group, desc)
+}
+
+fn gen_unique_id(prefix: &str) -> String {
+    static NEXT_UI_ID: AtomicU64 = AtomicU64::new(1);
+    let seq = NEXT_UI_ID.fetch_add(1, Ordering::Relaxed);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    format!("{prefix}-{ts:x}-{seq}")
+}
+
+fn is_valid_time_window(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let Some((start, end)) = trimmed.split_once('-') else {
+        return false;
+    };
+    let parse_hhmm = |s: &str| -> bool {
+        let Some((h, m)) = s.trim().split_once(':') else {
+            return false;
+        };
+        let Ok(hv) = h.parse::<u8>() else {
+            return false;
+        };
+        let Ok(mv) = m.parse::<u8>() else {
+            return false;
+        };
+        hv < 24 && mv < 60
+    };
+    parse_hhmm(start) && parse_hhmm(end)
+}
+
+fn format_bytes_human(bytes: u64, is_en: bool) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = 1024.0 * 1024.0;
     const GB: f64 = 1024.0 * 1024.0 * 1024.0;
     let b = bytes as f64;
     if b >= GB {
-        format!("{:.2} ГБ", b / GB)
+        format!("{:.2} {}", b / GB, if is_en { "GB" } else { "ГБ" })
     } else if b >= MB {
-        format!("{:.1} МБ", b / MB)
+        format!("{:.1} {}", b / MB, if is_en { "MB" } else { "МБ" })
     } else if b >= KB {
-        format!("{:.0} КБ", b / KB)
+        format!("{:.0} {}", b / KB, if is_en { "KB" } else { "КБ" })
     } else {
-        format!("{bytes} Б")
+        format!("{bytes} {}", if is_en { "B" } else { "Б" })
     }
 }
 
@@ -2598,7 +2940,13 @@ impl TachyonApp {
                 .min_w(px(0.0))
                 .overflow_hidden()
                 .h_full()
-                .pl(px(if m.narrow { 10.0 } else { 14.0 }))
+                .pl(px(if cfg!(target_os = "macos") {
+                    76.0
+                } else if m.narrow {
+                    10.0
+                } else {
+                    14.0
+                }))
                 .pr(px(8.0))
                 .flex()
                 .items_center()
@@ -2775,84 +3123,87 @@ impl TachyonApp {
                                 ),
                         )
                     })
-                    .child(
-                        div()
-                            .id("btn-win-min")
-                            .w(px(28.0))
-                            .h(px(26.0))
-                            .rounded(px(6.0))
-                            .hover(|s| s.bg(t.bg_hover))
-                            .cursor_pointer()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .on_click(cx.listener(|this, _, window, _| {
-                                if this.state.vpn_prefs.minimize_to_tray
-                                    && crate::tray::hide_to_tray()
-                                {
-                                    return;
-                                }
-                                window.minimize_window();
-                            }))
-                            .child(
-                                svg()
-                                    .path("icons/min.svg")
-                                    .size(px(12.0))
-                                    .text_color(t.text_dim),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("btn-win-max")
-                            .w(px(28.0))
-                            .h(px(26.0))
-                            .rounded(px(6.0))
-                            .hover(|s| s.bg(t.bg_hover))
-                            .cursor_pointer()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .on_click(|_, window, _| {
-                                if !crate::tray::toggle_maximize_window() {
-                                    window.zoom_window();
-                                }
-                            })
-                            .child(
-                                svg()
-                                    .path(if m.is_maximized {
-                                        "icons/restore.svg"
-                                    } else {
-                                        "icons/max.svg"
-                                    })
-                                    .size(px(11.0))
-                                    .text_color(t.text_dim),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("btn-win-close")
-                            .w(px(28.0))
-                            .h(px(26.0))
-                            .rounded(px(6.0))
-                            .hover(|s| s.bg(t.red_bg))
-                            .cursor_pointer()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .on_click(cx.listener(|this, _, _, _| {
-                                if this.state.vpn_prefs.close_to_tray && crate::tray::hide_to_tray()
-                                {
-                                    return;
-                                }
-                                this.quit_app();
-                            }))
-                            .child(
-                                svg()
-                                    .path("icons/close.svg")
-                                    .size(px(12.0))
-                                    .text_color(t.text_dim),
-                            ),
-                    ),
+                    .when(cfg!(not(target_os = "macos")), |el| {
+                        el.child(
+                            div()
+                                .id("btn-win-min")
+                                .w(px(28.0))
+                                .h(px(26.0))
+                                .rounded(px(6.0))
+                                .hover(|s| s.bg(t.bg_hover))
+                                .cursor_pointer()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .on_click(cx.listener(|this, _, window, _| {
+                                    if this.state.vpn_prefs.minimize_to_tray
+                                        && crate::tray::hide_to_tray()
+                                    {
+                                        return;
+                                    }
+                                    window.minimize_window();
+                                }))
+                                .child(
+                                    svg()
+                                        .path("icons/min.svg")
+                                        .size(px(12.0))
+                                        .text_color(t.text_dim),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("btn-win-max")
+                                .w(px(28.0))
+                                .h(px(26.0))
+                                .rounded(px(6.0))
+                                .hover(|s| s.bg(t.bg_hover))
+                                .cursor_pointer()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .on_click(|_, window, _| {
+                                    if !crate::tray::toggle_maximize_window() {
+                                        window.zoom_window();
+                                    }
+                                })
+                                .child(
+                                    svg()
+                                        .path(if m.is_maximized {
+                                            "icons/restore.svg"
+                                        } else {
+                                            "icons/max.svg"
+                                        })
+                                        .size(px(11.0))
+                                        .text_color(t.text_dim),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("btn-win-close")
+                                .w(px(28.0))
+                                .h(px(26.0))
+                                .rounded(px(6.0))
+                                .hover(|s| s.bg(t.red_bg))
+                                .cursor_pointer()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .on_click(cx.listener(|this, _, _, _| {
+                                    if this.state.vpn_prefs.close_to_tray
+                                        && crate::tray::hide_to_tray()
+                                    {
+                                        return;
+                                    }
+                                    this.quit_app();
+                                }))
+                                .child(
+                                    svg()
+                                        .path("icons/close.svg")
+                                        .size(px(12.0))
+                                        .text_color(t.text_dim),
+                                ),
+                        )
+                    }),
             )
     }
 
@@ -3092,9 +3443,8 @@ impl TachyonApp {
                             .text_color(t.accent)
                             .hover(|s| s.underline())
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.log_tail =
-                                    this.vpn.get_log_tail_filtered(200, &this.log_filter_level);
                                 this.modal = ModalKind::KernelLog;
+                                this.refresh_log_async(false);
                                 cx.notify();
                             }))
                             .child(self.tr("Лог ядра", "Core Log")),
@@ -3131,7 +3481,13 @@ impl TachyonApp {
         };
 
         let stack_badge = if self.state.vpn_prefs.mode == "tun" {
-            "TUN · WINTUN"
+            if cfg!(target_os = "windows") {
+                "TUN · WINTUN"
+            } else if cfg!(target_os = "macos") {
+                "TUN · UTUN"
+            } else {
+                "TUN"
+            }
         } else {
             "SYSTEM PROXY"
         };
@@ -3837,7 +4193,7 @@ impl TachyonApp {
                                                     .child(format!(
                                                         "{}: {}",
                                                         self.tr("Всего", "Total"),
-                                                        format_bytes_human(self.rx_total)
+                                                        format_bytes_human(self.rx_total, self.is_en())
                                                     )),
                                             ),
                                     )
@@ -3871,7 +4227,7 @@ impl TachyonApp {
                                                     .child(format!(
                                                         "{}: {}",
                                                         self.tr("Всего", "Total"),
-                                                        format_bytes_human(self.tx_total)
+                                                        format_bytes_human(self.tx_total, self.is_en())
                                                     )),
                                             ),
                                     ),
@@ -4106,74 +4462,15 @@ impl TachyonApp {
                                                     .text_size(px(10.0))
                                                     .text_color(t.accent)
                                                     .child(if self.state.vpn_prefs.mode == "tun" {
-                                                        "TUN · Wintun"
+                                                        if cfg!(target_os = "windows") {
+                                                            "TUN · Wintun"
+                                                        } else if cfg!(target_os = "macos") {
+                                                            "TUN · utun"
+                                                        } else {
+                                                            "TUN"
+                                                        }
                                                     } else {
                                                         self.tr("Системный прокси", "System Proxy")
-                                                    }),
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id("card-quick-ks")
-                                    .flex_1()
-                                    .min_w(px(150.0))
-                                    .p(px(10.0))
-                                    .rounded(px(10.0))
-                                    .bg(t.bg_card)
-                                    .border_1()
-                                    .border_color(if self.state.vpn_prefs.kill_switch {
-                                        t.red_border
-                                    } else {
-                                        t.border
-                                    })
-                                    .cursor_pointer()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        let next = !this.state.vpn_prefs.kill_switch;
-                                        this.state.vpn_prefs.kill_switch = next;
-                                        this.vpn.set_kill_switch(next);
-                                        this.state.save();
-                                        cx.notify();
-                                    }))
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(8.0))
-                                    .child(
-                                        svg()
-                                            .path("icons/lock.svg")
-                                            .size(px(14.0))
-                                            .flex_shrink_0()
-                                            .text_color(if self.state.vpn_prefs.kill_switch {
-                                                t.red
-                                            } else {
-                                                t.text_dim
-                                            }),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w(px(0.0))
-                                            .flex()
-                                            .flex_col()
-                                            .child(
-                                                div()
-                                                    .text_size(px(11.0))
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .text_color(t.text)
-                                                    .child("Kill Switch"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(px(10.0))
-                                                    .text_color(if self.state.vpn_prefs.kill_switch {
-                                                        t.red
-                                                    } else {
-                                                        t.text_dim
-                                                    })
-                                                    .child(if self.state.vpn_prefs.kill_switch {
-                                                        self.tr("Активен", "Active")
-                                                    } else {
-                                                        self.tr("Выключен", "Disabled")
                                                     }),
                                             ),
                                     ),
@@ -5538,8 +5835,8 @@ impl TachyonApp {
                                     "Anti-Cheat & Game Bypass (RICOCHET / EAC / BattlEye / Vanguard)",
                                 ),
                                 self.tr(
-                                    "Прямой обход игровых процессов и UDP-портов без инъекций и без OpenProcess",
-                                    "Direct bypass for game processes & UDP ports without packet injection or OpenProcess",
+                                    "Прямая маршрутизация игровых процессов и UDP-портов без инъекций и без OpenProcess",
+                                    "Direct routing for game processes & UDP ports without packet injection or OpenProcess",
                                 ),
                                 d.anticheat_bypass,
                                 t,
@@ -6242,7 +6539,7 @@ impl TachyonApp {
                                             if st == RouteSubTab::Apps
                                                 && this.running_apps.is_empty()
                                             {
-                                                this.running_apps = enumerate_apps();
+                                                this.refresh_apps_async(false);
                                             }
                                             cx.notify();
                                         }))
@@ -6285,7 +6582,7 @@ impl TachyonApp {
                                 div()
                                     .text_size(px(11.0))
                                     .text_color(t.text_soft)
-                                    .child(self.tr("Обновить базы .srs", "Update .srs DBs")),
+                                    .child(self.tr("Обновить базы .trs", "Update .trs DBs")),
                             ),
                     ),
             )
@@ -6304,13 +6601,17 @@ impl TachyonApp {
     ) -> impl IntoElement {
         let cat_w = adaptive_card_width(m.avail_w - 12.0, 255.0, 4, 8.0);
         let q = self.route_search.trim().to_lowercase();
+        let is_en = self.is_en();
         let filtered: Vec<_> = ROUTE_CATALOG
             .iter()
             .filter(|e| {
-                q.is_empty()
-                    || e.name.to_lowercase().contains(&q)
-                    || e.desc.to_lowercase().contains(&q)
-                    || e.group.to_lowercase().contains(&q)
+                if q.is_empty() {
+                    return true;
+                }
+                let (name_l, group_l, desc_l) = route_catalog_text(e, is_en);
+                name_l.to_lowercase().contains(&q)
+                    || desc_l.to_lowercase().contains(&q)
+                    || group_l.to_lowercase().contains(&q)
                     || e.id.to_lowercase().contains(&q)
             })
             .collect();
@@ -6478,6 +6779,7 @@ impl TachyonApp {
                                     .map(String::as_str)
                                     .unwrap_or("off");
                                 let eid = entry.id;
+                                let (ename, egroup, edesc) = route_catalog_text(entry, is_en);
 
                                 div()
                                     .w(px(cat_w))
@@ -6510,14 +6812,14 @@ impl TachyonApp {
                                                     .text_size(px(12.0))
                                                     .font_weight(FontWeight::SEMIBOLD)
                                                     .text_color(t.text)
-                                                    .child(entry.name),
+                                                    .child(ename),
                                             )
                                             .child(
                                                 div()
                                                     .flex_shrink_0()
                                                     .text_size(px(10.0))
                                                     .text_color(t.text_mute)
-                                                    .child(entry.group),
+                                                    .child(egroup),
                                             ),
                                     )
                                     .child(
@@ -6525,7 +6827,7 @@ impl TachyonApp {
                                             .w_full()
                                             .text_size(px(10.5))
                                             .text_color(t.text_dim)
-                                            .child(entry.desc),
+                                            .child(edesc),
                                     )
                                     .child(
                                         div()
@@ -6614,6 +6916,7 @@ impl TachyonApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let _ = m.narrow;
+        let lan_bypass = self.state.vpn_prefs.bypass_lan;
         div()
             .flex_1()
             .min_h(px(0.0))
@@ -6621,6 +6924,121 @@ impl TachyonApp {
             .flex()
             .flex_col()
             .gap(px(10.0))
+            .child(
+                // Local Network (LAN / Router / NAS) built-in rule card
+                div()
+                    .id("card-custom-bypass-lan")
+                    .w_full()
+                    .flex_shrink_0()
+                    .p(px(10.0))
+                    .rounded(px(10.0))
+                    .bg(t.bg_card)
+                    .border_1()
+                    .border_color(if lan_bypass { t.green_border } else { t.border })
+                    .cursor_pointer()
+                    .hover(|s| s.bg(t.bg_hover))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(10.0))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.state.vpn_prefs.bypass_lan = !this.state.vpn_prefs.bypass_lan;
+                        this.reconnect_if_active();
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(10.0))
+                            .child(
+                                div()
+                                    .w(px(28.0))
+                                    .h(px(28.0))
+                                    .rounded(px(7.0))
+                                    .bg(t.bg_elev)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .flex_shrink_0()
+                                    .child(
+                                        svg()
+                                            .path("icons/globe.svg")
+                                            .size(px(14.0))
+                                            .text_color(if lan_bypass { t.green } else { t.text_dim }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.0))
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .text_size(px(12.0))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(t.text)
+                                            .child(self.tr(
+                                                "Локальная сеть (LAN / Роутер / NAS)",
+                                                "Local Network (LAN / Router / NAS)",
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .text_size(px(10.5))
+                                            .text_color(t.text_dim)
+                                            .child("192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 100.64.0.0/10, .local, .lan"),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .px(px(7.0))
+                                    .py(px(2.0))
+                                    .rounded(px(5.0))
+                                    .bg(if lan_bypass { t.green_bg } else { t.bg_elev })
+                                    .text_size(px(10.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(if lan_bypass { t.green } else { t.text_dim })
+                                    .child(if lan_bypass {
+                                        self.tr("Напрямую", "Direct")
+                                    } else {
+                                        self.tr("Через туннель", "Via tunnel")
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .w(px(34.0))
+                                    .h(px(18.0))
+                                    .p(px(2.0))
+                                    .rounded(px(9.0))
+                                    .bg(if lan_bypass { t.accent } else { t.bg_elev })
+                                    .flex()
+                                    .items_center()
+                                    .justify_end()
+                                    .when(!lan_bypass, |el| el.justify_start())
+                                    .child(
+                                        div()
+                                            .w(px(14.0))
+                                            .h(px(14.0))
+                                            .rounded(px(7.0))
+                                            .bg(if lan_bypass { t.on_accent } else { t.text_dim }),
+                                    ),
+                            ),
+                    ),
+            )
             .child(
                 // Add custom rule bar
                 div()
@@ -6719,7 +7137,7 @@ impl TachyonApp {
                             .justify_center()
                             .text_size(px(11.0))
                             .font_weight(FontWeight::BOLD)
-                            .text_color(gpui::rgb(0x0B0B0D))
+                            .text_color(t.on_accent)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.submit_custom_rule_ui(window, cx);
                                 cx.notify();
@@ -6868,7 +7286,19 @@ impl TachyonApp {
                             .items_center()
                             .gap(px(8.0))
                             .child(div().text_size(px(11.5)).text_color(t.text_soft).child(
-                                if self.is_en() {
+                                if self.state.vpn_prefs.split_mode == "exclude" {
+                                    if self.is_en() {
+                                        format!(
+                                            "Excluded from tunnel: {}",
+                                            self.state.routed_apps.len()
+                                        )
+                                    } else {
+                                        format!(
+                                            "Исключено из туннеля: {}",
+                                            self.state.routed_apps.len()
+                                        )
+                                    }
+                                } else if self.is_en() {
                                     format!(
                                         "Selected apps for tunneling: {}",
                                         self.state.routed_apps.len()
@@ -6880,6 +7310,54 @@ impl TachyonApp {
                                     )
                                 },
                             ))
+                            .child(
+                                div()
+                                    .p(px(2.0))
+                                    .rounded(px(6.0))
+                                    .bg(t.bg_card)
+                                    .border_1()
+                                    .border_color(t.border)
+                                    .flex()
+                                    .gap(px(2.0))
+                                    .children(
+                                        [
+                                            (
+                                                "include",
+                                                self.tr("Только выбранные", "Include Only"),
+                                            ),
+                                            (
+                                                "exclude",
+                                                self.tr("Кроме выбранных", "Exclude Selected"),
+                                            ),
+                                        ]
+                                        .into_iter()
+                                        .map(|(sm, sl)| {
+                                            let act = self.state.vpn_prefs.split_mode == sm;
+                                            div()
+                                                .id(SharedString::from(format!("apps-split-{sm}")))
+                                                .px(px(7.0))
+                                                .py(px(2.0))
+                                                .rounded(px(4.0))
+                                                .cursor_pointer()
+                                                .bg(if act {
+                                                    t.accent_bg
+                                                } else {
+                                                    gpui::rgba(0x00000000)
+                                                })
+                                                .text_size(px(10.0))
+                                                .text_color(if act { t.accent } else { t.text_dim })
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    if this.state.vpn_prefs.split_mode != sm {
+                                                        this.state.vpn_prefs.split_mode =
+                                                            sm.to_string();
+                                                        this.reconnect_if_active();
+                                                        cx.notify();
+                                                    }
+                                                }))
+                                                .child(sl)
+                                        }),
+                                    ),
+                            )
                             .when(!self.state.routed_apps.is_empty(), |el| {
                                 el.child(
                                     div()
@@ -6917,15 +7395,7 @@ impl TachyonApp {
                             .items_center()
                             .gap(px(6.0))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.running_apps = enumerate_apps();
-                                this.show_toast(if this.is_en() {
-                                    format!("Found active processes: {}", this.running_apps.len())
-                                } else {
-                                    format!(
-                                        "Найдено активных процессов: {}",
-                                        this.running_apps.len()
-                                    )
-                                });
+                                this.refresh_apps_async(true);
                                 cx.notify();
                             }))
                             .child(
@@ -6935,7 +7405,11 @@ impl TachyonApp {
                                     .text_color(t.accent),
                             )
                             .child(div().text_size(px(11.0)).text_color(t.text_soft).child(
-                                self.tr("Обновить список процессов", "Refresh Process List"),
+                                if self.apps_scanning {
+                                    self.tr("Поиск процессов...", "Scanning...")
+                                } else {
+                                    self.tr("Обновить список процессов", "Refresh Process List")
+                                },
                             )),
                     ),
             )
@@ -7007,25 +7481,29 @@ impl TachyonApp {
                                                 .child(app.proc.clone()),
                                         ),
                                 )
-                                .child(
+                                .child({
+                                    let is_exclude = self.state.vpn_prefs.split_mode == "exclude";
+                                    let (bg, fg, txt) = if is_exclude {
+                                        if selected {
+                                            (t.green_bg, t.green, self.tr("Прямой", "Direct"))
+                                        } else {
+                                            (t.bg_elev, t.text_dim, self.tr("Туннель", "Tunnel"))
+                                        }
+                                    } else if selected {
+                                        (t.accent, t.on_accent, self.tr("Туннель", "Tunnel"))
+                                    } else {
+                                        (t.bg_elev, t.text_dim, self.tr("Прямой", "Direct"))
+                                    };
                                     div()
                                         .flex_shrink_0()
                                         .px(px(6.0))
                                         .py(px(2.0))
                                         .rounded(px(4.0))
-                                        .bg(if selected { t.accent } else { t.bg_elev })
+                                        .bg(bg)
                                         .text_size(px(10.0))
-                                        .text_color(if selected {
-                                            gpui::rgb(0x0B0B0D)
-                                        } else {
-                                            t.text_dim
-                                        })
-                                        .child(if selected {
-                                            self.tr("Туннель", "Tunnel")
-                                        } else {
-                                            self.tr("Прямой", "Direct")
-                                        }),
-                                )
+                                        .text_color(fg)
+                                        .child(txt)
+                                })
                         }),
                     )),
             )
@@ -7265,7 +7743,7 @@ impl TachyonApp {
                                     .justify_center()
                                     .text_size(px(11.5))
                                     .font_weight(FontWeight::BOLD)
-                                    .text_color(gpui::rgb(0x0B0B0D))
+                                    .text_color(t.on_accent)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.submit_node_uri_ui(window, cx);
                                         cx.notify();
@@ -7615,7 +8093,7 @@ impl TachyonApp {
                                     ("AWG", "AWG / WG"),
                                     ("REALITY", "Reality / VLESS"),
                                     ("XHTTP", "XHTTP / WS / gRPC"),
-                                    ("HY2", "HY2 / TUIC / WDTT"),
+                                    ("HY2", "HY2 / TUIC / WDTT / MASQUE"),
                                     ("TEWFAI", "Tewfai / Mieru"),
                                     ("VMESS", "VMess / Trojan / SS"),
                                     ("BALANCER", "Balancer"),
@@ -7790,9 +8268,26 @@ impl TachyonApp {
                                     .text_color(t.red)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         let before = this.state.servers.len();
+                                        let prev_active = this.state.active_id.clone();
+                                        let prev_relay = this.state.vpn_prefs.relay_id.clone();
                                         this.state.servers.retain(|s| {
                                             s.is_balancer || s.ping_ms.unwrap_or(1) > 0
                                         });
+                                        let alive_ids: HashSet<&str> = this
+                                            .state
+                                            .servers
+                                            .iter()
+                                            .map(|s| s.id.as_str())
+                                            .collect();
+                                        this.state
+                                            .auto_ping
+                                            .ids
+                                            .retain(|id| alive_ids.contains(id.as_str()));
+                                        if !this.state.vpn_prefs.relay_id.is_empty()
+                                            && !alive_ids.contains(this.state.vpn_prefs.relay_id.as_str())
+                                        {
+                                            this.state.vpn_prefs.relay_id.clear();
+                                        }
                                         let removed = before.saturating_sub(this.state.servers.len());
                                         if !this
                                             .state
@@ -7807,7 +8302,13 @@ impl TachyonApp {
                                                 .map(|s| s.id.clone())
                                                 .unwrap_or_default();
                                         }
-                                        this.state.save();
+                                        if prev_active != this.state.active_id
+                                            || prev_relay != this.state.vpn_prefs.relay_id
+                                        {
+                                            this.reconnect_if_active();
+                                        } else {
+                                            this.state.save();
+                                        }
                                         this.show_toast(if this.is_en() {
                                             format!("Removed unreachable nodes: {removed}")
                                         } else {
@@ -7849,8 +8350,14 @@ impl TachyonApp {
                                     "AWG" => matches!(p, "AWG" | "WG"),
                                     "REALITY" => matches!(p, "REALITY" | "VLESS"),
                                     "XHTTP" => matches!(p, "XHTTP" | "WS" | "GRPC" | "HTTPUP"),
-                                    "HY2" => matches!(p, "HY2" | "TUIC" | "WDTT" | "QUIC"),
-                                    "TEWFAI" => matches!(p, "TEWFAI" | "MIERU" | "TRUST" | "JUICITY"),
+                                    "HY2" => matches!(
+                                        p,
+                                        "HY2" | "TUIC" | "WDTT" | "QUIC" | "QWDTT" | "CSQTT" | "MASQUE"
+                                    ),
+                                    "TEWFAI" => matches!(
+                                        p,
+                                        "TEWFAI" | "MIERU" | "TRUST" | "TRUSTTUNNEL" | "JUICITY"
+                                    ),
                                     "VMESS" => matches!(
                                         p,
                                         "VMESS"
@@ -7863,6 +8370,7 @@ impl TachyonApp {
                                             | "TOR"
                                             | "SSH"
                                             | "SOCKS"
+                                            | "SOCKS5"
                                             | "HTTP"
                                     ),
                                     "BALANCER" => srv.is_balancer || p == "BALANCER",
@@ -8121,9 +8629,19 @@ impl TachyonApp {
                                                     .items_center()
                                                     .justify_center()
                                                     .on_click(cx.listener(move |this, _, _, cx| {
+                                                        let was_used = this.state.active_id == sid_del
+                                                            || this.state.vpn_prefs.relay_id == sid_del;
                                                         this.state
                                                             .servers
                                                             .retain(|s| s.id != sid_del);
+                                                        this.state
+                                                            .auto_ping
+                                                            .ids
+                                                            .retain(|x| x != &sid_del);
+                                                        if this.state.vpn_prefs.relay_id == sid_del
+                                                        {
+                                                            this.state.vpn_prefs.relay_id.clear();
+                                                        }
                                                         if this.state.active_id == sid_del {
                                                             this.state.active_id = this
                                                                 .state
@@ -8132,7 +8650,11 @@ impl TachyonApp {
                                                                 .map(|s| s.id.clone())
                                                                 .unwrap_or_default();
                                                         }
-                                                        this.state.save();
+                                                        if was_used {
+                                                            this.reconnect_if_active();
+                                                        } else {
+                                                            this.state.save();
+                                                        }
                                                         cx.notify();
                                                     }))
                                                     .child(
@@ -8303,6 +8825,8 @@ impl TachyonApp {
                                                         } else {
                                                             this.speedtest.running = true;
                                                             this.speedtest.progress = 0;
+                                                            this.speedtest.error.clear();
+                                                            this.speedtest.server.clear();
                                                             let sz = this.speedtest_size_mb;
                                                             let prov = this.speedtest_provider.clone();
                                                             let v = this.vpn.clone();
@@ -8368,7 +8892,59 @@ impl TachyonApp {
                                                 )
                                             }),
                                     ),
-                            ),
+                            )
+                            .when(self.speedtest.running || !self.speedtest.server.is_empty(), |el| {
+                                let pct = self.speedtest.progress.min(100) as f32 / 100.0;
+                                el.child(
+                                    div()
+                                        .w_full()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(4.0))
+                                        .when(self.speedtest.running, |cel| {
+                                            cel.child(
+                                                div()
+                                                    .w_full()
+                                                    .h(px(4.0))
+                                                    .rounded(px(2.0))
+                                                    .bg(t.bg_elev)
+                                                    .overflow_hidden()
+                                                    .child(
+                                                        div()
+                                                            .h_full()
+                                                            .w(gpui::relative(pct))
+                                                            .bg(t.accent),
+                                                    ),
+                                            )
+                                        })
+                                        .when(!self.speedtest.server.is_empty(), |cel| {
+                                            cel.child(
+                                                div()
+                                                    .text_size(px(10.0))
+                                                    .text_color(t.text_dim)
+                                                    .child(format!(
+                                                        "{}: {} ({}%)",
+                                                        self.tr("Узел теста", "Test server"),
+                                                        self.speedtest.server,
+                                                        self.speedtest.progress
+                                                    )),
+                                            )
+                                        }),
+                                )
+                            })
+                            .when(!self.speedtest.running && !self.speedtest.error.is_empty(), |el| {
+                                el.child(
+                                    div()
+                                        .w_full()
+                                        .px(px(8.0))
+                                        .py(px(5.0))
+                                        .rounded(px(6.0))
+                                        .bg(t.red_bg)
+                                        .text_size(px(10.5))
+                                        .text_color(t.red)
+                                        .child(self.speedtest.error.clone()),
+                                )
+                            }),
                     )
                     .child(
                         // Connectivity Matrix card
@@ -8491,12 +9067,14 @@ impl TachyonApp {
                                         let ok = sc.get("status").and_then(Value::as_str) == Some("ok")
                                             || sc.get("ok").and_then(Value::as_bool) == Some(true);
                                         let title = sc
-                                            .get("label")
+                                            .get("name")
+                                            .or_else(|| sc.get("label"))
                                             .or_else(|| sc.get("title"))
                                             .and_then(Value::as_str)
                                             .unwrap_or(self.tr("Проверка", "Check"));
                                         let detail = sc
-                                            .get("detail")
+                                            .get("summary")
+                                            .or_else(|| sc.get("detail"))
                                             .and_then(Value::as_str)
                                             .unwrap_or("");
                                         div()
@@ -9107,9 +9685,10 @@ impl TachyonApp {
                                                         .gap(px(8.0))
                                                         .text_color(t.text_dim)
                                                         .child(format!(
-                                                            "{status} · {dur} ms · ↓{} ↑{}",
-                                                            format_bytes_human(dl),
-                                                            format_bytes_human(ul),
+                                                            "{status} · {dur} {} · ↓{} ↑{}",
+                                                            self.tr("мс", "ms"),
+                                                            format_bytes_human(dl, self.is_en()),
+                                                            format_bytes_human(ul, self.is_en()),
                                                         )),
                                                 )
                                         })),
@@ -9224,8 +9803,8 @@ impl TachyonApp {
                                                     .child(div().text_color(t.text_dim).child(
                                                         format!(
                                                             "↓ {}  ↑ {}",
-                                                            format_bytes_human(c.dl),
-                                                            format_bytes_human(c.ul)
+                                                            format_bytes_human(c.dl, self.is_en()),
+                                                            format_bytes_human(c.ul, self.is_en())
                                                         ),
                                                     ))
                                                     .child(
@@ -9242,37 +9821,57 @@ impl TachyonApp {
                                                             .text_color(t.accent)
                                                             .on_click(cx.listener(
                                                                 move |this, _, _, cx| {
-                                                                    if !host_for_rule.is_empty() {
-                                                                        let rid = format!(
-                                                                            "rule-{}",
+                                                                    let clean = host_for_rule
+                                                                        .trim()
+                                                                        .trim_start_matches('[')
+                                                                        .trim_end_matches(']')
+                                                                        .trim_end_matches('.')
+                                                                        .to_lowercase();
+                                                                    if !clean.is_empty() {
+                                                                        let rtype = if is_ip_or_cidr(&clean) {
+                                                                            "cidr"
+                                                                        } else {
+                                                                            "domain"
+                                                                        };
+                                                                        if let Some(ex) = this
+                                                                            .state
+                                                                            .custom_rules
+                                                                            .iter_mut()
+                                                                            .find(|r| {
+                                                                                r.rule_type == rtype
+                                                                                    && r.value
+                                                                                        .eq_ignore_ascii_case(
+                                                                                            &clean,
+                                                                                        )
+                                                                            })
+                                                                        {
+                                                                            ex.action =
+                                                                                "vpn".to_string();
+                                                                        } else {
                                                                             this.state
                                                                                 .custom_rules
-                                                                                .len()
-                                                                                + 1
-                                                                        );
-                                                                        this.state
-                                                                            .custom_rules
-                                                                            .push(CustomRule {
-                                                                                id: rid,
-                                                                                rule_type:
-                                                                                    "domain"
+                                                                                .push(CustomRule {
+                                                                                    id: gen_unique_id(
+                                                                                        "rule",
+                                                                                    ),
+                                                                                    rule_type: rtype
                                                                                         .to_string(),
-                                                                                value:
-                                                                                    host_for_rule
+                                                                                    value: clean
                                                                                         .clone(),
-                                                                                action: "vpn"
-                                                                                    .to_string(),
-                                                                                time_window:
-                                                                                    String::new(),
-                                                                            });
+                                                                                    action: "vpn"
+                                                                                        .to_string(),
+                                                                                    time_window:
+                                                                                        String::new(),
+                                                                                });
+                                                                        }
                                                                         this.show_toast(
                                                                             if this.is_en() {
                                                                                 format!(
-                                                                                    "{host_for_rule} added to Tunnel"
+                                                                                    "{clean} added to Tunnel"
                                                                                 )
                                                                             } else {
                                                                                 format!(
-                                                                                    "{host_for_rule} добавлен в Туннель"
+                                                                                    "{clean} добавлен в Туннель"
                                                                                 )
                                                                             },
                                                                         );
@@ -9750,7 +10349,12 @@ impl TachyonApp {
                         p.ru_bypass,
                         t,
                         cx.listener(|this, _, _, cx| {
-                            this.state.vpn_prefs.ru_bypass = !this.state.vpn_prefs.ru_bypass;
+                            let next = !this.state.vpn_prefs.ru_bypass;
+                            this.state.vpn_prefs.ru_bypass = next;
+                            let val = if next { "direct" } else { "off" };
+                            for k in ["ru_domains", "ru_only_inside"] {
+                                this.state.list_modes.insert(k.to_string(), val.to_string());
+                            }
                             this.reconnect_if_active();
                             cx.notify();
                         }),
@@ -10104,8 +10708,10 @@ impl TachyonApp {
                         cx.listener(|this, _, _, cx| {
                             let next = !this.state.vpn_prefs.autostart;
                             this.state.vpn_prefs.autostart = next;
-                            crate::set_autostart(next);
                             this.state.save();
+                            std::thread::spawn(move || {
+                                crate::set_autostart(next);
+                            });
                             cx.notify();
                         }),
                     ))
@@ -10155,7 +10761,12 @@ impl TachyonApp {
                         p.adblock,
                         t,
                         cx.listener(|this, _, _, cx| {
-                            this.state.vpn_prefs.adblock = !this.state.vpn_prefs.adblock;
+                            let next = !this.state.vpn_prefs.adblock;
+                            this.state.vpn_prefs.adblock = next;
+                            let val = if next { "block" } else { "off" };
+                            for k in ["ads_all", "adguard", "win_telemetry"] {
+                                this.state.list_modes.insert(k.to_string(), val.to_string());
+                            }
                             this.reconnect_if_active();
                             cx.notify();
                         }),
@@ -10381,24 +10992,43 @@ impl TachyonApp {
                                     ),
                             )
                             .when(self.update_banner.available, |el| {
+                                let busy = self.update_banner.downloading;
                                 el.child(
                                     div()
                                         .id("btn-install-update")
                                         .px(px(12.0))
                                         .py(px(6.0))
                                         .rounded(px(8.0))
-                                        .bg(t.green)
+                                        .bg(if busy { t.bg_elev } else { t.green })
                                         .cursor_pointer()
                                         .text_size(px(11.5))
                                         .font_weight(FontWeight::BOLD)
-                                        .text_color(gpui::rgb(0x0B0B0D))
-                                        .on_click(cx.listener(|this, _, _, _| {
+                                        .text_color(if busy { t.text_soft } else { t.on_accent })
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if this.update_banner.downloading {
+                                                return;
+                                            }
+                                            this.update_banner.downloading = true;
+                                            this.update_banner.progress_pct = 0;
                                             let v = this.vpn.clone();
                                             this.rt.spawn(async move {
                                                 v.install_github_update().await;
                                             });
+                                            cx.notify();
                                         }))
-                                        .child(if self.is_en() {
+                                        .child(if busy {
+                                            if self.is_en() {
+                                                format!(
+                                                    "Downloading {}%...",
+                                                    self.update_banner.progress_pct
+                                                )
+                                            } else {
+                                                format!(
+                                                    "Загрузка {}%...",
+                                                    self.update_banner.progress_pct
+                                                )
+                                            }
+                                        } else if self.is_en() {
                                             format!("Install {}", self.update_banner.tag)
                                         } else {
                                             format!("Установить {}", self.update_banner.tag)
@@ -10596,11 +11226,7 @@ impl TachyonApp {
                             .w(px(14.0))
                             .h(px(14.0))
                             .rounded(px(7.0))
-                            .bg(if checked {
-                                gpui::rgb(0x0B0B0D)
-                            } else {
-                                t.text_dim
-                            }),
+                            .bg(if checked { t.on_accent } else { t.text_dim }),
                     ),
             )
     }
@@ -11329,6 +11955,13 @@ impl TachyonApp {
             .flex()
             .items_center()
             .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.modal = ModalKind::None;
+                    cx.notify();
+                }),
+            )
             .child(
                 div()
                     .w(px((m.width - 32.0).clamp(300.0, 660.0)))
@@ -11341,6 +11974,9 @@ impl TachyonApp {
                     .flex()
                     .flex_col()
                     .gap(px(10.0))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
                     .child(
                         div()
                             .w_full()
@@ -11466,6 +12102,13 @@ impl TachyonApp {
                     .flex()
                     .items_center()
                     .justify_center()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.modal = ModalKind::None;
+                            cx.notify();
+                        }),
+                    )
                     .child(
                         div()
                             .w(px((m.width - 32.0).clamp(300.0, 620.0)))
@@ -11478,6 +12121,9 @@ impl TachyonApp {
                             .flex()
                             .flex_col()
                             .gap(px(10.0))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
                             .child(
                                 div()
                                     .w_full()
@@ -11542,7 +12188,7 @@ impl TachyonApp {
                                             .justify_center()
                                             .text_size(px(11.5))
                                             .font_weight(FontWeight::BOLD)
-                                            .text_color(gpui::rgb(0x0B0B0D))
+                                            .text_color(t.on_accent)
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 this.submit_sub_url_ui(window, cx);
                                                 cx.notify();
@@ -11562,6 +12208,49 @@ impl TachyonApp {
                                             let sub_url = sub.url.clone();
                                             let sub_handle = sub.handle.clone();
                                             let sid = sub.id.clone();
+                                            let meta_line = sub.meta.as_ref().and_then(|meta| {
+                                                let mut parts = Vec::new();
+                                                if meta.total_bytes > 0 {
+                                                    parts.push(format!(
+                                                        "{} / {}",
+                                                        format_bytes_human(
+                                                            meta.used_bytes,
+                                                            self.is_en()
+                                                        ),
+                                                        format_bytes_human(
+                                                            meta.total_bytes,
+                                                            self.is_en()
+                                                        )
+                                                    ));
+                                                } else if meta.used_bytes > 0 {
+                                                    parts.push(format_bytes_human(
+                                                        meta.used_bytes,
+                                                        self.is_en(),
+                                                    ));
+                                                }
+                                                if meta.expire_unix > 0 {
+                                                    let now = now_unix_secs();
+                                                    if meta.expire_unix <= now {
+                                                        parts.push(
+                                                            self.tr("истекла", "expired")
+                                                                .to_string(),
+                                                        );
+                                                    } else {
+                                                        let days =
+                                                            (meta.expire_unix - now) / 86_400;
+                                                        parts.push(if self.is_en() {
+                                                            format!("{}d left", days.max(1))
+                                                        } else {
+                                                            format!("осталось {} д.", days.max(1))
+                                                        });
+                                                    }
+                                                }
+                                                if parts.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(parts.join(" · "))
+                                                }
+                                            });
                                             div()
                                                 .w_full()
                                                 .p(px(10.0))
@@ -11601,7 +12290,17 @@ impl TachyonApp {
                                                                     sub.count,
                                                                     truncate_str(&sub.url, 44)
                                                                 )),
-                                                        ),
+                                                        )
+                                                        .when_some(meta_line, |el, ml| {
+                                                            el.child(
+                                                                div()
+                                                                    .w_full()
+                                                                    .truncate()
+                                                                    .text_size(px(10.0))
+                                                                    .text_color(t.accent)
+                                                                    .child(ml),
+                                                            )
+                                                        }),
                                                 )
                                                 .child(
                                                     div()
@@ -11647,6 +12346,15 @@ impl TachyonApp {
                                                                 .text_color(t.red)
                                                                 .on_click(cx.listener(
                                                                     move |this, _, _, cx| {
+                                                                        let prev_active = this
+                                                                            .state
+                                                                            .active_id
+                                                                            .clone();
+                                                                        let prev_relay = this
+                                                                            .state
+                                                                            .vpn_prefs
+                                                                            .relay_id
+                                                                            .clone();
                                                                         this.state
                                                                             .subscriptions
                                                                             .retain(|s| {
@@ -11661,7 +12369,65 @@ impl TachyonApp {
                                                                                     )
                                                                             },
                                                                         );
-                                                                        this.state.save();
+                                                                        let valid_ids: HashSet<
+                                                                            &str,
+                                                                        > = this
+                                                                            .state
+                                                                            .servers
+                                                                            .iter()
+                                                                            .map(|s| s.id.as_str())
+                                                                            .collect();
+                                                                        this.state
+                                                                            .auto_ping
+                                                                            .ids
+                                                                            .retain(|id| {
+                                                                                valid_ids.contains(
+                                                                                    id.as_str(),
+                                                                                )
+                                                                            });
+                                                                        if !valid_ids.contains(
+                                                                            this.state
+                                                                                .active_id
+                                                                                .as_str(),
+                                                                        ) {
+                                                                            this.state.active_id =
+                                                                                this.state
+                                                                                    .servers
+                                                                                    .first()
+                                                                                    .map(|s| {
+                                                                                        s.id.clone()
+                                                                                    })
+                                                                                    .unwrap_or_default();
+                                                                        }
+                                                                        if !this
+                                                                            .state
+                                                                            .vpn_prefs
+                                                                            .relay_id
+                                                                            .is_empty()
+                                                                            && !valid_ids.contains(
+                                                                                this.state
+                                                                                    .vpn_prefs
+                                                                                    .relay_id
+                                                                                    .as_str(),
+                                                                            )
+                                                                        {
+                                                                            this.state
+                                                                                .vpn_prefs
+                                                                                .relay_id
+                                                                                .clear();
+                                                                        }
+                                                                        if prev_active
+                                                                            != this.state.active_id
+                                                                            || prev_relay
+                                                                                != this
+                                                                                    .state
+                                                                                    .vpn_prefs
+                                                                                    .relay_id
+                                                                        {
+                                                                            this.reconnect_if_active();
+                                                                        } else {
+                                                                            this.state.save();
+                                                                        }
                                                                         cx.notify();
                                                                     },
                                                                 ))
@@ -11684,10 +12450,18 @@ impl TachyonApp {
                     .left_0()
                     .size_full()
                     .p(px(12.0))
+                    .occlude()
                     .bg(gpui::rgba(0x000000A6))
                     .flex()
                     .items_center()
                     .justify_center()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.modal = ModalKind::None;
+                            cx.notify();
+                        }),
+                    )
                     .child(
                         div()
                             .w(px((m.width - 32.0).clamp(300.0, 760.0)))
@@ -11700,6 +12474,9 @@ impl TachyonApp {
                             .flex()
                             .flex_col()
                             .gap(px(10.0))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
                             .child(
                                 div()
                                     .w_full()
@@ -11763,11 +12540,7 @@ impl TachyonApp {
                                                                 move |this, _, _, cx| {
                                                                     this.log_filter_level =
                                                                         flvl.to_string();
-                                                                    this.log_tail = this
-                                                                        .vpn
-                                                                        .get_log_tail_filtered(
-                                                                            200, flvl,
-                                                                        );
+                                                                    this.refresh_log_async(false);
                                                                     cx.notify();
                                                                 },
                                                             ))
@@ -11789,21 +12562,7 @@ impl TachyonApp {
                                                     .text_size(px(11.0))
                                                     .text_color(t.text_soft)
                                                     .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.log_tail =
-                                                            this.vpn.get_log_tail_filtered(
-                                                                200,
-                                                                &this.log_filter_level,
-                                                            );
-                                                        let cnt = this
-                                                            .log_tail
-                                                            .lines()
-                                                            .filter(|l| !l.trim().is_empty())
-                                                            .count();
-                                                        this.show_toast(if this.is_en() {
-                                                            format!("Log refreshed: {cnt} lines")
-                                                        } else {
-                                                            format!("Лог обновлён: {cnt} строк")
-                                                        });
+                                                        this.refresh_log_async(true);
                                                         cx.notify();
                                                     }))
                                                     .child(self.tr("Обновить", "Refresh")),
@@ -11888,6 +12647,13 @@ impl TachyonApp {
                                     .border_1()
                                     .border_color(t.border)
                                     .overflow_y_scroll()
+                                    .font_family(if cfg!(target_os = "macos") {
+                                        "Menlo"
+                                    } else if cfg!(target_os = "windows") {
+                                        "Consolas"
+                                    } else {
+                                        "monospace"
+                                    })
                                     .text_size(px(10.5))
                                     .text_color(t.text_soft)
                                     .child(if self.log_tail.trim().is_empty() {
@@ -11959,6 +12725,12 @@ impl Render for TachyonApp {
             .relative()
             .flex()
             .flex_col()
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                if ev.keystroke.key == "escape" && this.modal != ModalKind::None {
+                    this.modal = ModalKind::None;
+                    cx.notify();
+                }
+            }))
             .child(self.render_titlebar(m, t, cx))
             .child(self.render_navbar(m, t, cx))
             .child(
@@ -11977,7 +12749,8 @@ impl Render for TachyonApp {
                     }),
             )
             .child(self.render_footer(m, t, cx))
-            .when_some(self.toast.as_ref(), |el, (msg, _)| {
+            .when_some(self.toast.as_ref(), |el, (msg, kind, _)| {
+                let is_err = *kind == ToastKind::Error;
                 el.child(
                     div()
                         .absolute()
@@ -11993,11 +12766,15 @@ impl Render for TachyonApp {
                                 .rounded(px(99.0))
                                 .bg(t.bg_elev)
                                 .border_1()
-                                .border_color(t.border_hi)
+                                .border_color(if is_err { t.red_border } else { t.border_hi })
                                 .flex()
                                 .items_center()
                                 .gap(px(8.0))
-                                .child(div().w(px(7.0)).h(px(7.0)).rounded(px(4.0)).bg(t.green))
+                                .child(div().w(px(7.0)).h(px(7.0)).rounded(px(4.0)).bg(if is_err {
+                                    t.red
+                                } else {
+                                    t.green
+                                }))
                                 .child(
                                     div()
                                         .text_size(px(11.5))
@@ -12069,7 +12846,10 @@ fn this_log_filter_eq(cur: &str, candidate: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{adaptive_card_width, parse_custom_rule_entries, parse_duration_secs};
+    use super::{
+        adaptive_card_width, format_bytes_human, is_valid_time_window, parse_custom_rule_entries,
+        parse_duration_secs,
+    };
 
     #[test]
     fn test_adaptive_card_width_fits_all_viewports() {
@@ -12144,5 +12924,34 @@ mod tests {
         assert_eq!(parse_duration_secs("0"), None);
         assert_eq!(parse_duration_secs(""), None);
         assert_eq!(parse_duration_secs("abc"), None);
+    }
+
+    #[test]
+    fn test_is_valid_time_window() {
+        assert!(is_valid_time_window(""));
+        assert!(is_valid_time_window("09:00-18:30"));
+        assert!(is_valid_time_window("23:59-00:00"));
+        assert!(!is_valid_time_window("24:00-12:00"));
+        assert!(!is_valid_time_window("09:60-18:00"));
+        assert!(!is_valid_time_window("invalid"));
+    }
+
+    #[test]
+    fn test_format_bytes_human_bilingual() {
+        assert_eq!(format_bytes_human(512, false), "512 Б");
+        assert_eq!(format_bytes_human(512, true), "512 B");
+        assert_eq!(format_bytes_human(2048, false), "2 КБ");
+        assert_eq!(format_bytes_human(2048, true), "2 KB");
+        assert_eq!(format_bytes_human(5 * 1024 * 1024, true), "5.0 MB");
+    }
+
+    #[test]
+    fn test_custom_rule_validation_rejects_bad_cidr_and_port() {
+        assert!(parse_custom_rule_entries("cidr", "not-an-ip, 10.0.0.0/8").len() == 1);
+        assert!(
+            parse_custom_rule_entries("port", "0, 99999, 443-80, 80-443")
+                == vec![("port".to_string(), "80:443".to_string())]
+        );
+        assert!(parse_custom_rule_entries("domain_regex", "[unclosed\n^youtube\\.com$").len() == 1);
     }
 }
