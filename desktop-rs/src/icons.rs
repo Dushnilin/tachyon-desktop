@@ -4,8 +4,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use gpui::{AssetSource, Image, ImageFormat, Result as GpuiResult, SharedString};
 
-include!(concat!(env!("OUT_DIR"), "/flags_assets.rs"));
-
 pub struct TachyonAssetSource;
 
 impl AssetSource for TachyonAssetSource {
@@ -125,11 +123,7 @@ pub fn flag_image(cc: &str) -> Option<Arc<Image>> {
         return found.clone();
     }
     let img = render_flag_png(&clean)
-        .map(|png_bytes| Arc::new(Image::from_bytes(ImageFormat::Png, png_bytes)))
-        .or_else(|| {
-            get_embedded_flag_svg(&clean)
-                .map(|bytes| Arc::new(Image::from_bytes(ImageFormat::Svg, bytes.to_vec())))
-        });
+        .map(|png_bytes| Arc::new(Image::from_bytes(ImageFormat::Png, png_bytes)));
     if let Ok(mut guard) = cache.lock() {
         guard.insert(clean, img.clone());
     }

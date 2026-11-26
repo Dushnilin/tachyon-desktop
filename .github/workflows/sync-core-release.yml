@@ -1,0 +1,183 @@
+name: Sync tachyon-core & Release Desktop
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  repository_dispatch:
+    types: [core-released]
+  workflow_dispatch:
+    inputs:
+      core_tag:
+        description: 'Тег tachyon-core (пусто — последний релиз Dushnilin/tachyon-core)'
+        required: false
+        type: string
+      desktop_version:
+        description: 'Версия Tachyon Desktop без префикса v (пусто — автоинкремент patch)'
+        required: false
+        type: string
+
+concurrency:
+  group: sync-core-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check New Core Release & Bump Version
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    outputs:
+      should_release: ${{ steps.sync.outputs.should_release }}
+      release_tag: ${{ steps.sync.outputs.release_tag }}
+      core_ref: ${{ steps.sync.outputs.core_ref }}
+    steps:
+      - name: Checkout tachyon-desktop
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check latest tachyon-core release and bump version
+        id: sync
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          INPUT_CORE_TAG: ${{ inputs.core_tag }}
+          INPUT_DESKTOP_VERSION: ${{ inputs.desktop_version }}
+          PAYLOAD_TAG: ${{ github.event.client_payload.tag }}
+        run: |
+          set -euo pipefail
+
+          TARGET_CORE="$(printf '%s' "${INPUT_CORE_TAG:-${PAYLOAD_TAG:-}}" | tr -d '\r\n')"
+          if [[ -z "${TARGET_CORE}" ]]; then
+            TARGET_CORE="$(gh api repos/Dushnilin/tachyon-core/releases/latest --jq '.tag_name')"
+          fi
+          if [[ ! "${TARGET_CORE}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Unexpected core tag format: ${TARGET_CORE}"
+            exit 1
+          fi
+
+          CURRENT_CORE="$(tr -d '[:space:]' < .github/core-version.txt || true)"
+          CUSTOM_DESKTOP="$(printf '%s' "${INPUT_DESKTOP_VERSION}" | tr -d '\r\n')"
+          CUSTOM_DESKTOP="${CUSTOM_DESKTOP#v}"
+
+          if [[ "${TARGET_CORE}" == "${CURRENT_CORE}" && -z "${CUSTOM_DESKTOP}" ]]; then
+            echo "tachyon-core ${TARGET_CORE} is already active in .github/core-version.txt."
+            echo "should_release=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [[ -z "${PRIVATE_REPO_TOKEN}" ]]; then
+            echo "::error::PRIVATE_REPO_TOKEN secret is required to verify tachyon-core-src"
+            exit 1
+          fi
+
+          # Убеждаемся, что тег уже синхронизирован в закрытом репозитории исходников ядра.
+          if ! curl -fsSL \
+            -H "Authorization: Bearer ${PRIVATE_REPO_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/Dushnilin/tachyon-core-src/git/ref/tags/${TARGET_CORE}" >/dev/null 2>&1; then
+            echo "Tag ${TARGET_CORE} is not yet present in Dushnilin/tachyon-core-src; will retry on next run."
+            echo "should_release=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          CUR_APP_VER="$(awk -F'=' '
+            /^\[package\]/ { in_pkg = 1; next }
+            /^\[/ { in_pkg = 0 }
+            in_pkg && /^version[[:space:]]*=/ {
+              gsub(/["'\''[:space:]]/, "", $2);
+              print $2;
+              exit
+            }
+          ' desktop-rs/Cargo.toml)"
+
+          if [[ -n "${CUSTOM_DESKTOP}" ]]; then
+            NEW_VER="${CUSTOM_DESKTOP}"
+          else
+            BASE_VER="${CUR_APP_VER%%-*}"
+            IFS='.' read -r MAJ MIN PAT <<< "${BASE_VER}"
+            PAT=$((PAT + 1))
+            NEW_VER="${MAJ}.${MIN}.${PAT}"
+            while git rev-parse -q --verify "refs/tags/v${NEW_VER}" >/dev/null; do
+              PAT=$((PAT + 1))
+              NEW_VER="${MAJ}.${MIN}.${PAT}"
+            done
+          fi
+
+          if [[ ! "${NEW_VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid desktop version: ${NEW_VER}"
+            exit 1
+          fi
+
+          RELEASE_TAG="v${NEW_VER}"
+          if git rev-parse -q --verify "refs/tags/${RELEASE_TAG}" >/dev/null; then
+            echo "::error::Tag ${RELEASE_TAG} already exists"
+            exit 1
+          fi
+
+          printf '%s\n' "${TARGET_CORE}" > .github/core-version.txt
+
+          python3 - "${NEW_VER}" <<'PY'
+          import pathlib, re, sys
+
+          new_ver = sys.argv[1]
+
+          cargo_path = pathlib.Path("desktop-rs/Cargo.toml")
+          cargo_text = cargo_path.read_text(encoding="utf-8")
+          updated_cargo, n_cargo = re.subn(
+              r'(?ms)(^\[package\].*?^version\s*=\s*")[^"]+(")',
+              rf'\g<1>{new_ver}\2',
+              cargo_text,
+              count=1,
+          )
+          if n_cargo != 1:
+              raise SystemExit("Failed to update version in desktop-rs/Cargo.toml")
+          cargo_path.write_text(updated_cargo, encoding="utf-8")
+
+          wix_path = pathlib.Path("desktop-rs/wix/Tachyon.wixproj")
+          wix_text = wix_path.read_text(encoding="utf-8")
+          updated_wix, n_wix = re.subn(
+              r'(<ProductVersion[^>]*>)[^<]+(</ProductVersion>)',
+              rf'\g<1>{new_ver}\2',
+              wix_text,
+              count=1,
+          )
+          if n_wix != 1:
+              raise SystemExit("Failed to update ProductVersion in desktop-rs/wix/Tachyon.wixproj")
+          wix_path.write_text(updated_wix, encoding="utf-8")
+          PY
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add .github/core-version.txt desktop-rs/Cargo.toml desktop-rs/wix/Tachyon.wixproj
+          git commit -m "Обновить встроенное ядро tachyon-core до ${TARGET_CORE} (${RELEASE_TAG})"
+          git tag -a "${RELEASE_TAG}" -m "Tachyon Desktop ${RELEASE_TAG}
+
+          - Обновлено встроенное ядро tachyon-core до ${TARGET_CORE}."
+
+          git push origin HEAD:main
+          git push origin "refs/tags/${RELEASE_TAG}"
+
+          {
+            echo "should_release=true"
+            echo "release_tag=${RELEASE_TAG}"
+            echo "core_ref=${TARGET_CORE}"
+          } >> "${GITHUB_OUTPUT}"
+
+  build-and-release:
+    name: Build & Publish Desktop Release
+    needs: check
+    if: needs.check.outputs.should_release == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/build-desktop.yml
+    with:
+      release_tag: ${{ needs.check.outputs.release_tag }}
+      core_ref: ${{ needs.check.outputs.core_ref }}
+      desktop_ref: ${{ needs.check.outputs.release_tag }}
+    secrets: inherit

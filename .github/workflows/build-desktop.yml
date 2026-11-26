@@ -6,52 +6,223 @@ on:
       - main
     tags:
       - 'v*'
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Опциональный тег релиза (например v0.3.1) для создания GitHub Release вручную'
+        description: 'Опциональный тег релиза (например v0.4.2)'
         required: false
         type: string
+      core_ref:
+        description: 'Опциональный тег/ветка tachyon-core-src (по умолчанию из .github/core-version.txt)'
+        required: false
+        type: string
+      desktop_ref:
+        description: 'Опциональный ref tachyon-desktop'
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      release_tag:
+        required: false
+        type: string
+        default: ''
+      core_ref:
+        required: false
+        type: string
+        default: ''
+      desktop_ref:
+        required: false
+        type: string
+        default: ''
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build-linux:
-    name: Linux (x86_64 .deb + .tar.gz)
-    runs-on: ubuntu-24.04
+  prepare:
+    name: Resolve Versions & Validate Metadata
+    runs-on: ubuntu-22.04
+    outputs:
+      core_ref: ${{ steps.resolve.outputs.core_ref }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      app_version: ${{ steps.resolve.outputs.app_version }}
+      desktop_ref: ${{ steps.resolve.outputs.desktop_ref }}
+    steps:
+      - name: Checkout tachyon-desktop
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.desktop_ref || '' }}
+          persist-credentials: false
+
+      - name: Resolve and validate versions
+        id: resolve
+        shell: bash
+        env:
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          INPUT_CORE_REF: ${{ inputs.core_ref }}
+          INPUT_DESKTOP_REF: ${{ inputs.desktop_ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          CORE_REF="$(printf '%s' "${INPUT_CORE_REF}" | tr -d '\r\n')"
+          if [[ -z "${CORE_REF}" ]]; then
+            CORE_REF="$(tr -d '[:space:]' < .github/core-version.txt)"
+          fi
+          if [[ ! "${CORE_REF}" =~ ^[0-9A-Za-z._/-]+$ ]]; then
+            echo "::error::Invalid core_ref: ${CORE_REF}"
+            exit 1
+          fi
+
+          PKG_VER="$(awk -F'=' '
+            /^\[package\]/ { in_pkg = 1; next }
+            /^\[/ { in_pkg = 0 }
+            in_pkg && /^version[[:space:]]*=/ {
+              gsub(/["'\''[:space:]]/, "", $2);
+              print $2;
+              exit
+            }
+          ' desktop-rs/Cargo.toml)"
+          if [[ ! "${PKG_VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid desktop-rs/Cargo.toml version: ${PKG_VER}"
+            exit 1
+          fi
+
+          RELEASE_TAG="$(printf '%s' "${INPUT_RELEASE_TAG}" | tr -d '\r\n')"
+          if [[ -z "${RELEASE_TAG}" && "${REF}" == refs/tags/v* ]]; then
+            RELEASE_TAG="${REF_NAME}"
+          fi
+
+          if [[ -n "${RELEASE_TAG}" ]]; then
+            if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+              echo "::error::Invalid release_tag: ${RELEASE_TAG}"
+              exit 1
+            fi
+            TAG_VER="${RELEASE_TAG#v}"
+            if [[ "${TAG_VER}" != "${PKG_VER}" ]]; then
+              echo "::error::Release tag version (${TAG_VER}) does not match desktop-rs/Cargo.toml (${PKG_VER})"
+              exit 1
+            fi
+          fi
+
+          DESKTOP_REF="$(printf '%s' "${INPUT_DESKTOP_REF}" | tr -d '\r\n')"
+
+          {
+            echo "core_ref=${CORE_REF}"
+            echo "release_tag=${RELEASE_TAG}"
+            echo "app_version=${PKG_VER}"
+            echo "desktop_ref=${DESKTOP_REF}"
+          } >> "${GITHUB_OUTPUT}"
+
+  verify:
+    name: Format, Clippy & Unit Tests
+    needs: prepare
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout tachyon-desktop
         uses: actions/checkout@v4
         with:
           path: tachyon-desktop
+          ref: ${{ needs.prepare.outputs.desktop_ref || '' }}
+          persist-credentials: false
 
       - name: Checkout tachyon-core
         uses: actions/checkout@v4
         with:
           repository: Dushnilin/tachyon-core-src
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          ref: ${{ needs.prepare.outputs.core_ref }}
           path: tachyon-core
+          persist-credentials: false
 
-      - name: Apply desktop runtime patch to tachyon-core
+      - name: Apply patches if present
         shell: bash
         run: |
-          if git -C tachyon-core apply --check --ignore-whitespace ../tachyon-desktop/desktop-rs/patches/tachyon-core-desktop.patch 2>/dev/null; then
-            git -C tachyon-core apply --ignore-whitespace ../tachyon-desktop/desktop-rs/patches/tachyon-core-desktop.patch
-          else
-            echo "Desktop runtime patch already upstreamed in tachyon-core, skipping."
-          fi
-          cp -r tachyon-desktop/desktop-rs/patches/wintun_driver tachyon-core/crates/core-runtime/src/inbound/
-          if git -C tachyon-core apply --check --ignore-whitespace ../tachyon-desktop/desktop-rs/patches/pure-rust-wintun.patch 2>/dev/null; then
-            git -C tachyon-core apply --ignore-whitespace ../tachyon-desktop/desktop-rs/patches/pure-rust-wintun.patch
-          else
-            echo "Pure-Rust Wintun patch already upstreamed in tachyon-core, skipping."
-          fi
-          if git -C tachyon-core apply --check --ignore-whitespace ../tachyon-desktop/desktop-rs/patches/wintun-active-routes.patch 2>/dev/null; then
-            git -C tachyon-core apply --ignore-whitespace ../tachyon-desktop/desktop-rs/patches/wintun-active-routes.patch
-          else
-            echo "Wintun active routes patch already applied in tachyon-core, skipping."
-          fi
+          set -euo pipefail
+          shopt -s nullglob
+          for patch in tachyon-desktop/desktop-rs/patches/*.patch; do
+            if git -C tachyon-core apply --reverse --check "../${patch}" 2>/dev/null; then
+              echo "Patch $(basename "${patch}") already applied in tachyon-core."
+            else
+              git -C tachyon-core apply --check "../${patch}"
+              git -C tachyon-core apply "../${patch}"
+              echo "Applied $(basename "${patch}") cleanly."
+            fi
+          done
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            libvulkan-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tachyon-desktop/desktop-rs -> target
+
+      - name: Run fmt, clippy & tests
+        working-directory: tachyon-desktop/desktop-rs
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+
+  build-linux:
+    name: Linux (x86_64 .deb + .tar.gz)
+    needs: prepare
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout tachyon-desktop
+        uses: actions/checkout@v4
+        with:
+          path: tachyon-desktop
+          ref: ${{ needs.prepare.outputs.desktop_ref || '' }}
+          persist-credentials: false
+
+      - name: Checkout tachyon-core
+        uses: actions/checkout@v4
+        with:
+          repository: Dushnilin/tachyon-core-src
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          ref: ${{ needs.prepare.outputs.core_ref }}
+          path: tachyon-core
+          persist-credentials: false
+
+      - name: Apply patches if present
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for patch in tachyon-desktop/desktop-rs/patches/*.patch; do
+            if git -C tachyon-core apply --reverse --check "../${patch}" 2>/dev/null; then
+              echo "Patch $(basename "${patch}") already applied in tachyon-core."
+            else
+              git -C tachyon-core apply --check "../${patch}"
+              git -C tachyon-core apply "../${patch}"
+              echo "Applied $(basename "${patch}") cleanly."
+            fi
+          done
 
       - name: Install X11, Wayland & Vulkan dependencies for GPUI
         run: |
@@ -65,7 +236,6 @@ jobs:
             libxkbcommon-x11-dev \
             libwayland-dev \
             libvulkan-dev \
-            libssl-dev \
             libfontconfig1-dev \
             libfreetype6-dev \
             pkg-config \
@@ -74,14 +244,18 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tachyon-desktop/desktop-rs -> target
+
       - name: Package Linux (.deb, .tar.gz & binary)
         working-directory: tachyon-desktop
+        env:
+          APP_VERSION: ${{ needs.prepare.outputs.app_version }}
         run: |
-          RAW_TAG="${{ inputs.release_tag != '' && inputs.release_tag || github.ref_name }}"
-          VER="${RAW_TAG#v}"
-          if [[ ! "${VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then VER="0.4.1"; fi
           chmod +x desktop-rs/scripts/package-linux.sh
-          ./desktop-rs/scripts/package-linux.sh "${VER}"
+          ./desktop-rs/scripts/package-linux.sh "${APP_VERSION}"
 
       - name: Upload Linux Artifacts
         uses: actions/upload-artifact@v4
@@ -94,53 +268,57 @@ jobs:
 
   build-macos:
     name: macOS (Universal Apple Silicon + Intel .dmg)
+    needs: prepare
     runs-on: macos-latest
     steps:
       - name: Checkout tachyon-desktop
         uses: actions/checkout@v4
         with:
           path: tachyon-desktop
+          ref: ${{ needs.prepare.outputs.desktop_ref || '' }}
+          persist-credentials: false
 
       - name: Checkout tachyon-core
         uses: actions/checkout@v4
         with:
           repository: Dushnilin/tachyon-core-src
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          ref: ${{ needs.prepare.outputs.core_ref }}
           path: tachyon-core
+          persist-credentials: false
 
-      - name: Apply desktop runtime patch to tachyon-core
+      - name: Apply patches if present
         shell: bash
         run: |
-          if git -C tachyon-core apply --check --ignore-whitespace ../tachyon-desktop/desktop-rs/patches/tachyon-core-desktop.patch 2>/dev/null; then
-            git -C tachyon-core apply --ignore-whitespace ../tachyon-desktop/desktop-rs/patches/tachyon-core-desktop.patch
-          else
-            echo "Desktop runtime patch already upstreamed in tachyon-core, skipping."
-          fi
-          cp -r tachyon-desktop/desktop-rs/patches/wintun_driver tachyon-core/crates/core-runtime/src/inbound/
-          if git -C tachyon-core apply --check --ignore-whitespace ../tachyon-desktop/desktop-rs/patches/pure-rust-wintun.patch 2>/dev/null; then
-            git -C tachyon-core apply --ignore-whitespace ../tachyon-desktop/desktop-rs/patches/pure-rust-wintun.patch
-          else
-            echo "Pure-Rust Wintun patch already upstreamed in tachyon-core, skipping."
-          fi
-          if git -C tachyon-core apply --check --ignore-whitespace ../tachyon-desktop/desktop-rs/patches/wintun-active-routes.patch 2>/dev/null; then
-            git -C tachyon-core apply --ignore-whitespace ../tachyon-desktop/desktop-rs/patches/wintun-active-routes.patch
-          else
-            echo "Wintun active routes patch already applied in tachyon-core, skipping."
-          fi
+          set -euo pipefail
+          shopt -s nullglob
+          for patch in tachyon-desktop/desktop-rs/patches/*.patch; do
+            if git -C tachyon-core apply --reverse --check "../${patch}" 2>/dev/null; then
+              echo "Patch $(basename "${patch}") already applied in tachyon-core."
+            else
+              git -C tachyon-core apply --check "../${patch}"
+              git -C tachyon-core apply "../${patch}"
+              echo "Applied $(basename "${patch}") cleanly."
+            fi
+          done
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tachyon-desktop/desktop-rs -> target
+
       - name: Package macOS (.app, .dmg & universal binary)
         working-directory: tachyon-desktop
+        env:
+          APP_VERSION: ${{ needs.prepare.outputs.app_version }}
         run: |
-          RAW_TAG="${{ inputs.release_tag != '' && inputs.release_tag || github.ref_name }}"
-          VER="${RAW_TAG#v}"
-          if [[ ! "${VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then VER="0.4.1"; fi
           chmod +x desktop-rs/scripts/package-macos.sh
-          ./desktop-rs/scripts/package-macos.sh --universal "${VER}"
+          ./desktop-rs/scripts/package-macos.sh --universal "${APP_VERSION}"
 
       - name: Upload macOS Artifacts
         uses: actions/upload-artifact@v4
@@ -151,43 +329,48 @@ jobs:
             tachyon-desktop/dist/tachyon-desktop-macos-universal
 
   build-windows:
-    name: Windows (x86_64 .msi, .exe & .zip — Pure Rust)
+    name: Windows (x86_64 .msi, .exe & .zip)
+    needs: prepare
     runs-on: windows-latest
     steps:
       - name: Checkout tachyon-desktop
         uses: actions/checkout@v4
         with:
           path: tachyon-desktop
+          ref: ${{ needs.prepare.outputs.desktop_ref || '' }}
+          persist-credentials: false
 
       - name: Checkout tachyon-core
         uses: actions/checkout@v4
         with:
           repository: Dushnilin/tachyon-core-src
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          ref: ${{ needs.prepare.outputs.core_ref }}
           path: tachyon-core
+          persist-credentials: false
 
-      - name: Apply desktop runtime patch to tachyon-core
+      - name: Apply patches if present
         shell: bash
         run: |
-          if git -C tachyon-core apply --check --ignore-whitespace ../tachyon-desktop/desktop-rs/patches/tachyon-core-desktop.patch 2>/dev/null; then
-            git -C tachyon-core apply --ignore-whitespace ../tachyon-desktop/desktop-rs/patches/tachyon-core-desktop.patch
-          else
-            echo "Desktop runtime patch already upstreamed in tachyon-core, skipping."
-          fi
-          cp -r tachyon-desktop/desktop-rs/patches/wintun_driver tachyon-core/crates/core-runtime/src/inbound/
-          if git -C tachyon-core apply --check --ignore-whitespace ../tachyon-desktop/desktop-rs/patches/pure-rust-wintun.patch 2>/dev/null; then
-            git -C tachyon-core apply --ignore-whitespace ../tachyon-desktop/desktop-rs/patches/pure-rust-wintun.patch
-          else
-            echo "Pure-Rust Wintun patch already upstreamed in tachyon-core, skipping."
-          fi
-          if git -C tachyon-core apply --check --ignore-whitespace ../tachyon-desktop/desktop-rs/patches/wintun-active-routes.patch 2>/dev/null; then
-            git -C tachyon-core apply --ignore-whitespace ../tachyon-desktop/desktop-rs/patches/wintun-active-routes.patch
-          else
-            echo "Wintun active routes patch already applied in tachyon-core, skipping."
-          fi
+          set -euo pipefail
+          shopt -s nullglob
+          for patch in tachyon-desktop/desktop-rs/patches/*.patch; do
+            if git -C tachyon-core apply --reverse --check "../${patch}" 2>/dev/null; then
+              echo "Patch $(basename "${patch}") already applied in tachyon-core."
+            else
+              git -C tachyon-core apply --check "../${patch}"
+              git -C tachyon-core apply "../${patch}"
+              echo "Applied $(basename "${patch}") cleanly."
+            fi
+          done
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tachyon-desktop/desktop-rs -> target
 
       - name: Install .NET 8 SDK for WiX MSI packaging
         uses: actions/setup-dotnet@v4
@@ -197,11 +380,10 @@ jobs:
       - name: Package Windows (.exe, .zip & .msi installer)
         working-directory: tachyon-desktop
         shell: powershell
+        env:
+          APP_VERSION: ${{ needs.prepare.outputs.app_version }}
         run: |
-          $RawTag = "${{ inputs.release_tag != '' && inputs.release_tag || github.ref_name }}"
-          $Ver = $RawTag.TrimStart('v')
-          if ($Ver -notmatch '^[0-9]+\.[0-9]+\.[0-9]+') { $Ver = "0.4.1" }
-          ./desktop-rs/scripts/package-windows.ps1 $Ver
+          ./desktop-rs/scripts/package-windows.ps1 $env:APP_VERSION
 
       - name: Upload Windows Artifacts
         uses: actions/upload-artifact@v4
@@ -215,22 +397,36 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    needs: [build-linux, build-macos, build-windows]
-    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
-    runs-on: ubuntu-24.04
+    needs: [prepare, verify, build-linux, build-macos, build-windows]
+    if: needs.prepare.outputs.release_tag != ''
+    permissions:
+      contents: write
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout tag annotation
         uses: actions/checkout@v4
         with:
           path: repo
-          fetch-depth: 1
+          ref: ${{ needs.prepare.outputs.desktop_ref || '' }}
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Extract release notes from tag
         shell: bash
+        env:
+          TAG: ${{ needs.prepare.outputs.release_tag }}
+          CORE_REF: ${{ needs.prepare.outputs.core_ref }}
         run: |
-          TAG="${{ inputs.release_tag != '' && inputs.release_tag || github.ref_name }}"
+          set -euo pipefail
           git -C repo fetch --force --depth=1 origin "refs/tags/${TAG}:refs/tags/${TAG}" 2>/dev/null || true
-          git -C repo tag -l --format='%(contents)' "${TAG}" > release_notes.md
+          git -C repo tag -l --format='%(contents)' "${TAG}" > release_notes.md || true
+          if [[ ! -s release_notes.md ]]; then
+            {
+              echo "Tachyon Desktop ${TAG}"
+              echo ""
+              echo "- Сборка на ядре \`tachyon-core\` ${CORE_REF}."
+            } > release_notes.md
+          fi
           cat release_notes.md
 
       - name: Download all artifacts
@@ -249,8 +445,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.release_tag != '' && inputs.release_tag || github.ref_name }}
-          name: "${{ inputs.release_tag != '' && inputs.release_tag || github.ref_name }}"
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          name: ${{ needs.prepare.outputs.release_tag }}
           body_path: release_notes.md
           generate_release_notes: false
           files: release-assets/*
