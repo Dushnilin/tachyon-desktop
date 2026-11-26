@@ -11,8 +11,9 @@ mod ui;
 mod vpn;
 
 use std::fs;
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use gpui::{
@@ -24,8 +25,10 @@ use crate::icons::TachyonAssetSource;
 use crate::ui::TachyonApp;
 use crate::vpn::{
     VpnManager, app_data_dir, cleanup_stale_state_on_startup, detect_passive_tun_error,
-    flush_os_dns,
+    emergency_cleanup_on_panic, flush_os_dns,
 };
+
+static IS_MAIN_GUI: AtomicBool = AtomicBool::new(false);
 
 #[cfg(unix)]
 fn raise_nofile_limit() {
@@ -56,7 +59,96 @@ fn raise_nofile_limit() {
     }
 }
 
-fn run_core_worker_mode(cfg_path: &str) -> i32 {
+fn is_parent_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return true;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, GetLastError};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        const STILL_ACTIVE: u32 = 259;
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                return GetLastError() == ERROR_ACCESS_DENIED;
+            }
+            let mut code = 0u32;
+            let ok = GetExitCodeProcess(h, &mut code) != 0;
+            let _ = CloseHandle(h);
+            !ok || code == STILL_ACTIVE
+        }
+    }
+    #[cfg(unix)]
+    {
+        unsafe {
+            if libc::kill(pid as libc::pid_t, 0) == 0 {
+                return true;
+            }
+            matches!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EPERM)
+            )
+        }
+    }
+    #[cfg(not(any(target_os = "windows", unix)))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+#[cfg(unix)]
+fn fix_data_dir_files_ownership(data_dir: &std::path::Path) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+    let Ok(c_dir) = CString::new(data_dir.as_os_str().as_bytes()) else {
+        return;
+    };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::stat(c_dir.as_ptr(), &mut st) } != 0 {
+        return;
+    }
+    if st.st_uid == 0 {
+        return;
+    }
+    for name in [
+        "core.pid",
+        "core.err",
+        "tachyon-core.log",
+        "cache.db",
+        "cache.db-wal",
+        "cache.db-shm",
+    ] {
+        let p = data_dir.join(name);
+        if p.exists()
+            && let Ok(c_file) = CString::new(p.as_os_str().as_bytes())
+        {
+            unsafe {
+                let _ = libc::chown(c_file.as_ptr(), st.st_uid, st.st_gid);
+            }
+        }
+    }
+}
+
+fn parse_parent_pid(args: &[String]) -> Option<u32> {
+    for w in args.windows(2) {
+        if w[0] == "--parent-pid"
+            && let Ok(pid) = w[1].trim().parse::<u32>()
+            && pid > 0
+        {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+fn run_core_worker_mode(cfg_path: &str, parent_pid: Option<u32>) -> i32 {
     let data_dir = std::path::Path::new(cfg_path)
         .parent()
         .map(std::path::Path::to_path_buf)
@@ -87,6 +179,7 @@ fn run_core_worker_mode(cfg_path: &str) -> i32 {
         .expect("tokio runtime");
 
     let stop_file_wait = stop_file.clone();
+    let data_dir_fix = data_dir.clone();
     let code = rt.block_on(async move {
         let mut bx = match core_runtime::start(&root).await {
             Ok(b) => b,
@@ -98,6 +191,11 @@ fn run_core_worker_mode(cfg_path: &str) -> i32 {
             }
         };
 
+        #[cfg(unix)]
+        fix_data_dir_files_ownership(&data_dir_fix);
+        #[cfg(not(unix))]
+        let _ = &data_dir_fix;
+
         if let Some(msg) = detect_passive_tun_error(&root) {
             eprintln!("run-core: {msg}");
             let _ = fs::write(&err_file, &msg);
@@ -105,17 +203,47 @@ fn run_core_worker_mode(cfg_path: &str) -> i32 {
             return 1;
         }
 
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = async {
-                loop {
-                    if stop_file_wait.exists() {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let stop_loop = async {
+            let mut ticks = 0u32;
+            loop {
+                if stop_file_wait.exists() {
+                    break;
                 }
-            } => {}
+                if ticks.is_multiple_of(10)
+                    && let Some(ppid) = parent_pid
+                    && !is_parent_alive(ppid)
+                {
+                    break;
+                }
+                ticks = ticks.wrapping_add(1);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        };
+
+        #[cfg(unix)]
+        {
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = async {
+                    if let Some(ref mut s) = sigterm {
+                        let _ = s.recv().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {}
+                _ = stop_loop => {}
+            }
         }
+        #[cfg(not(unix))]
+        {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = stop_loop => {}
+            }
+        }
+
         bx.shutdown_wait().await;
         flush_os_dns();
         0
@@ -126,6 +254,50 @@ fn run_core_worker_mode(cfg_path: &str) -> i32 {
     code
 }
 
+fn find_incoming_uri_arg(args: &[String]) -> Option<String> {
+    const PREFIXES: &[&str] = &[
+        "tachyon://",
+        "vless://",
+        "vmess://",
+        "trojan://",
+        "ss://",
+        "hysteria2://",
+        "hy2://",
+        "tuic://",
+        "wg://",
+        "awg://",
+        "happ://",
+        "socks://",
+        "socks5://",
+    ];
+    for arg in args.iter().skip(1) {
+        let trimmed = arg.trim();
+        let low = trimmed.to_ascii_lowercase();
+        if PREFIXES.iter().any(|p| low.starts_with(p)) {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+fn write_pending_uri(uri: &str) {
+    let dir = app_data_dir();
+    let _ = fs::create_dir_all(&dir);
+    let _ = fs::write(dir.join("pending_uri.txt"), uri);
+}
+
+pub fn take_pending_uri() -> Option<String> {
+    let path = app_data_dir().join("pending_uri.txt");
+    let raw = fs::read_to_string(&path).ok()?;
+    let _ = fs::remove_file(&path);
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 fn main() {
     #[cfg(unix)]
     raise_nofile_limit();
@@ -133,11 +305,15 @@ fn main() {
     std::panic::set_hook(Box::new(|info| {
         let msg = format!("PANIC: {info}\n");
         let _ = fs::write(app_data_dir().join("startup.log"), msg);
+        if IS_MAIN_GUI.load(Ordering::Relaxed) {
+            emergency_cleanup_on_panic();
+        }
     }));
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 3 && args[1] == "--run-core" {
-        std::process::exit(run_core_worker_mode(&args[2]));
+        let ppid = parse_parent_pid(&args[3..]);
+        std::process::exit(run_core_worker_mode(&args[2], ppid));
     }
     #[cfg(target_os = "macos")]
     if args.len() >= 2 && args[1] == "--macos-helper" {
@@ -151,11 +327,20 @@ fn main() {
         return;
     }
 
+    if let Some(uri) = find_incoming_uri_arg(&args) {
+        write_pending_uri(&uri);
+    }
+
     if !crate::tray::acquire_single_instance_or_focus_existing() {
         return;
     }
 
+    IS_MAIN_GUI.store(true, Ordering::Relaxed);
+
     if let Ok(exe) = std::env::current_exe() {
+        let exe_str = exe.to_string_lossy();
+        let _ = fs::remove_file(format!("{exe_str}.old"));
+        let _ = fs::remove_file(format!("{exe_str}.new"));
         let _ = fs::remove_file(exe.with_extension("exe.old"));
         let _ = fs::remove_file(exe.with_extension("new"));
     }
@@ -178,6 +363,9 @@ fn main() {
             guard.push(msg);
         }
     })));
+
+    let vpn_exit = vpn.clone();
+    let rt_exit = rt.clone();
 
     gpui_kit::application()
         .with_assets(TachyonAssetSource)
@@ -207,6 +395,36 @@ fn main() {
             });
             cx.activate(true);
         });
+
+    rt_exit.block_on(vpn_exit.disconnect());
+    crate::tray::shutdown();
+}
+
+#[cfg(target_os = "macos")]
+fn escape_xml(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn escape_desktop_exec(s: &str) -> String {
+    let escaped = s
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
+        .replace('`', "\\`")
+        .replace('%', "%%");
+    format!("\"{escaped}\"")
 }
 
 pub fn set_autostart_for_exe(exe: &std::path::Path, enable: bool) {
@@ -219,9 +437,9 @@ pub fn set_autostart_for_exe(exe: &std::path::Path, enable: bool) {
             let _ = fs::create_dir_all(&autostart_dir);
             let desktop_file = autostart_dir.join("tachyon.desktop");
             if enable {
+                let exec_field = escape_desktop_exec(&exe.to_string_lossy());
                 let content = format!(
-                    "[Desktop Entry]\nType=Application\nName=Tachyon\nExec=\"{}\"\nIcon=tachyon\nTerminal=false\nCategories=Network;VPN;\n",
-                    exe.display()
+                    "[Desktop Entry]\nType=Application\nName=Tachyon\nExec={exec_field}\nIcon=tachyon\nTerminal=false\nCategories=Network;VPN;\n"
                 );
                 let _ = fs::write(desktop_file, content);
             } else {
@@ -239,6 +457,7 @@ pub fn set_autostart_for_exe(exe: &std::path::Path, enable: bool) {
             let _ = fs::create_dir_all(&agents_dir);
             let plist_file = agents_dir.join("io.tachyon.desktop.plist");
             if enable {
+                let exe_xml = escape_xml(&exe.to_string_lossy());
                 let content = format!(
                     r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -248,14 +467,13 @@ pub fn set_autostart_for_exe(exe: &std::path::Path, enable: bool) {
     <string>io.tachyon.desktop</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{}</string>
+        <string>{exe_xml}</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
 </dict>
 </plist>
-"#,
-                    exe.display()
+"#
                 );
                 let _ = fs::write(plist_file, content);
             } else {

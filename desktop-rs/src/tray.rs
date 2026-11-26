@@ -26,8 +26,9 @@ mod imp {
         PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SW_HIDE,
         SW_MAXIMIZE, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow, ShowWindowAsync,
         TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP,
-        WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL,
-        WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
+        WM_CANCELMODE, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_ENDSESSION,
+        WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_QUERYENDSESSION, WM_RBUTTONUP, WNDCLASSW,
+        WS_OVERLAPPED,
     };
 
     const WM_APP_TRAY: u32 = WM_APP + 1;
@@ -97,7 +98,7 @@ mod imp {
     }
 
     unsafe fn add_or_update_tray_icon(hwnd: HWND, add: bool) {
-        let nid = unsafe { fill_notify_icon_data(hwnd, true) };
+        let nid = unsafe { fill_notify_icon_data(hwnd, add) };
         let msg = if add { NIM_ADD } else { NIM_MODIFY };
         unsafe {
             let _ = Shell_NotifyIconW(msg, &nid);
@@ -206,9 +207,22 @@ mod imp {
                 }
                 0
             }
+            WM_QUERYENDSESSION => 1,
+            WM_ENDSESSION => {
+                if wparam != 0 {
+                    push_event("tray:exit");
+                }
+                0
+            }
             WM_CLOSE => {
-                unsafe {
-                    let _ = DestroyWindow(hwnd);
+                if SHUTDOWN_REQ.load(Ordering::SeqCst) {
+                    unsafe {
+                        let _ = DestroyWindow(hwnd);
+                    }
+                } else {
+                    // Внешнее закрытие (например, WiX CloseApplication при обновлении MSI):
+                    // даём основному приложению корректно отключить туннель и выйти.
+                    push_event("tray:exit");
                 }
                 0
             }
@@ -217,7 +231,7 @@ mod imp {
                     remove_tray_icon(hwnd);
                     PostQuitMessage(0);
                 }
-                TRAY_HWND.store(0, Ordering::Release);
+                TRAY_HWND.store(0, Ordering::SeqCst);
                 0
             }
             _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
@@ -270,8 +284,8 @@ mod imp {
                 if hwnd.is_null() {
                     return;
                 }
-                TRAY_HWND.store(hwnd as isize, Ordering::Release);
-                if SHUTDOWN_REQ.load(Ordering::Acquire) {
+                TRAY_HWND.store(hwnd as isize, Ordering::SeqCst);
+                if SHUTDOWN_REQ.load(Ordering::SeqCst) {
                     let _ = DestroyWindow(hwnd);
                     return;
                 }
@@ -298,6 +312,10 @@ mod imp {
         if has_owner {
             return 1;
         }
+        let tray_h = TRAY_HWND.load(Ordering::SeqCst);
+        if (hwnd as isize) == tray_h {
+            return 1;
+        }
         let mut buf = [0u16; 64];
         let len = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
         let title = if len > 0 {
@@ -305,15 +323,16 @@ mod imp {
         } else {
             String::new()
         };
-        let tray_h = TRAY_HWND.load(Ordering::Acquire);
-        if (hwnd as isize) == tray_h {
-            return 1;
-        }
-        if title.starts_with("Tachyon") || unsafe { IsWindowVisible(hwnd) } != 0 {
+        if title.starts_with("Tachyon") {
             unsafe {
                 *out_ptr = hwnd as isize;
             }
             return 0;
+        }
+        if unsafe { *out_ptr == 0 && IsWindowVisible(hwnd) != 0 } {
+            unsafe {
+                *out_ptr = hwnd as isize;
+            }
         }
         1
     }
@@ -373,17 +392,17 @@ mod imp {
 
     pub fn show_from_tray() {
         let hwnd = resolve_main_hwnd();
-        if hwnd.is_null() {
-            return;
-        }
-        unsafe {
-            if IsIconic(hwnd) != 0 {
-                let _ = ShowWindowAsync(hwnd, SW_RESTORE);
-            } else {
-                let _ = ShowWindowAsync(hwnd, SW_SHOW);
+        if !hwnd.is_null() {
+            unsafe {
+                if IsIconic(hwnd) != 0 {
+                    let _ = ShowWindowAsync(hwnd, SW_RESTORE);
+                } else {
+                    let _ = ShowWindowAsync(hwnd, SW_SHOW);
+                }
+                let _ = SetForegroundWindow(hwnd);
             }
-            let _ = SetForegroundWindow(hwnd);
         }
+        push_event("tray:show");
     }
 
     pub fn update_status(connected: bool, is_en: bool) {
@@ -392,7 +411,7 @@ mod imp {
         if prev_conn == connected && prev_en == is_en {
             return;
         }
-        let hwnd = TRAY_HWND.load(Ordering::Acquire) as HWND;
+        let hwnd = TRAY_HWND.load(Ordering::SeqCst) as HWND;
         if !hwnd.is_null() {
             unsafe {
                 let _ = PostMessageW(hwnd, WM_APP_UPDATE_TIP, 0, 0);
@@ -441,10 +460,11 @@ mod imp {
     }
 
     pub fn shutdown() {
-        SHUTDOWN_REQ.store(true, Ordering::Release);
-        let hwnd = TRAY_HWND.load(Ordering::Acquire) as HWND;
+        SHUTDOWN_REQ.store(true, Ordering::SeqCst);
+        let hwnd = TRAY_HWND.load(Ordering::SeqCst) as HWND;
         if !hwnd.is_null() {
             unsafe {
+                let _ = PostMessageW(hwnd, WM_CANCELMODE, 0, 0);
                 let _ = PostMessageW(hwnd, WM_CLOSE, 0, 0);
             }
         }

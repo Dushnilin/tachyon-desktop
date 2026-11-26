@@ -31,11 +31,29 @@ impl HttpResponse {
     }
 }
 
+const MAX_CHUNK_HEADER_LEN: usize = 1024;
+const MAX_CONNECT_HEADER_LEN: usize = 8192;
+const CLASH_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+fn format_host_port_for_http(host: &str, port: u16) -> String {
+    let bare = host.trim_matches(|c| c == '[' || c == ']');
+    if bare.contains(':') {
+        format!("[{bare}]:{port}")
+    } else {
+        format!("{bare}:{port}")
+    }
+}
+
+fn same_origin(a: &Url, b: &Url) -> bool {
+    a.secure == b.secure && a.port == b.port && a.host.eq_ignore_ascii_case(&b.host)
+}
+
 async fn connect_stream(
     url: &Url,
     proxy_port: Option<u16>,
     timeout: Duration,
 ) -> io::Result<AnyStream> {
+    let raw_host = url.host.trim_matches(|c| c == '[' || c == ']');
     if let Some(pport) = proxy_port {
         let mut tcp = tokio::time::timeout(timeout, TcpStream::connect(("127.0.0.1", pport)))
             .await
@@ -43,26 +61,45 @@ async fn connect_stream(
         let _ = tcp.set_nodelay(true);
 
         if url.secure {
+            let hp = format_host_port_for_http(raw_host, url.port);
             let connect_req = format!(
-                "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\nProxy-Connection: Keep-Alive\r\n\r\n",
-                url.host, url.port, url.host, url.port
+                "CONNECT {hp} HTTP/1.1\r\nHost: {hp}\r\nProxy-Connection: Keep-Alive\r\n\r\n"
             );
-            tcp.write_all(connect_req.as_bytes()).await?;
+            tokio::time::timeout(timeout, async {
+                tcp.write_all(connect_req.as_bytes()).await?;
+                tcp.flush().await
+            })
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "proxy CONNECT write timeout")
+            })??;
+
             let mut hdr_buf = Vec::with_capacity(512);
-            let mut b = [0u8; 1];
-            while hdr_buf.len() < 8192 {
-                let n = tcp.read(&mut b).await?;
-                if n == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "proxy closed during CONNECT",
-                    ));
+            tokio::time::timeout(timeout, async {
+                let mut b = [0u8; 1];
+                loop {
+                    let n = tcp.read(&mut b).await?;
+                    if n == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "proxy closed during CONNECT",
+                        ));
+                    }
+                    hdr_buf.push(b[0]);
+                    if hdr_buf.ends_with(b"\r\n\r\n") {
+                        return Ok(());
+                    }
+                    if hdr_buf.len() >= MAX_CONNECT_HEADER_LEN {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "proxy CONNECT headers too large",
+                        ));
+                    }
                 }
-                hdr_buf.push(b[0]);
-                if hdr_buf.ends_with(b"\r\n\r\n") {
-                    break;
-                }
-            }
+            })
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "proxy CONNECT read timeout"))??;
+
             let status_line = String::from_utf8_lossy(&hdr_buf);
             if !status_line.starts_with("HTTP/1.1 200") && !status_line.starts_with("HTTP/1.0 200")
             {
@@ -71,19 +108,19 @@ async fn connect_stream(
                     status_line.lines().next().unwrap_or("bad status")
                 )));
             }
-            tokio::time::timeout(timeout, wrap_probe_stream(tcp, &url.host))
+            tokio::time::timeout(timeout, wrap_probe_stream(tcp, raw_host))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timeout"))?
         } else {
             Ok(Box::new(tcp))
         }
     } else {
-        let tcp = tokio::time::timeout(timeout, TcpStream::connect((url.host.as_str(), url.port)))
+        let tcp = tokio::time::timeout(timeout, TcpStream::connect((raw_host, url.port)))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP connect timeout"))??;
         let _ = tcp.set_nodelay(true);
         if url.secure {
-            tokio::time::timeout(timeout, wrap_probe_stream(tcp, &url.host))
+            tokio::time::timeout(timeout, wrap_probe_stream(tcp, raw_host))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timeout"))?
         } else {
@@ -135,15 +172,15 @@ async fn read_http_head(
     Ok((status, headers, leftover))
 }
 
-async fn read_chunked_body(
-    stream: &mut AnyStream,
+async fn read_chunked_body<S: tokio::io::AsyncRead + Unpin>(
+    stream: &mut S,
     mut leftover: Vec<u8>,
     max_bytes: usize,
 ) -> io::Result<Vec<u8>> {
     let mut out = Vec::new();
 
-    async fn ensure_bytes(
-        stream: &mut AnyStream,
+    async fn ensure_bytes<S: tokio::io::AsyncRead + Unpin>(
+        stream: &mut S,
         buf: &mut Vec<u8>,
         need: usize,
     ) -> io::Result<()> {
@@ -164,27 +201,56 @@ async fn read_chunked_body(
     loop {
         let line_end = loop {
             if let Some(pos) = leftover.windows(2).position(|w| w == b"\r\n") {
+                if pos > MAX_CHUNK_HEADER_LEN {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "chunk header line too long",
+                    ));
+                }
                 break pos;
+            }
+            if leftover.len() > MAX_CHUNK_HEADER_LEN {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "chunk header line too long",
+                ));
             }
             let prev = leftover.len();
             ensure_bytes(stream, &mut leftover, prev + 1).await?;
         };
         let size_str = String::from_utf8_lossy(&leftover[..line_end]);
         let size_hex = size_str.split(';').next().unwrap_or("").trim();
-        let chunk_size = usize::from_str_radix(size_hex, 16)
-            .map_err(|_| io::Error::other(format!("invalid chunk size: {size_hex}")))?;
+        let chunk_size = usize::from_str_radix(size_hex, 16).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid chunk size: {size_hex}"),
+            )
+        })?;
         leftover.drain(..line_end + 2);
         if chunk_size == 0 {
             break;
         }
-        if out.len() + chunk_size > max_bytes {
+        if chunk_size > max_bytes.saturating_sub(out.len()) {
             return Err(io::Error::other("HTTP response exceeds max size"));
         }
-        ensure_bytes(stream, &mut leftover, chunk_size + 2).await?;
+        let need_with_crlf = chunk_size
+            .checked_add(2)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "chunk size overflow"))?;
+        ensure_bytes(stream, &mut leftover, need_with_crlf).await?;
         out.extend_from_slice(&leftover[..chunk_size]);
-        leftover.drain(..chunk_size + 2);
+        leftover.drain(..need_with_crlf);
     }
 
+    Ok(out)
+}
+
+fn decode_gzip_capped(raw_body: &[u8], max_bytes: usize) -> io::Result<Vec<u8>> {
+    let mut dec = GzDecoder::new(raw_body).take((max_bytes as u64).saturating_add(1));
+    let mut out = Vec::new();
+    dec.read_to_end(&mut out)?;
+    if out.len() > max_bytes {
+        return Err(io::Error::other("decompressed HTTP body exceeds max size"));
+    }
     Ok(out)
 }
 
@@ -221,8 +287,7 @@ where
     F: FnMut(usize, Option<usize>),
 {
     let initial_url = Url::parse(raw_url)?;
-    let initial_host = initial_url.host.clone();
-    let mut current = initial_url;
+    let mut current = initial_url.clone();
     let mut cur_method = method.to_string();
     let mut cur_body = body.map(|b| b.to_vec());
 
@@ -241,9 +306,9 @@ where
             current.authority()
         );
         let mut has_ua = false;
-        let same_host = current.host.eq_ignore_ascii_case(&initial_host);
+        let send_auth = same_origin(&current, &initial_url);
         for (k, v) in extra_headers {
-            if !same_host && k.eq_ignore_ascii_case("authorization") {
+            if !send_auth && k.eq_ignore_ascii_case("authorization") {
                 continue;
             }
             if k.eq_ignore_ascii_case("user-agent") {
@@ -259,11 +324,15 @@ where
         }
         req.push_str("\r\n");
 
-        stream.write_all(req.as_bytes()).await?;
-        if let Some(ref b) = cur_body {
-            stream.write_all(b).await?;
-        }
-        stream.flush().await?;
+        tokio::time::timeout(timeout, async {
+            stream.write_all(req.as_bytes()).await?;
+            if let Some(ref b) = cur_body {
+                stream.write_all(b).await?;
+            }
+            stream.flush().await
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTP request write timeout"))??;
 
         let (status, headers, mut leftover) =
             tokio::time::timeout(timeout, read_http_head(&mut stream))
@@ -276,12 +345,17 @@ where
             && let Some((_, loc)) = headers.iter().find(|(k, _)| k == "location")
         {
             current = current.join(loc)?;
-            if status == 303 || (status == 302 && cur_method == "POST") {
+            if status == 303 || (status == 302 && cur_method.eq_ignore_ascii_case("POST")) {
                 cur_method = "GET".to_string();
                 cur_body = None;
             }
             continue;
         }
+
+        let no_body = cur_method.eq_ignore_ascii_case("HEAD")
+            || (100..200).contains(&status)
+            || status == 204
+            || status == 304;
 
         let is_chunked = headers
             .iter()
@@ -292,7 +366,9 @@ where
             .and_then(|(_, v)| v.parse::<usize>().ok());
 
         let max_bytes = 96 * 1024 * 1024;
-        let raw_body = if is_chunked {
+        let raw_body = if no_body {
+            Vec::new()
+        } else if is_chunked {
             tokio::time::timeout(timeout, read_chunked_body(&mut stream, leftover, max_bytes))
                 .await
                 .map_err(|_| {
@@ -302,7 +378,7 @@ where
             if len > max_bytes {
                 return Err(io::Error::other("HTTP body too large"));
             }
-            on_progress(leftover.len(), Some(len));
+            on_progress(leftover.len().min(len), Some(len));
             let mut last_tick = Instant::now();
             while leftover.len() < len {
                 let mut tmp = [0u8; 16384];
@@ -313,11 +389,14 @@ where
                         io::Error::new(io::ErrorKind::TimedOut, "HTTP body read timeout")
                     })??;
                 if n == 0 {
-                    break;
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "EOF before HTTP Content-Length",
+                    ));
                 }
                 leftover.extend_from_slice(&tmp[..n]);
                 if last_tick.elapsed() >= Duration::from_millis(120) {
-                    on_progress(leftover.len(), Some(len));
+                    on_progress(leftover.len().min(len), Some(len));
                     last_tick = Instant::now();
                 }
             }
@@ -327,10 +406,13 @@ where
         } else {
             let mut tmp = [0u8; 16384];
             let mut last_tick = Instant::now();
-            while leftover.len() < max_bytes {
+            loop {
                 match tokio::time::timeout(timeout, stream.read(&mut tmp)).await {
                     Ok(Ok(0)) => break,
                     Ok(Ok(n)) => {
+                        if n > max_bytes.saturating_sub(leftover.len()) {
+                            return Err(io::Error::other("HTTP response exceeds max size"));
+                        }
                         leftover.extend_from_slice(&tmp[..n]);
                         if last_tick.elapsed() >= Duration::from_millis(120) {
                             on_progress(leftover.len(), None);
@@ -338,7 +420,12 @@ where
                         }
                     }
                     Ok(Err(e)) => return Err(e),
-                    Err(_) => break,
+                    Err(_) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "HTTP body read timeout",
+                        ));
+                    }
                 }
             }
             leftover
@@ -348,13 +435,7 @@ where
             .iter()
             .any(|(k, v)| k == "content-encoding" && v.to_ascii_lowercase().contains("gzip"));
         let final_body = if is_gzip && !raw_body.is_empty() {
-            let mut dec = GzDecoder::new(&raw_body[..]);
-            let mut out = Vec::new();
-            if dec.read_to_end(&mut out).is_ok() {
-                out
-            } else {
-                raw_body
-            }
+            decode_gzip_capped(&raw_body, max_bytes)?
         } else {
             raw_body
         };
@@ -396,10 +477,15 @@ pub async fn clash_api_request(
         )
     };
 
-    tcp.write_all(req.as_bytes()).await?;
-    if !body_bytes.is_empty() {
-        tcp.write_all(body_bytes).await?;
-    }
+    tokio::time::timeout(Duration::from_secs(4), async {
+        tcp.write_all(req.as_bytes()).await?;
+        if !body_bytes.is_empty() {
+            tcp.write_all(body_bytes).await?;
+        }
+        tcp.flush().await
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "clash api write timeout"))??;
 
     let mut boxed: AnyStream = Box::new(tcp);
     let (status, headers, mut leftover) =
@@ -407,34 +493,70 @@ pub async fn clash_api_request(
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "clash api read timeout"))??;
 
+    if method.eq_ignore_ascii_case("HEAD")
+        || (100..200).contains(&status)
+        || status == 204
+        || status == 304
+    {
+        return Ok((status, String::new()));
+    }
+
+    let is_chunked = headers
+        .iter()
+        .any(|(k, v)| k == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked"));
     let content_len = headers
         .iter()
         .find(|(k, _)| k == "content-length")
         .and_then(|(_, v)| v.parse::<usize>().ok());
 
-    if let Some(len) = content_len {
+    let raw_body = if is_chunked {
+        tokio::time::timeout(
+            Duration::from_secs(6),
+            read_chunked_body(&mut boxed, leftover, CLASH_MAX_BYTES),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "clash api chunked read timeout"))??
+    } else if let Some(len) = content_len {
+        if len > CLASH_MAX_BYTES {
+            return Err(io::Error::other("clash api response exceeds max size"));
+        }
         while leftover.len() < len {
             let mut tmp = [0u8; 4096];
-            let n = boxed.read(&mut tmp).await?;
+            let to_read = (len - leftover.len()).min(tmp.len());
+            let n = tokio::time::timeout(Duration::from_secs(6), boxed.read(&mut tmp[..to_read]))
+                .await
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "clash api body read timeout")
+                })??;
             if n == 0 {
-                break;
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "clash api EOF before Content-Length",
+                ));
             }
             leftover.extend_from_slice(&tmp[..n]);
         }
         leftover.truncate(len);
+        leftover
     } else {
         let mut tmp = [0u8; 4096];
-        while let Ok(Ok(n)) =
-            tokio::time::timeout(Duration::from_millis(500), boxed.read(&mut tmp)).await
-        {
-            if n == 0 {
-                break;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(2), boxed.read(&mut tmp)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => {
+                    if n > CLASH_MAX_BYTES.saturating_sub(leftover.len()) {
+                        return Err(io::Error::other("clash api response exceeds max size"));
+                    }
+                    leftover.extend_from_slice(&tmp[..n]);
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => break,
             }
-            leftover.extend_from_slice(&tmp[..n]);
         }
-    }
+        leftover
+    };
 
-    Ok((status, String::from_utf8_lossy(&leftover).into_owned()))
+    Ok((status, String::from_utf8_lossy(&raw_body).into_owned()))
 }
 
 pub struct SpeedtestOutcome {
@@ -447,6 +569,29 @@ pub struct SpeedtestOutcome {
     pub target_mb: u32,
     pub server: String,
     pub stopped: bool,
+}
+
+async fn with_cancel<T, Fut>(
+    cancel_rx: &mut tokio::sync::watch::Receiver<bool>,
+    fut: Fut,
+) -> Result<T, bool>
+where
+    Fut: std::future::Future<Output = T>,
+{
+    tokio::pin!(fut);
+    loop {
+        if *cancel_rx.borrow() {
+            return Err(true);
+        }
+        tokio::select! {
+            res = &mut fut => return Ok(res),
+            changed = cancel_rx.changed() => {
+                if changed.is_err() || *cancel_rx.borrow() {
+                    return Err(true);
+                }
+            }
+        }
+    }
 }
 
 pub async fn run_speedtest_stream<F>(
@@ -479,9 +624,20 @@ where
         let mut ok_conn = None;
 
         for _ in 0..4 {
-            let Ok(mut st) = connect_stream(&cur_url, proxy_port, Duration::from_secs(6)).await
-            else {
-                break;
+            let mut st = match with_cancel(
+                &mut cancel_rx,
+                connect_stream(&cur_url, proxy_port, Duration::from_secs(6)),
+            )
+            .await
+            {
+                Ok(Ok(s)) => s,
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "Тест остановлен",
+                    ));
+                }
             };
             let req_path = if proxy_port.is_some() && !cur_url.secure {
                 format!("http://{}{}", cur_url.authority(), cur_url.path)
@@ -493,13 +649,35 @@ where
                 req_path,
                 cur_url.authority()
             );
-            if st.write_all(req.as_bytes()).await.is_err() {
-                break;
+            let write_res = with_cancel(&mut cancel_rx, async {
+                tokio::time::timeout(Duration::from_secs(4), st.write_all(req.as_bytes())).await
+            })
+            .await;
+            match write_res {
+                Ok(Ok(Ok(()))) => {}
+                Ok(_) => break,
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "Тест остановлен",
+                    ));
+                }
             }
-            let Ok(Ok((status, headers, leftover))) =
-                tokio::time::timeout(Duration::from_secs(6), read_http_head(&mut st)).await
-            else {
-                break;
+
+            let head_res = with_cancel(
+                &mut cancel_rx,
+                tokio::time::timeout(Duration::from_secs(6), read_http_head(&mut st)),
+            )
+            .await;
+            let (status, headers, leftover) = match head_res {
+                Ok(Ok(Ok(h))) => h,
+                Ok(_) => break,
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "Тест остановлен",
+                    ));
+                }
             };
             if matches!(status, 301 | 302 | 303 | 307 | 308) {
                 if let Some((_, loc)) = headers.iter().find(|(k, _)| k == "location")
@@ -545,8 +723,18 @@ where
         }
 
         if active_stream.is_none() {
-            let Ok(mut st) = connect_stream(&url, proxy_port, Duration::from_secs(6)).await else {
-                break;
+            let mut st = match with_cancel(
+                &mut cancel_rx,
+                connect_stream(&url, proxy_port, Duration::from_secs(6)),
+            )
+            .await
+            {
+                Ok(Ok(s)) => s,
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    stopped_early = true;
+                    break;
+                }
             };
             let req_path = if proxy_port.is_some() && !url.secure {
                 format!("http://{}{}", url.authority(), url.path)
@@ -558,13 +746,30 @@ where
                 req_path,
                 url.authority()
             );
-            if st.write_all(req.as_bytes()).await.is_err() {
-                break;
+            match with_cancel(&mut cancel_rx, async {
+                tokio::time::timeout(Duration::from_secs(4), st.write_all(req.as_bytes())).await
+            })
+            .await
+            {
+                Ok(Ok(Ok(()))) => {}
+                Ok(_) => break,
+                Err(_) => {
+                    stopped_early = true;
+                    break;
+                }
             }
-            let Ok(Ok((status, _, leftover))) =
-                tokio::time::timeout(Duration::from_secs(6), read_http_head(&mut st)).await
-            else {
-                break;
+            let (status, _, leftover) = match with_cancel(
+                &mut cancel_rx,
+                tokio::time::timeout(Duration::from_secs(6), read_http_head(&mut st)),
+            )
+            .await
+            {
+                Ok(Ok(Ok(h))) => h,
+                Ok(_) => break,
+                Err(_) => {
+                    stopped_early = true;
+                    break;
+                }
             };
             if !(200..300).contains(&status) {
                 break;
@@ -678,4 +883,132 @@ where
         server: chosen_label,
         stopped: stopped_early,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::{Compression, write::GzEncoder};
+    use std::io::Write;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn read_chunked_rejects_usize_overflow_and_huge_header() {
+        let mut cursor = io::Cursor::new(b"ffffffffffffffff\r\nabc\r\n0\r\n\r\n".to_vec());
+        let err = read_chunked_body(&mut cursor, Vec::new(), 1024)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("max size") || err.to_string().contains("overflow"));
+
+        let long_hdr = vec![b'1'; MAX_CHUNK_HEADER_LEN + 10];
+        let mut cur2 = io::Cursor::new(long_hdr);
+        let err2 = read_chunked_body(&mut cur2, Vec::new(), 1024)
+            .await
+            .unwrap_err();
+        assert_eq!(err2.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn decode_gzip_capped_blocks_bomb() {
+        let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
+        enc.write_all(&vec![b'A'; 4096]).unwrap();
+        let compressed = enc.finish().unwrap();
+
+        assert!(decode_gzip_capped(&compressed, 512).is_err());
+        let ok = decode_gzip_capped(&compressed, 4096).unwrap();
+        assert_eq!(ok.len(), 4096);
+    }
+
+    #[tokio::test]
+    async fn fetch_url_handles_204_and_eof_and_strips_auth_on_redirect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr1 = listener.local_addr().unwrap();
+
+        let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            // 1) 204 No Content
+            {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf).await;
+                let _ = s.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").await;
+            }
+
+            // 2) Truncated Content-Length
+            {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf).await;
+                let _ = s
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nhi")
+                    .await;
+            }
+
+            // 3) Cross-port redirect to listener2
+            {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{}/next\r\n\r\n",
+                    addr2.port()
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        tokio::spawn(async move {
+            let (mut s, _) = listener2.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = s.read(&mut buf).await.unwrap_or(0);
+            let req_str = String::from_utf8_lossy(&buf[..n]);
+            let has_auth = req_str.to_ascii_lowercase().contains("authorization:");
+            let body = if has_auth { "leaked" } else { "clean" };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = s.write_all(resp.as_bytes()).await;
+        });
+
+        let r1 = fetch_url(
+            &format!("http://127.0.0.1:{}/empty", addr1.port()),
+            "GET",
+            &[],
+            None,
+            None,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r1.status, 204);
+        assert!(r1.body.is_empty());
+
+        let r2 = fetch_url(
+            &format!("http://127.0.0.1:{}/trunc", addr1.port()),
+            "GET",
+            &[],
+            None,
+            None,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(r2.kind(), io::ErrorKind::UnexpectedEof);
+
+        let r3 = fetch_url(
+            &format!("http://127.0.0.1:{}/redir", addr1.port()),
+            "GET",
+            &[("Authorization", "Bearer topsecret")],
+            None,
+            None,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r3.text(), "clean");
+    }
 }
