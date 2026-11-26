@@ -2659,10 +2659,9 @@ pub fn parse_custom_rule_entries(selected_type: &str, raw: &str) -> Vec<(String,
             continue;
         }
         if sel == "process" {
-            let proc_name = std::path::Path::new(token)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .filter(|n| !n.is_empty())
+            let proc_name = token
+                .rsplit(['\\', '/'])
+                .find(|n| !n.is_empty())
                 .unwrap_or(token)
                 .to_string();
             out.push(("process".to_string(), proc_name));
@@ -2678,10 +2677,9 @@ pub fn parse_custom_rule_entries(selected_type: &str, raw: &str) -> Vec<(String,
             continue;
         }
         if token.to_ascii_lowercase().ends_with(".exe") {
-            let proc_name = std::path::Path::new(token)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .filter(|n| !n.is_empty())
+            let proc_name = token
+                .rsplit(['\\', '/'])
+                .find(|n| !n.is_empty())
                 .unwrap_or(token)
                 .to_string();
             out.push(("process".to_string(), proc_name));
