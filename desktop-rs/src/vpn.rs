@@ -7450,7 +7450,7 @@ fn unix_icmp_ping_ms(host: &str, timeout_ms: u64) -> Option<i64> {
     pkt[6..8].copy_from_slice(&1u16.to_be_bytes());
     pkt[8..16].copy_from_slice(b"tachyon!");
     let mut sum = 0u32;
-    for chunk in pkt.chunks_exact(2) {
+    for chunk in pkt.as_chunks::<2>().0 {
         sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
     }
     while (sum >> 16) != 0 {

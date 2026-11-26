@@ -491,6 +491,7 @@ mod imp {
             let lock_path = crate::vpn::app_data_dir().join("tachyon.lock");
             if let Ok(file) = std::fs::OpenOptions::new()
                 .create(true)
+                .truncate(false)
                 .read(true)
                 .write(true)
                 .open(&lock_path)
