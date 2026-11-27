@@ -51,20 +51,34 @@ mkdir -p "${APP_BUNDLE}/Contents/Resources"
 cp "${BIN_PATH}" "${APP_BUNDLE}/Contents/MacOS/tachyon"
 chmod 0755 "${APP_BUNDLE}/Contents/MacOS/tachyon"
 
-if [[ -f "${ROOT_DIR}/src/app.ico" ]] && command -v sips >/dev/null 2>&1 && command -v iconutil >/dev/null 2>&1; then
+ICON_SRC_PNG="${PROJECT_DIR}/assets/AppIcon.png"
+if [[ ! -s "${ICON_SRC_PNG}" ]] && [[ -f "${ROOT_DIR}/src/app.ico" ]] && command -v python3 >/dev/null 2>&1; then
+  mkdir -p "$(dirname "${ICON_SRC_PNG}")"
+  python3 - "${ROOT_DIR}/src/app.ico" "${ICON_SRC_PNG}" << 'PYEOF'
+import struct, sys
+data = open(sys.argv[1], "rb").read()
+cnt = struct.unpack("<HHH", data[:6])[2]
+sz, off = max(struct.unpack("<II", data[6+i*16+8:6+i*16+16]) for i in range(cnt))
+chunk = data[off:off+sz]
+assert chunk[:8] == b"\x89PNG\r\n\x1a\n", "app.ico largest entry is not PNG"
+open(sys.argv[2], "wb").write(chunk)
+PYEOF
+fi
+if [[ -s "${ICON_SRC_PNG}" ]] && command -v sips >/dev/null 2>&1 && command -v iconutil >/dev/null 2>&1; then
   ICONSET_DIR="${DIST_DIR}/AppIcon.iconset"
   rm -rf "${ICONSET_DIR}"
   mkdir -p "${ICONSET_DIR}"
-  BASE_PNG="${DIST_DIR}/appicon_base.png"
-  if sips -s format png "${ROOT_DIR}/src/app.ico" --out "${BASE_PNG}" >/dev/null 2>&1; then
-    for sz in 16 32 128 256 512; do
-      sips -z "${sz}" "${sz}" "${BASE_PNG}" --out "${ICONSET_DIR}/icon_${sz}x${sz}.png" >/dev/null 2>&1 || true
-      sz2=$((sz * 2))
-      sips -z "${sz2}" "${sz2}" "${BASE_PNG}" --out "${ICONSET_DIR}/icon_${sz}x${sz}@2x.png" >/dev/null 2>&1 || true
-    done
-    iconutil -c icns "${ICONSET_DIR}" -o "${APP_BUNDLE}/Contents/Resources/AppIcon.icns" || true
-  fi
-  rm -rf "${ICONSET_DIR}" "${BASE_PNG}"
+  for sz in 16 32 128 256 512; do
+    sips -s format png -z "${sz}" "${sz}" "${ICON_SRC_PNG}" --out "${ICONSET_DIR}/icon_${sz}x${sz}.png" >/dev/null
+    sz2=$((sz * 2))
+    sips -s format png -z "${sz2}" "${sz2}" "${ICON_SRC_PNG}" --out "${ICONSET_DIR}/icon_${sz}x${sz}@2x.png" >/dev/null
+  done
+  iconutil -c icns "${ICONSET_DIR}" -o "${APP_BUNDLE}/Contents/Resources/AppIcon.icns"
+  test -s "${APP_BUNDLE}/Contents/Resources/AppIcon.icns"
+  rm -rf "${ICONSET_DIR}"
+else
+  echo "ERROR: failed to build AppIcon.icns (missing AppIcon.png, sips, or iconutil)" >&2
+  exit 1
 fi
 
 cat > "${APP_BUNDLE}/Contents/Info.plist" << EOF
@@ -77,6 +91,8 @@ cat > "${APP_BUNDLE}/Contents/Info.plist" << EOF
     <key>CFBundleExecutable</key>
     <string>tachyon</string>
     <key>CFBundleIconFile</key>
+    <string>AppIcon.icns</string>
+    <key>CFBundleIconName</key>
     <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>io.tachyon.desktop</string>

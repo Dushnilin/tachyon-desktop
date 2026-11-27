@@ -966,6 +966,9 @@ pub struct AutoPingPrefs {
     pub interval_s: u64,
     #[serde(default)]
     pub ids: Vec<String>,
+    /// true — сквозная HTTPS URL-test проба через протокол узла, false — быстрый TCP/ICMP-пинг.
+    #[serde(default = "default_true")]
+    pub urltest_ping: bool,
 }
 
 fn default_ap_all() -> bool {
@@ -982,6 +985,7 @@ impl Default for AutoPingPrefs {
             all: true,
             interval_s: 60,
             ids: Vec::new(),
+            urltest_ping: true,
         }
     }
 }
