@@ -16,7 +16,7 @@ for arg in "$@"; do
 done
 if [[ -z "${VERSION}" ]]; then
   VERSION="$(awk -F'=' '/^version[[:space:]]*=/{gsub(/["[:space:]]/, "", $2); print $2; exit}' "${PROJECT_DIR}/Cargo.toml")"
-  VERSION="${VERSION:-0.4.3}"
+  VERSION="${VERSION:-0.4.6}"
 fi
 export MACOSX_DEPLOYMENT_TARGET=11.0
 

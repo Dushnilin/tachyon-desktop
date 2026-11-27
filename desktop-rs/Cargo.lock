@@ -1075,7 +1075,7 @@ dependencies = [
 
 [[package]]
 name = "core-config"
-version = "0.6.7"
+version = "0.6.9"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1091,7 +1091,7 @@ dependencies = [
 
 [[package]]
 name = "core-crypto"
-version = "0.6.7"
+version = "0.6.9"
 dependencies = [
  "aead",
  "aes-gcm",
@@ -1124,7 +1124,7 @@ dependencies = [
 
 [[package]]
 name = "core-experimental"
-version = "0.6.7"
+version = "0.6.9"
 
 [[package]]
 name = "core-foundation"
@@ -1215,7 +1215,7 @@ dependencies = [
 
 [[package]]
 name = "core-runtime"
-version = "0.6.7"
+version = "0.6.9"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1284,7 +1284,7 @@ dependencies = [
 
 [[package]]
 name = "core-tls"
-version = "0.6.7"
+version = "0.6.9"
 dependencies = [
  "aes-gcm",
  "brotli",
@@ -6984,7 +6984,7 @@ dependencies = [
 
 [[package]]
 name = "tachyon-desktop"
-version = "0.4.3"
+version = "0.4.6"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
