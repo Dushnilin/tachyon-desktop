@@ -17,16 +17,19 @@ use gpui::{
 };
 use serde_json::{Value, json};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
+
 use crate::icons::flag_image;
 use crate::state::{
     CustomRule, PersistedState, ROUTE_CATALOG, ServerNode, SubscriptionItem, SubscriptionMeta,
-    country_title_for_lang, detect_protocol_badge, extract_host_port_from_uri,
+    country_title_for_lang, detect_country_code, detect_protocol_badge, extract_host_port_from_uri,
 };
 use crate::theme::Theme;
 use crate::vpn::{
     BalancerMember, BalancerPayload, RunningApp, VpnManager, balancer_country_presets,
     decode_balancer_uri, encode_balancer_uri, enumerate_apps, is_mtproto_uri, parse_node_uri,
-    probe_endpoint_median_ms,
+    probe_endpoint_median_ms, probe_node_urltest_ms, probe_nodes_urltest_batch,
 };
 #[cfg(target_os = "macos")]
 use crate::vpn::{install_macos_helper, macos_helper_status, uninstall_macos_helper};
@@ -57,6 +60,7 @@ pub enum ModalKind {
     NodeInspector,
     EditBalancer,
     NodePicker,
+    RenameNode,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -196,6 +200,7 @@ pub struct TachyonApp {
     pub bal_words_input_state: Entity<InputState>,
     pub auto_ping_interval_input: Entity<InputState>,
     pub edit_bal_name_input: Entity<InputState>,
+    pub rename_node_input: Entity<InputState>,
     pub pasted_multiline_uri: Option<String>,
     _input_subscriptions: Vec<Subscription>,
 
@@ -276,6 +281,10 @@ pub struct TachyonApp {
     pub edit_bal_tolerance: u32,
     pub edit_bal_pool: u32,
     pub edit_bal_members: Vec<BalancerMember>,
+    pub edit_bal_selected_remove: HashSet<usize>,
+    pub balancer_select_mode: bool,
+    pub balancer_draft_ids: HashSet<String>,
+    pub renaming_node_id: Option<String>,
     pub node_picker_target: Option<NodePickerTarget>,
     #[cfg(target_os = "macos")]
     pub macos_helper_installed: bool,
@@ -447,6 +456,13 @@ impl TachyonApp {
                 "Balancer name"
             } else {
                 "Название балансировщика"
+            })
+        });
+        let rename_node_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(if is_en {
+                "Node name"
+            } else {
+                "Название узла"
             })
         });
 
@@ -779,6 +795,7 @@ impl TachyonApp {
             bal_words_input_state,
             auto_ping_interval_input,
             edit_bal_name_input,
+            rename_node_input,
             pasted_multiline_uri: None,
             _input_subscriptions: subs,
             vpn_status: "disconnected".to_string(),
@@ -850,6 +867,10 @@ impl TachyonApp {
             edit_bal_tolerance: 50,
             edit_bal_pool: 4,
             edit_bal_members: Vec::new(),
+            edit_bal_selected_remove: HashSet::new(),
+            balancer_select_mode: false,
+            balancer_draft_ids: HashSet::new(),
+            renaming_node_id: None,
             node_picker_target: None,
             #[cfg(target_os = "macos")]
             macos_helper_installed: macos_helper_init,
@@ -1758,17 +1779,31 @@ impl TachyonApp {
             } else if let Some(raw_items) = msg.strip_prefix("conf:import-items:") {
                 if let Ok(items) = serde_json::from_str::<Vec<(String, String)>>(raw_items) {
                     let count = items.len();
-                    for (stem, content) in items {
-                        self.add_single_server_uri(&content, Some(&stem));
-                    }
+                    let v = self.vpn.clone();
+                    self.rt.spawn(async move {
+                        for (stem, content) in items {
+                            let trimmed = content.trim();
+                            if trimmed.is_empty() {
+                                continue;
+                            }
+                            let payload = if !stem.trim().is_empty() {
+                                json!({ "url": trimmed, "handle": stem.trim() }).to_string()
+                            } else {
+                                trimmed.to_string()
+                            };
+                            v.import_subscription(payload).await;
+                        }
+                    });
                     if count > 0 {
                         self.show_toast(if self.is_en() {
-                            format!("Imported configuration files: {count}")
+                            format!("Importing configuration files: {count}...")
                         } else {
-                            format!("Импортировано файлов конфигурации: {count}")
+                            format!("Импорт файлов конфигурации: {count}...")
                         });
                     }
                 }
+            } else if let Some(err_msg) = msg.strip_prefix("conf:import-err:") {
+                self.show_error_toast(err_msg.to_string());
             } else if let Some(apps_raw) = msg.strip_prefix("apps:scanned:") {
                 self.apps_scanning = false;
                 let (with_toast, json_part) = if let Some(rest) = apps_raw.strip_prefix("toast:") {
@@ -1887,6 +1922,25 @@ impl TachyonApp {
         Some(name)
     }
 
+    pub fn resolve_existing_node_label(&self, action: &str) -> Option<String> {
+        let nid = action.strip_prefix("NODE_")?;
+        self.state
+            .servers
+            .iter()
+            .find(|s| s.id == nid)
+            .map(|s| truncate_str(&s.name, 16))
+    }
+
+    pub fn sanitize_draft_custom_rule_action(&mut self) {
+        if self.custom_rule_action.starts_with("NODE_")
+            && self
+                .resolve_existing_node_label(&self.custom_rule_action)
+                .is_none()
+        {
+            self.custom_rule_action = "vpn".to_string();
+        }
+    }
+
     pub fn action_display_label(&self, action: &str) -> String {
         if let Some(name) = self.resolve_node_action_label(action) {
             return name;
@@ -1918,6 +1972,7 @@ impl TachyonApp {
             return;
         };
         self.editing_balancer_id = Some(srv.id.clone());
+        self.edit_bal_selected_remove.clear();
         let name_val = if srv.name.trim().is_empty() {
             bal.name.clone()
         } else {
@@ -1939,6 +1994,39 @@ impl TachyonApp {
         self.edit_bal_pool = if bal.pool == 0 { 4 } else { bal.pool };
         self.edit_bal_members = bal.members;
         self.modal = ModalKind::EditBalancer;
+    }
+
+    pub fn open_new_balancer_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editing_balancer_id = None;
+        self.edit_bal_selected_remove.clear();
+        let def_name = if self.is_en() {
+            "Smart Balancer".to_string()
+        } else {
+            "Новый балансировщик".to_string()
+        };
+        self.edit_bal_name_input
+            .update(cx, |s, cx| s.set_value(def_name, window, cx));
+        self.edit_bal_mode = self.state.vpn_prefs.balancer_mode.clone();
+        self.edit_bal_interval = self.state.vpn_prefs.balancer_interval.clone();
+        self.edit_bal_tolerance = self.state.vpn_prefs.balancer_tolerance;
+        self.edit_bal_pool = self.state.vpn_prefs.balancer_pool as u32;
+        self.edit_bal_members = Vec::new();
+        self.modal = ModalKind::EditBalancer;
+    }
+
+    pub fn open_rename_node_modal(
+        &mut self,
+        srv_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(srv) = self.state.servers.iter().find(|s| s.id == srv_id).cloned() else {
+            return;
+        };
+        self.renaming_node_id = Some(srv.id);
+        self.rename_node_input
+            .update(cx, |s, cx| s.set_value(srv.name, window, cx));
+        self.modal = ModalKind::RenameNode;
     }
 
     pub fn refresh_exit_info(&mut self) {
@@ -1981,13 +2069,19 @@ impl TachyonApp {
         let name = srv.name.clone();
         let eq = self.event_queue.clone();
         let is_en = self.is_en();
+        let use_urltest = self.state.auto_ping.urltest_ping;
+        let probe_url = self.state.vpn_prefs.balancer_url.clone();
         self.show_toast(if is_en {
             format!("Pinging {name}...")
         } else {
             format!("Пинг узла: {name}...")
         });
         self.rt.spawn(async move {
-            let ms = Self::probe_single_uri_ms(&uri).await;
+            let ms = if use_urltest && !is_mtproto_uri(&uri) {
+                probe_node_urltest_ms(&uri, &probe_url, 6500).await
+            } else {
+                Self::probe_single_uri_ms(&uri).await
+            };
             if let Ok(mut g) = eq.lock() {
                 g.push(format!("pong:{id}:{ms}"));
             }
@@ -2024,28 +2118,45 @@ impl TachyonApp {
 
     fn spawn_ping_batch(&self, targets: Vec<(String, String)>, is_auto: bool) {
         let eq = self.event_queue.clone();
+        let use_urltest = self.state.auto_ping.urltest_ping;
+        let probe_url = self.state.vpn_prefs.balancer_url.clone();
         self.rt.spawn(async move {
             let total = targets.len();
-            let sem = Arc::new(tokio::sync::Semaphore::new(16));
             let reachable = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let mut handles = Vec::with_capacity(total);
-            for (id, uri) in targets {
-                let sem_cl = sem.clone();
-                let eq_cl = eq.clone();
-                let reach_cl = reachable.clone();
-                handles.push(tokio::spawn(async move {
-                    let _permit = sem_cl.acquire().await;
-                    let ms = Self::probe_single_uri_ms(&uri).await;
-                    if ms > 0 {
-                        reach_cl.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if use_urltest {
+                for chunk in targets.chunks(12) {
+                    let res = probe_nodes_urltest_batch(chunk.to_vec(), &probe_url, 7000).await;
+                    if let Ok(mut g) = eq.lock() {
+                        for (id, _) in chunk {
+                            let ms = res.get(id).copied().unwrap_or(-1);
+                            if ms > 0 {
+                                reachable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            g.push(format!("pong:{id}:{ms}"));
+                        }
                     }
-                    if let Ok(mut g) = eq_cl.lock() {
-                        g.push(format!("pong:{id}:{ms}"));
-                    }
-                }));
-            }
-            for h in handles {
-                let _ = h.await;
+                }
+            } else {
+                let sem = Arc::new(tokio::sync::Semaphore::new(16));
+                let mut handles = Vec::with_capacity(total);
+                for (id, uri) in targets {
+                    let sem_cl = sem.clone();
+                    let eq_cl = eq.clone();
+                    let reach_cl = reachable.clone();
+                    handles.push(tokio::spawn(async move {
+                        let _permit = sem_cl.acquire().await;
+                        let ms = Self::probe_single_uri_ms(&uri).await;
+                        if ms > 0 {
+                            reach_cl.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        if let Ok(mut g) = eq_cl.lock() {
+                            g.push(format!("pong:{id}:{ms}"));
+                        }
+                    }));
+                }
+                for h in handles {
+                    let _ = h.await;
+                }
             }
             let r = reachable.load(std::sync::atomic::Ordering::Relaxed);
             if let Ok(mut g) = eq.lock() {
@@ -2167,6 +2278,7 @@ impl TachyonApp {
     }
 
     pub fn create_custom_balancer_from_nodes(&mut self) {
+        let has_selected = !self.balancer_draft_ids.is_empty();
         let members: Vec<BalancerMember> = self
             .state
             .servers
@@ -2174,6 +2286,9 @@ impl TachyonApp {
             .filter(|s| {
                 if s.is_balancer || is_mtproto_uri(&s.vless) {
                     return false;
+                }
+                if has_selected {
+                    return self.balancer_draft_ids.contains(&s.id);
                 }
                 if self.hide_ru_by && matches!(s.country.as_str(), "ru" | "by") {
                     return false;
@@ -2188,13 +2303,22 @@ impl TachyonApp {
             .collect();
 
         if members.len() < 2 {
-            let msg = self.tr(
-                "Нужно минимум 2 узла для создания балансировщика",
-                "At least 2 nodes are required to create a balancer",
-            );
+            let msg = if has_selected {
+                self.tr(
+                    "Отметьте минимум 2 узла для сборки балансировщика",
+                    "Select at least 2 nodes to build a balancer",
+                )
+            } else {
+                self.tr(
+                    "Нужно минимум 2 узла для создания балансировщика",
+                    "At least 2 nodes are required to create a balancer",
+                )
+            };
             self.show_toast(msg.to_string());
             return;
         }
+        self.balancer_draft_ids.clear();
+        self.balancer_select_mode = false;
 
         let mode = self.state.vpn_prefs.balancer_mode.clone();
         let name = if self.is_en() {
@@ -2284,20 +2408,26 @@ impl TachyonApp {
 
     pub fn import_conf_file_dialog(&mut self) {
         let eq = self.event_queue.clone();
+        let is_en = self.is_en();
         std::thread::spawn(move || {
             let paths = pick_conf_files_native();
             if paths.is_empty() {
                 return;
             }
             let mut items: Vec<(String, String)> = Vec::new();
+            let mut errs: Vec<String> = Vec::new();
             for path in paths {
-                if let Ok(content) = fs::read_to_string(&path) {
-                    let stem = path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("AWG Config")
-                        .to_string();
-                    items.push((stem, content));
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("AWG Config")
+                    .to_string();
+                match read_text_file_smart(&path) {
+                    Ok(content) if !content.trim().is_empty() => {
+                        items.push((stem, content));
+                    }
+                    Ok(_) => errs.push(format!("{stem}: empty file")),
+                    Err(e) => errs.push(format!("{stem}: {e}")),
                 }
             }
             if !items.is_empty()
@@ -2305,6 +2435,15 @@ impl TachyonApp {
                 && let Ok(mut g) = eq.lock()
             {
                 g.push(format!("conf:import-items:{payload}"));
+            } else if !errs.is_empty()
+                && let Ok(mut g) = eq.lock()
+            {
+                let msg = if is_en {
+                    format!("Failed to read .conf: {}", errs.join("; "))
+                } else {
+                    format!("Ошибка чтения .conf: {}", errs.join("; "))
+                };
+                g.push(format!("conf:import-err:{msg}"));
             }
         });
     }
@@ -2482,10 +2621,11 @@ impl TachyonApp {
                 self.auto_desync_fallback = false;
             }
         }
+        self.sanitize_draft_custom_rule_action();
         self.state.save();
-        if imported_count > 0 {
+        if imported_count > 0 && self.last_auto_ping.elapsed() >= Duration::from_secs(3) {
+            self.last_auto_ping = Instant::now();
             if self.state.auto_ping.enabled && self.auto_ping_busy.is_none() {
-                self.last_auto_ping = Instant::now();
                 self.run_auto_ping();
             } else if !self.state.auto_ping.enabled {
                 self.ping_all_nodes();
@@ -3499,6 +3639,9 @@ impl TachyonApp {
                             .gap(px(if m.narrow { 4.0 } else { 6.0 }))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.tab = tab_id;
+                                if tab_id == Tab::Routes {
+                                    this.sanitize_draft_custom_rule_action();
+                                }
                                 if tab_id == Tab::Traffic {
                                     let v = this.vpn.clone();
                                     let eq = this.event_queue.clone();
@@ -7522,7 +7665,7 @@ impl TachyonApp {
                         }),
                     )
                     .child({
-                        let node_lbl = self.resolve_node_action_label(&self.custom_rule_action);
+                        let node_lbl = self.resolve_existing_node_label(&self.custom_rule_action);
                         let active = node_lbl.is_some();
                         div()
                             .id("cr-act-node")
@@ -8277,6 +8420,54 @@ impl TachyonApp {
                                     .gap(px(6.0))
                                     .child(
                                         div()
+                                            .id("btn-toggle-bal-select")
+                                            .px(px(8.0))
+                                            .py(px(3.0))
+                                            .rounded(px(5.0))
+                                            .bg(if self.balancer_select_mode {
+                                                t.accent_bg
+                                            } else {
+                                                t.bg_elev
+                                            })
+                                            .border_1()
+                                            .border_color(if self.balancer_select_mode {
+                                                t.accent_border
+                                            } else {
+                                                t.border
+                                            })
+                                            .cursor_pointer()
+                                            .text_size(px(10.5))
+                                            .text_color(if self.balancer_select_mode {
+                                                t.accent
+                                            } else {
+                                                t.text_soft
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.balancer_select_mode =
+                                                    !this.balancer_select_mode;
+                                                if !this.balancer_select_mode {
+                                                    this.balancer_draft_ids.clear();
+                                                }
+                                                cx.notify();
+                                            }))
+                                            .child(if self.balancer_select_mode {
+                                                if self.is_en() {
+                                                    format!(
+                                                        "Selection ({})",
+                                                        self.balancer_draft_ids.len()
+                                                    )
+                                                } else {
+                                                    format!(
+                                                        "Выбор узлов ({})",
+                                                        self.balancer_draft_ids.len()
+                                                    )
+                                                }
+                                            } else {
+                                                self.tr("Выбрать узлы", "Select Nodes").to_string()
+                                            }),
+                                    )
+                                    .child(
+                                        div()
                                             .id("btn-create-custom-balancer")
                                             .px(px(8.0))
                                             .py(px(3.0))
@@ -8288,14 +8479,28 @@ impl TachyonApp {
                                             .text_size(px(10.5))
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(t.accent)
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.create_custom_balancer_from_nodes();
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                if !this.balancer_draft_ids.is_empty() {
+                                                    this.create_custom_balancer_from_nodes();
+                                                } else {
+                                                    this.open_new_balancer_editor(window, cx);
+                                                }
                                                 cx.notify();
                                             }))
-                                            .child(self.tr(
-                                                "+ Собрать балансировщик",
-                                                "+ Create Balancer",
-                                            )),
+                                            .child(if !self.balancer_draft_ids.is_empty() {
+                                                let cnt = self.balancer_draft_ids.len();
+                                                if self.is_en() {
+                                                    format!("+ Create Balancer ({cnt})")
+                                                } else {
+                                                    format!("+ Собрать ({cnt})")
+                                                }
+                                            } else {
+                                                self.tr(
+                                                    "+ Собрать балансировщик",
+                                                    "+ Create Balancer",
+                                                )
+                                                .to_string()
+                                            }),
                                     )
                                     .child(
                                         div()
@@ -8675,6 +8880,42 @@ impl TachyonApp {
                             )
                             .child(
                                 div()
+                                    .id("btn-nodes-ping-mode")
+                                    .px(px(8.0))
+                                    .py(px(4.0))
+                                    .rounded(px(6.0))
+                                    .bg(if self.state.auto_ping.urltest_ping {
+                                        t.accent_bg
+                                    } else {
+                                        t.bg_card
+                                    })
+                                    .border_1()
+                                    .border_color(if self.state.auto_ping.urltest_ping {
+                                        t.accent_border
+                                    } else {
+                                        t.border
+                                    })
+                                    .cursor_pointer()
+                                    .text_size(px(10.5))
+                                    .text_color(if self.state.auto_ping.urltest_ping {
+                                        t.accent
+                                    } else {
+                                        t.text_soft
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.state.auto_ping.urltest_ping =
+                                            !this.state.auto_ping.urltest_ping;
+                                        this.state.save();
+                                        cx.notify();
+                                    }))
+                                    .child(if self.state.auto_ping.urltest_ping {
+                                        self.tr("Пинг: HTTPS", "Ping: HTTPS")
+                                    } else {
+                                        self.tr("Пинг: TCP", "Ping: TCP")
+                                    }),
+                            )
+                            .child(
+                                div()
                                     .id("btn-nodes-ping-all")
                                     .px(px(8.0))
                                     .py(px(4.0))
@@ -8712,11 +8953,11 @@ impl TachyonApp {
                                         this.state.servers.retain(|s| {
                                             s.is_balancer || s.ping_ms.unwrap_or(1) > 0
                                         });
-                                        let alive_ids: HashSet<&str> = this
+                                        let alive_ids: HashSet<String> = this
                                             .state
                                             .servers
                                             .iter()
-                                            .map(|s| s.id.as_str())
+                                            .map(|s| s.id.clone())
                                             .collect();
                                         this.state
                                             .auto_ping
@@ -8748,6 +8989,9 @@ impl TachyonApp {
                                         } else {
                                             this.state.save();
                                         }
+                                        this.balancer_draft_ids
+                                            .retain(|id| alive_ids.contains(id.as_str()));
+                                        this.sanitize_draft_custom_rule_action();
                                         this.show_toast(if this.is_en() {
                                             format!("Removed unreachable nodes: {removed}")
                                         } else {
@@ -8759,448 +9003,125 @@ impl TachyonApp {
                             ),
                     );
 
-        let nodes_list =
-                // Full server table
-                div()
-                    .id("nodes-full-scroll")
-                    .when(!scroll_outer, |el| el.flex_1().min_h(px(0.0)))
-                    .when(scroll_outer, |el| el.h(px(340.0)).flex_none())
-                    .w_full()
-                    .overflow_y_scroll()
-                    .child(
+        let filtered_servers: Vec<&ServerNode> = self
+            .state
+            .servers
+            .iter()
+            .filter(|srv| {
+                if self.hide_ru_by && matches!(srv.country.as_str(), "ru" | "by") {
+                    return false;
+                }
+                let p = detect_protocol_badge(&srv.vless);
+                match self.node_filter.as_str() {
+                    "alive" => srv.is_balancer || srv.ping_ms.unwrap_or(-1) > 0,
+                    "AWG" => matches!(p, "AWG" | "WG"),
+                    "REALITY" => matches!(p, "REALITY" | "VLESS"),
+                    "XHTTP" => matches!(p, "XHTTP" | "WS" | "GRPC" | "HTTPUP"),
+                    "HY2" => matches!(
+                        p,
+                        "HY2" | "TUIC" | "WDTT" | "QUIC" | "QWDTT" | "CSQTT" | "MASQUE"
+                    ),
+                    "TEWFAI" => {
+                        matches!(p, "TEWFAI" | "MIERU" | "TRUST" | "TRUSTTUNNEL" | "JUICITY")
+                    }
+                    "VMESS" => matches!(
+                        p,
+                        "VMESS"
+                            | "TROJAN"
+                            | "SS"
+                            | "ANYTLS"
+                            | "SHADOWTLS"
+                            | "NAIVE"
+                            | "FPTN"
+                            | "TOR"
+                            | "SSH"
+                            | "SOCKS"
+                            | "SOCKS5"
+                            | "HTTP"
+                    ),
+                    "BALANCER" => srv.is_balancer || p == "BALANCER",
+                    _ => true,
+                }
+            })
+            .collect();
+
+        let balancers_vec: Vec<&ServerNode> = filtered_servers
+            .iter()
+            .copied()
+            .filter(|s| s.is_balancer)
+            .collect();
+        let regular_vec: Vec<&ServerNode> = filtered_servers
+            .iter()
+            .copied()
+            .filter(|s| !s.is_balancer)
+            .collect();
+        let show_split_headers = !balancers_vec.is_empty() && !regular_vec.is_empty();
+
+        let nodes_inner = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .when(!balancers_vec.is_empty(), |el| {
+                el.when(show_split_headers, |hel| {
+                    hel.child(
                         div()
                             .w_full()
-                            .flex()
-                            .flex_col()
-                            .gap(px(6.0))
-                            .children(
-                        self.state
-                            .servers
-                            .iter()
-                            .filter(|srv| {
-                                if self.hide_ru_by
-                                    && matches!(srv.country.as_str(), "ru" | "by")
-                                {
-                                    return false;
-                                }
-                                let p = detect_protocol_badge(&srv.vless);
-                                match self.node_filter.as_str() {
-                                    "alive" => srv.is_balancer || srv.ping_ms.unwrap_or(-1) > 0,
-                                    "AWG" => matches!(p, "AWG" | "WG"),
-                                    "REALITY" => matches!(p, "REALITY" | "VLESS"),
-                                    "XHTTP" => matches!(p, "XHTTP" | "WS" | "GRPC" | "HTTPUP"),
-                                    "HY2" => matches!(
-                                        p,
-                                        "HY2" | "TUIC" | "WDTT" | "QUIC" | "QWDTT" | "CSQTT" | "MASQUE"
-                                    ),
-                                    "TEWFAI" => matches!(
-                                        p,
-                                        "TEWFAI" | "MIERU" | "TRUST" | "TRUSTTUNNEL" | "JUICITY"
-                                    ),
-                                    "VMESS" => matches!(
-                                        p,
-                                        "VMESS"
-                                            | "TROJAN"
-                                            | "SS"
-                                            | "ANYTLS"
-                                            | "SHADOWTLS"
-                                            | "NAIVE"
-                                            | "FPTN"
-                                            | "TOR"
-                                            | "SSH"
-                                            | "SOCKS"
-                                            | "SOCKS5"
-                                            | "HTTP"
-                                    ),
-                                    "BALANCER" => srv.is_balancer || p == "BALANCER",
-                                    _ => true,
-                                }
-                            })
-                            .map(|srv| {
-                                let is_sel = srv.id == self.state.active_id;
-                                let is_relay = srv.id == self.state.vpn_prefs.relay_id;
-                                let sid = srv.id.clone();
-                                let sid_ping = srv.id.clone();
-                                let sid_del = srv.id.clone();
-                                let sid_relay = srv.id.clone();
-                                let sid_ap = srv.id.clone();
-                                let sid_info = srv.id.clone();
-                                let sid_edit = srv.id.clone();
-                                let bal_tag = if srv.is_balancer {
-                                    let bm = srv
-                                        .balancer_mode
-                                        .as_deref()
-                                        .unwrap_or(&self.state.vpn_prefs.balancer_mode);
-                                    let st = balancer_mode_short_label(bm, self.is_en());
-                                    let cnt = srv.member_count.unwrap_or(0);
-                                    Some(format!("{st} · {cnt}"))
-                                } else {
-                                    None
-                                };
-                                let is_ap_sel = !srv.is_balancer
-                                    && (self.state.auto_ping.all
-                                        || self.state.auto_ping.ids.contains(&srv.id));
-                                let srv_uri = srv.vless.clone();
-                                let proto = detect_protocol_badge(&srv.vless);
-                                let stale_thresh =
-                                    (self.state.auto_ping.interval_s * 2).max(300);
-                                let (ping_icon_col, ping_text_col, ping_label) = ping_badge_style(
-                                    srv.ping_ms,
-                                    srv.ping_at,
-                                    now_unix_secs(),
-                                    stale_thresh,
-                                    self.is_en(),
-                                    false,
-                                    t,
-                                );
-
-                                div()
-                                    .id(SharedString::from(format!("node-row-{}", srv.id)))
-                                    .w_full()
-                                    .p(px(10.0))
-                                    .rounded(px(10.0))
-                                    .bg(if is_sel { t.accent_bg } else { t.bg_card })
-                                    .border_1()
-                                    .border_color(if is_sel { t.accent_border } else { t.border })
-                                    .flex()
-                                    .flex_wrap()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap(px(8.0))
-                                    .child(
-                                        div()
-                                            .id(SharedString::from(format!("node-sel-{}", srv.id)))
-                                            .flex_1()
-                                            .min_w(px(160.0))
-                                            .cursor_pointer()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(10.0))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.state.active_id = sid.clone();
-                                                this.reconnect_if_active();
-                                                cx.notify();
-                                            }))
-                                            .child(render_flag_badge(&srv.country, 22.0, t))
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_w(px(0.0))
-                                                    .flex()
-                                                    .flex_col()
-                                                    .child(
-                                                        div()
-                                                            .w_full()
-                                                            .truncate()
-                                                            .text_size(px(12.0))
-                                                            .font_weight(FontWeight::SEMIBOLD)
-                                                            .text_color(t.text)
-                                                            .child(srv.name.clone()),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .w_full()
-                                                            .flex()
-                                                            .items_center()
-                                                            .gap(px(5.0))
-                                                            .child(
-                                                                div()
-                                                                    .truncate()
-                                                                    .text_size(px(10.0))
-                                                                    .text_color(t.text_dim)
-                                                                    .child(format!(
-                                                                        "{} · {}",
-                                                                        self.country_title(&srv.country),
-                                                                        proto
-                                                                    )),
-                                                            )
-                                                            .when_some(bal_tag, |el, bt| {
-                                                                el.child(
-                                                                    div()
-                                                                        .px(px(5.0))
-                                                                        .py(px(1.0))
-                                                                        .rounded(px(4.0))
-                                                                        .bg(t.accent_bg)
-                                                                        .text_size(px(9.0))
-                                                                        .font_weight(FontWeight::SEMIBOLD)
-                                                                        .text_color(t.accent)
-                                                                        .child(bt),
-                                                                )
-                                                            }),
-                                                    ),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_wrap()
-                                            .items_center()
-                                            .gap(px(6.0))
-                                            .when(!srv.is_balancer, |el| {
-                                                el.child(
-                                                    div()
-                                                        .id(SharedString::from(format!(
-                                                            "chk-autoping-{}",
-                                                            srv.id
-                                                        )))
-                                                        .w(px(22.0))
-                                                        .h(px(22.0))
-                                                        .rounded(px(5.0))
-                                                        .bg(if is_ap_sel {
-                                                            t.green_bg
-                                                        } else {
-                                                            t.bg_elev
-                                                        })
-                                                        .border_1()
-                                                        .border_color(if is_ap_sel {
-                                                            t.green_border
-                                                        } else {
-                                                            t.border
-                                                        })
-                                                        .cursor_pointer()
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_center()
-                                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                                            this.toggle_ping_selected(&sid_ap);
-                                                            cx.notify();
-                                                        }))
-                                                        .when(is_ap_sel, |cel| {
-                                                            cel.child(
-                                                                svg()
-                                                                    .path("icons/check.svg")
-                                                                    .size(px(11.0))
-                                                                    .text_color(t.green),
-                                                            )
-                                                        }),
-                                                )
-                                            })
-                                            .child(
-                                                div()
-                                                    .id(SharedString::from(format!(
-                                                        "btn-node-ping-{}",
-                                                        srv.id
-                                                    )))
-                                                    .px(px(7.0))
-                                                    .py(px(3.0))
-                                                    .rounded(px(5.0))
-                                                    .bg(t.bg_elev)
-                                                    .border_1()
-                                                    .border_color(t.border)
-                                                    .cursor_pointer()
-                                                    .hover(|s| s.bg(t.bg_hover))
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap(px(4.0))
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        this.ping_single_node(sid_ping.clone());
-                                                        cx.notify();
-                                                    }))
-                                                    .child(
-                                                        svg()
-                                                            .path("icons/bolt.svg")
-                                                            .size(px(10.0))
-                                                            .text_color(ping_icon_col),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(10.5))
-                                                            .text_color(ping_text_col)
-                                                            .child(ping_label),
-                                                    ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id(SharedString::from(format!(
-                                                        "btn-relay-{}",
-                                                        srv.id
-                                                    )))
-                                                    .px(px(7.0))
-                                                    .py(px(3.0))
-                                                    .rounded(px(5.0))
-                                                    .cursor_pointer()
-                                                    .bg(if is_relay { t.amber_bg } else { t.bg_elev })
-                                                    .border_1()
-                                                    .border_color(if is_relay {
-                                                        t.amber_border
-                                                    } else {
-                                                        t.border
-                                                    })
-                                                    .text_size(px(10.0))
-                                                    .text_color(if is_relay {
-                                                        t.amber
-                                                    } else {
-                                                        t.text_dim
-                                                    })
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        if this.state.vpn_prefs.relay_id
-                                                            == sid_relay
-                                                        {
-                                                            this.state.vpn_prefs.relay_id.clear();
-                                                        } else {
-                                                            this.state.vpn_prefs.relay_id =
-                                                                sid_relay.clone();
-                                                        }
-                                                        this.reconnect_if_active();
-                                                        cx.notify();
-                                                    }))
-                                                    .child(if is_relay {
-                                                        self.tr("Каскад (Вход)", "Relay (Entry)")
-                                                    } else {
-                                                        self.tr("В каскад", "Set Relay")
-                                                    }),
-                                            )
-                                            .when(srv.is_balancer, |el| {
-                                                el.child(
-                                                    div()
-                                                        .id(SharedString::from(format!(
-                                                            "btn-edit-bal-{}",
-                                                            srv.id
-                                                        )))
-                                                        .w(px(26.0))
-                                                        .h(px(26.0))
-                                                        .rounded(px(6.0))
-                                                        .bg(t.bg_elev)
-                                                        .border_1()
-                                                        .border_color(t.border)
-                                                        .cursor_pointer()
-                                                        .hover(|s| s.bg(t.bg_hover))
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_center()
-                                                        .on_click(cx.listener(
-                                                            move |this, _, window, cx| {
-                                                                this.open_balancer_editor(
-                                                                    &sid_edit, window, cx,
-                                                                );
-                                                                cx.notify();
-                                                            },
-                                                        ))
-                                                        .child(
-                                                            svg()
-                                                                .path("icons/sliders.svg")
-                                                                .size(px(12.0))
-                                                                .text_color(t.accent),
-                                                        ),
-                                                )
-                                            })
-                                            .child(
-                                                div()
-                                                    .id(SharedString::from(format!(
-                                                        "btn-node-info-{}",
-                                                        srv.id
-                                                    )))
-                                                    .w(px(26.0))
-                                                    .h(px(26.0))
-                                                    .rounded(px(6.0))
-                                                    .bg(t.bg_elev)
-                                                    .cursor_pointer()
-                                                    .hover(|s| s.bg(t.bg_hover))
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        this.inspected_node_id =
-                                                            Some(sid_info.clone());
-                                                        this.modal = ModalKind::NodeInspector;
-                                                        cx.notify();
-                                                    }))
-                                                    .child(
-                                                        svg()
-                                                            .path("icons/info.svg")
-                                                            .size(px(12.0))
-                                                            .text_color(t.text_soft),
-                                                    ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id(SharedString::from(format!(
-                                                        "btn-copy-{}",
-                                                        srv.id
-                                                    )))
-                                                    .w(px(26.0))
-                                                    .h(px(26.0))
-                                                    .rounded(px(6.0))
-                                                    .bg(t.bg_elev)
-                                                    .cursor_pointer()
-                                                    .hover(|s| s.bg(t.bg_hover))
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        cx.write_to_clipboard(
-                                                            ClipboardItem::new_string(
-                                                                srv_uri.clone(),
-                                                            ),
-                                                        );
-                                                        this.show_toast(this.tr(
-                                                            "Ссылка скопирована в буфер обмена",
-                                                            "Link copied to clipboard",
-                                                        ));
-                                                        cx.notify();
-                                                    }))
-                                                    .child(
-                                                        svg()
-                                                            .path("icons/copy.svg")
-                                                            .size(px(12.0))
-                                                            .text_color(t.text_soft),
-                                                    ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id(SharedString::from(format!(
-                                                        "btn-del-{}",
-                                                        srv.id
-                                                    )))
-                                                    .w(px(26.0))
-                                                    .h(px(26.0))
-                                                    .rounded(px(6.0))
-                                                    .bg(t.bg_elev)
-                                                    .cursor_pointer()
-                                                    .hover(|s| s.bg(t.red_bg))
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        let was_used = this.state.active_id == sid_del
-                                                            || this.state.vpn_prefs.relay_id == sid_del;
-                                                        this.state
-                                                            .servers
-                                                            .retain(|s| s.id != sid_del);
-                                                        this.state
-                                                            .auto_ping
-                                                            .ids
-                                                            .retain(|x| x != &sid_del);
-                                                        if this.state.vpn_prefs.relay_id == sid_del
-                                                        {
-                                                            this.state.vpn_prefs.relay_id.clear();
-                                                        }
-                                                        if this.state.active_id == sid_del {
-                                                            this.state.active_id = this
-                                                                .state
-                                                                .servers
-                                                                .first()
-                                                                .map(|s| s.id.clone())
-                                                                .unwrap_or_default();
-                                                        }
-                                                        if was_used {
-                                                            this.reconnect_if_active();
-                                                        } else {
-                                                            this.state.save();
-                                                        }
-                                                        cx.notify();
-                                                    }))
-                                                    .child(
-                                                        svg()
-                                                            .path("icons/trash.svg")
-                                                            .size(px(12.0))
-                                                            .text_color(t.red),
-                                                    ),
-                                            ),
-                                    )
+                            .pt(px(2.0))
+                            .text_size(px(10.5))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(t.accent)
+                            .child(if self.is_en() {
+                                format!("Balancers ({})", balancers_vec.len())
+                            } else {
+                                format!("Балансировщики ({})", balancers_vec.len())
                             }),
-                        ),
-                    );
+                    )
+                })
+                .children(
+                    balancers_vec
+                        .iter()
+                        .map(|srv| self.render_node_row_card(srv, t, cx)),
+                )
+            })
+            .when(!regular_vec.is_empty(), |el| {
+                el.when(show_split_headers, |hel| {
+                    hel.child(
+                        div()
+                            .w_full()
+                            .mt(px(4.0))
+                            .pt(px(6.0))
+                            .border_t_1()
+                            .border_color(t.border)
+                            .text_size(px(10.5))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(t.text_soft)
+                            .child(if self.is_en() {
+                                format!("Nodes ({})", regular_vec.len())
+                            } else {
+                                format!("Серверы и узлы ({})", regular_vec.len())
+                            }),
+                    )
+                })
+                .children(
+                    regular_vec
+                        .iter()
+                        .map(|srv| self.render_node_row_card(srv, t, cx)),
+                )
+            });
+
+        let nodes_list = if scroll_outer {
+            div().w_full().child(nodes_inner).into_any_element()
+        } else {
+            div()
+                .id("nodes-full-scroll")
+                .flex_1()
+                .min_h(px(0.0))
+                .w_full()
+                .overflow_y_scroll()
+                .child(nodes_inner)
+                .into_any_element()
+        };
 
         if scroll_outer {
             div()
@@ -9236,6 +9157,414 @@ impl TachyonApp {
                 .child(nodes_list)
                 .into_any_element()
         }
+    }
+
+    fn render_node_row_card(
+        &self,
+        srv: &ServerNode,
+        t: Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let is_sel = srv.id == self.state.active_id;
+        let is_relay = srv.id == self.state.vpn_prefs.relay_id;
+        let sid = srv.id.clone();
+        let sid_ping = srv.id.clone();
+        let sid_del = srv.id.clone();
+        let sid_relay = srv.id.clone();
+        let sid_ap = srv.id.clone();
+        let sid_info = srv.id.clone();
+        let sid_edit = srv.id.clone();
+        let sid_rename = srv.id.clone();
+        let sid_draft = srv.id.clone();
+        let in_draft = self.balancer_draft_ids.contains(&srv.id);
+        let bal_tag = if srv.is_balancer {
+            let bm = srv
+                .balancer_mode
+                .as_deref()
+                .unwrap_or(&self.state.vpn_prefs.balancer_mode);
+            let st = balancer_mode_short_label(bm, self.is_en());
+            let cnt = srv.member_count.unwrap_or(0);
+            Some(format!("{st} · {cnt}"))
+        } else {
+            None
+        };
+        let is_ap_sel = !srv.is_balancer
+            && (self.state.auto_ping.all || self.state.auto_ping.ids.contains(&srv.id));
+        let srv_uri = srv.vless.clone();
+        let proto = detect_protocol_badge(&srv.vless);
+        let stale_thresh = (self.state.auto_ping.interval_s * 2).max(300);
+        let (ping_icon_col, ping_text_col, ping_label) = ping_badge_style(
+            srv.ping_ms,
+            srv.ping_at,
+            now_unix_secs(),
+            stale_thresh,
+            self.is_en(),
+            false,
+            t,
+        );
+
+        div()
+            .id(SharedString::from(format!("node-row-{}", srv.id)))
+            .w_full()
+            .p(px(10.0))
+            .rounded(px(10.0))
+            .bg(if is_sel {
+                t.accent_bg
+            } else if srv.is_balancer {
+                t.bg_elev
+            } else {
+                t.bg_card
+            })
+            .border_1()
+            .border_color(if is_sel {
+                t.accent_border
+            } else if srv.is_balancer {
+                t.border_hi
+            } else {
+                t.border
+            })
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .justify_between()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .id(SharedString::from(format!("node-sel-{}", srv.id)))
+                    .flex_1()
+                    .min_w(px(160.0))
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.state.active_id = sid.clone();
+                        this.reconnect_if_active();
+                        cx.notify();
+                    }))
+                    .when(self.balancer_select_mode && !srv.is_balancer, |el| {
+                        el.child(
+                            div()
+                                .id(SharedString::from(format!("chk-bal-draft-{}", srv.id)))
+                                .w(px(20.0))
+                                .h(px(20.0))
+                                .rounded(px(5.0))
+                                .bg(if in_draft { t.accent_bg } else { t.bg_elev })
+                                .border_1()
+                                .border_color(if in_draft {
+                                    t.accent_border
+                                } else {
+                                    t.border_hi
+                                })
+                                .cursor_pointer()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    if !this.balancer_draft_ids.remove(&sid_draft) {
+                                        this.balancer_draft_ids.insert(sid_draft.clone());
+                                    }
+                                    cx.notify();
+                                }))
+                                .when(in_draft, |cel| {
+                                    cel.child(
+                                        svg()
+                                            .path("icons/check.svg")
+                                            .size(px(11.0))
+                                            .text_color(t.accent),
+                                    )
+                                }),
+                        )
+                    })
+                    .child(render_flag_badge(&srv.country, 22.0, t))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .w_full()
+                                    .truncate()
+                                    .text_size(px(12.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(t.text)
+                                    .child(srv.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(5.0))
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_size(px(10.0))
+                                            .text_color(t.text_dim)
+                                            .child(format!(
+                                                "{} · {}",
+                                                self.country_title(&srv.country),
+                                                proto
+                                            )),
+                                    )
+                                    .when_some(bal_tag, |el, bt| {
+                                        el.child(
+                                            div()
+                                                .px(px(5.0))
+                                                .py(px(1.0))
+                                                .rounded(px(4.0))
+                                                .bg(t.accent_bg)
+                                                .text_size(px(9.0))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(t.accent)
+                                                .child(bt),
+                                        )
+                                    }),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(6.0))
+                    .when(!srv.is_balancer, |el| {
+                        el.child(
+                            div()
+                                .id(SharedString::from(format!("chk-autoping-{}", srv.id)))
+                                .w(px(22.0))
+                                .h(px(22.0))
+                                .rounded(px(5.0))
+                                .bg(if is_ap_sel { t.green_bg } else { t.bg_elev })
+                                .border_1()
+                                .border_color(if is_ap_sel { t.green_border } else { t.border })
+                                .cursor_pointer()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.toggle_ping_selected(&sid_ap);
+                                    cx.notify();
+                                }))
+                                .when(is_ap_sel, |cel| {
+                                    cel.child(
+                                        svg()
+                                            .path("icons/check.svg")
+                                            .size(px(11.0))
+                                            .text_color(t.green),
+                                    )
+                                }),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("btn-node-ping-{}", srv.id)))
+                            .px(px(7.0))
+                            .py(px(3.0))
+                            .rounded(px(5.0))
+                            .bg(t.bg_elev)
+                            .border_1()
+                            .border_color(t.border)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(t.bg_hover))
+                            .flex()
+                            .items_center()
+                            .gap(px(4.0))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.ping_single_node(sid_ping.clone());
+                                cx.notify();
+                            }))
+                            .child(
+                                svg()
+                                    .path("icons/bolt.svg")
+                                    .size(px(10.0))
+                                    .text_color(ping_icon_col),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .text_color(ping_text_col)
+                                    .child(ping_label),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("btn-relay-{}", srv.id)))
+                            .px(px(7.0))
+                            .py(px(3.0))
+                            .rounded(px(5.0))
+                            .cursor_pointer()
+                            .bg(if is_relay { t.amber_bg } else { t.bg_elev })
+                            .border_1()
+                            .border_color(if is_relay { t.amber_border } else { t.border })
+                            .text_size(px(10.0))
+                            .text_color(if is_relay { t.amber } else { t.text_dim })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if this.state.vpn_prefs.relay_id == sid_relay {
+                                    this.state.vpn_prefs.relay_id.clear();
+                                } else {
+                                    this.state.vpn_prefs.relay_id = sid_relay.clone();
+                                }
+                                this.reconnect_if_active();
+                                cx.notify();
+                            }))
+                            .child(if is_relay {
+                                self.tr("Каскад (Вход)", "Relay (Entry)")
+                            } else {
+                                self.tr("В каскад", "Set Relay")
+                            }),
+                    )
+                    .when(srv.is_balancer, |el| {
+                        el.child(
+                            div()
+                                .id(SharedString::from(format!("btn-edit-bal-{}", srv.id)))
+                                .w(px(26.0))
+                                .h(px(26.0))
+                                .rounded(px(6.0))
+                                .bg(t.bg_elev)
+                                .border_1()
+                                .border_color(t.border)
+                                .cursor_pointer()
+                                .hover(|s| s.bg(t.bg_hover))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_balancer_editor(&sid_edit, window, cx);
+                                    cx.notify();
+                                }))
+                                .child(
+                                    svg()
+                                        .path("icons/sliders.svg")
+                                        .size(px(12.0))
+                                        .text_color(t.accent),
+                                ),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("btn-rename-node-{}", srv.id)))
+                            .w(px(26.0))
+                            .h(px(26.0))
+                            .rounded(px(6.0))
+                            .bg(t.bg_elev)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(t.bg_hover))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_rename_node_modal(&sid_rename, window, cx);
+                                cx.notify();
+                            }))
+                            .child(
+                                svg()
+                                    .path("icons/edit.svg")
+                                    .size(px(12.0))
+                                    .text_color(t.text_soft),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("btn-node-info-{}", srv.id)))
+                            .w(px(26.0))
+                            .h(px(26.0))
+                            .rounded(px(6.0))
+                            .bg(t.bg_elev)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(t.bg_hover))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.inspected_node_id = Some(sid_info.clone());
+                                this.modal = ModalKind::NodeInspector;
+                                cx.notify();
+                            }))
+                            .child(
+                                svg()
+                                    .path("icons/info.svg")
+                                    .size(px(12.0))
+                                    .text_color(t.text_soft),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("btn-copy-{}", srv.id)))
+                            .w(px(26.0))
+                            .h(px(26.0))
+                            .rounded(px(6.0))
+                            .bg(t.bg_elev)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(t.bg_hover))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(srv_uri.clone()));
+                                this.show_toast(this.tr(
+                                    "Ссылка скопирована в буфер обмена",
+                                    "Link copied to clipboard",
+                                ));
+                                cx.notify();
+                            }))
+                            .child(
+                                svg()
+                                    .path("icons/copy.svg")
+                                    .size(px(12.0))
+                                    .text_color(t.text_soft),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("btn-del-{}", srv.id)))
+                            .w(px(26.0))
+                            .h(px(26.0))
+                            .rounded(px(6.0))
+                            .bg(t.bg_elev)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(t.red_bg))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let was_used = this.state.active_id == sid_del
+                                    || this.state.vpn_prefs.relay_id == sid_del;
+                                this.state.servers.retain(|s| s.id != sid_del);
+                                this.state.auto_ping.ids.retain(|x| x != &sid_del);
+                                this.balancer_draft_ids.remove(&sid_del);
+                                if this.state.vpn_prefs.relay_id == sid_del {
+                                    this.state.vpn_prefs.relay_id.clear();
+                                }
+                                if this.state.active_id == sid_del {
+                                    this.state.active_id = this
+                                        .state
+                                        .servers
+                                        .first()
+                                        .map(|s| s.id.clone())
+                                        .unwrap_or_default();
+                                }
+                                this.sanitize_draft_custom_rule_action();
+                                if was_used {
+                                    this.reconnect_if_active();
+                                } else {
+                                    this.state.save();
+                                }
+                                cx.notify();
+                            }))
+                            .child(
+                                svg()
+                                    .path("icons/trash.svg")
+                                    .size(px(12.0))
+                                    .text_color(t.red),
+                            ),
+                    ),
+            )
+            .into_any_element()
     }
 
     fn render_traffic_tab(
@@ -13092,7 +13421,26 @@ impl TachyonApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let en = self.is_en();
-        let can_remove_member = self.edit_bal_members.len() > 2;
+        let is_creating = self.editing_balancer_id.is_none();
+        let min_keep = if is_creating { 0 } else { 2 };
+        let selected_rm_cnt = self.edit_bal_selected_remove.len();
+        let can_batch_remove = selected_rm_cnt > 0
+            && self.edit_bal_members.len().saturating_sub(selected_rm_cnt) >= min_keep;
+        let present_uris: HashSet<&str> = self
+            .edit_bal_members
+            .iter()
+            .map(|mem| mem.vless.as_str())
+            .collect();
+        let available_to_add: Vec<&ServerNode> = self
+            .state
+            .servers
+            .iter()
+            .filter(|s| {
+                !s.is_balancer
+                    && !is_mtproto_uri(&s.vless)
+                    && !present_uris.contains(s.vless.as_str())
+            })
+            .collect();
         const MODES: [(&str, &str, &str); 12] = [
             ("stability", "Стабильность (EWMA)", "Stability (EWMA)"),
             ("least_test", "Мин. пинг (Least RTT)", "Least RTT"),
@@ -13154,9 +13502,14 @@ impl TachyonApp {
                                     .text_size(px(14.0))
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(t.text)
-                                    .child(
-                                        self.tr("Редактирование балансировщика", "Edit Balancer"),
-                                    ),
+                                    .child(if is_creating {
+                                        self.tr("Создание балансировщика", "Create Balancer")
+                                    } else {
+                                        self.tr(
+                                            "Редактирование балансировщика",
+                                            "Edit Balancer",
+                                        )
+                                    }),
                             )
                             .child(
                                 div()
@@ -13327,22 +13680,124 @@ impl TachyonApp {
                                             })
                                             .collect(),
                                     ))
-                                    .child(Self::bal_title(
-                                        self.tr("Участники пула", "Pool Members"),
-                                        t,
-                                    ))
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .gap(px(8.0))
+                                            .child(Self::bal_title(
+                                                if en {
+                                                    "Pool Members"
+                                                } else {
+                                                    "Участники пула"
+                                                },
+                                                t,
+                                            ))
+                                            .when(selected_rm_cnt > 0, |el| {
+                                                el.child(
+                                                    div()
+                                                        .id("btn-edit-bal-rm-selected")
+                                                        .px(px(8.0))
+                                                        .py(px(3.0))
+                                                        .rounded(px(5.0))
+                                                        .cursor_pointer()
+                                                        .bg(if can_batch_remove {
+                                                            t.red_bg
+                                                        } else {
+                                                            t.bg_elev
+                                                        })
+                                                        .border_1()
+                                                        .border_color(if can_batch_remove {
+                                                            t.red_border
+                                                        } else {
+                                                            t.border
+                                                        })
+                                                        .text_size(px(10.0))
+                                                        .text_color(if can_batch_remove {
+                                                            t.red
+                                                        } else {
+                                                            t.text_dim
+                                                        })
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                let keep_min = if this
+                                                                    .editing_balancer_id
+                                                                    .is_none()
+                                                                {
+                                                                    0
+                                                                } else {
+                                                                    2
+                                                                };
+                                                                let rm_cnt = this
+                                                                    .edit_bal_selected_remove
+                                                                    .len();
+                                                                if this
+                                                                    .edit_bal_members
+                                                                    .len()
+                                                                    .saturating_sub(rm_cnt)
+                                                                    < keep_min
+                                                                {
+                                                                    this.show_error_toast(
+                                                                        this.tr(
+                                                                            "В балансировщике должно остаться минимум 2 узла",
+                                                                            "At least 2 nodes must remain in balancer",
+                                                                        ),
+                                                                    );
+                                                                    return;
+                                                                }
+                                                                let to_rm = std::mem::take(
+                                                                    &mut this.edit_bal_selected_remove,
+                                                                );
+                                                                let mut idx = 0usize;
+                                                                this.edit_bal_members.retain(|_| {
+                                                                    let keep =
+                                                                        !to_rm.contains(&idx);
+                                                                    idx += 1;
+                                                                    keep
+                                                                });
+                                                                cx.notify();
+                                                            },
+                                                        ))
+                                                        .child(if en {
+                                                            format!("Remove ({selected_rm_cnt})")
+                                                        } else {
+                                                            format!("Удалить ({selected_rm_cnt})")
+                                                        }),
+                                                )
+                                            }),
+                                    )
                                     .children(self.edit_bal_members.iter().enumerate().map(
                                         |(idx, mem)| {
+                                            let checked =
+                                                self.edit_bal_selected_remove.contains(&idx);
                                             div()
+                                                .id(SharedString::from(format!(
+                                                    "edit-bal-mem-{idx}"
+                                                )))
                                                 .w_full()
                                                 .px(px(8.0))
                                                 .py(px(5.0))
                                                 .rounded(px(6.0))
-                                                .bg(t.bg_elev)
+                                                .bg(if checked { t.red_bg } else { t.bg_elev })
+                                                .border_1()
+                                                .border_color(if checked {
+                                                    t.red_border
+                                                } else {
+                                                    t.border
+                                                })
+                                                .cursor_pointer()
                                                 .flex()
                                                 .items_center()
                                                 .justify_between()
                                                 .gap(px(6.0))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    if !this.edit_bal_selected_remove.remove(&idx) {
+                                                        this.edit_bal_selected_remove.insert(idx);
+                                                    }
+                                                    cx.notify();
+                                                }))
                                                 .child(
                                                     div()
                                                         .flex_1()
@@ -13350,6 +13805,34 @@ impl TachyonApp {
                                                         .flex()
                                                         .items_center()
                                                         .gap(px(6.0))
+                                                        .child(
+                                                            div()
+                                                                .w(px(16.0))
+                                                                .h(px(16.0))
+                                                                .rounded(px(4.0))
+                                                                .bg(if checked {
+                                                                    t.red_bg
+                                                                } else {
+                                                                    t.bg_card
+                                                                })
+                                                                .border_1()
+                                                                .border_color(if checked {
+                                                                    t.red
+                                                                } else {
+                                                                    t.border_hi
+                                                                })
+                                                                .flex()
+                                                                .items_center()
+                                                                .justify_center()
+                                                                .when(checked, |cel| {
+                                                                    cel.child(
+                                                                        svg()
+                                                                            .path("icons/check.svg")
+                                                                            .size(px(10.0))
+                                                                            .text_color(t.red),
+                                                                    )
+                                                                }),
+                                                        )
                                                         .child(render_flag_badge(
                                                             &mem.country,
                                                             16.0,
@@ -13365,45 +13848,102 @@ impl TachyonApp {
                                                                 .child(mem.name.clone()),
                                                         ),
                                                 )
-                                                .when(can_remove_member, |el| {
-                                                    el.child(
-                                                        div()
-                                                            .id(SharedString::from(format!(
-                                                                "edit-bal-rm-{idx}"
-                                                            )))
-                                                            .w(px(22.0))
-                                                            .h(px(22.0))
-                                                            .rounded(px(5.0))
-                                                            .cursor_pointer()
-                                                            .hover(|s| s.bg(t.red_bg))
-                                                            .flex()
-                                                            .items_center()
-                                                            .justify_center()
-                                                            .on_click(cx.listener(
-                                                                move |this, _, _, cx| {
-                                                                    if this.edit_bal_members.len()
-                                                                        > 2
-                                                                        && idx
-                                                                            < this
-                                                                                .edit_bal_members
-                                                                                .len()
-                                                                    {
-                                                                        this.edit_bal_members
-                                                                            .remove(idx);
-                                                                    }
-                                                                    cx.notify();
-                                                                },
-                                                            ))
-                                                            .child(
-                                                                svg()
-                                                                    .path("icons/trash.svg")
-                                                                    .size(px(11.0))
-                                                                    .text_color(t.red),
-                                                            ),
-                                                    )
-                                                })
+                                                .child(
+                                                    div()
+                                                        .flex_shrink_0()
+                                                        .text_size(px(9.5))
+                                                        .text_color(t.text_dim)
+                                                        .child(detect_protocol_badge(&mem.vless)),
+                                                )
                                         },
-                                    )),
+                                    ))
+                                    .when(!available_to_add.is_empty(), |el| {
+                                        el.child(Self::bal_title(
+                                            self.tr(
+                                                "Добавить узлы в пул",
+                                                "Add Nodes to Pool",
+                                            ),
+                                            t,
+                                        ))
+                                        .children(available_to_add.into_iter().map(|srv| {
+                                            let add_mem = BalancerMember {
+                                                name: srv.name.clone(),
+                                                vless: srv.vless.clone(),
+                                                country: srv.country.clone(),
+                                            };
+                                            let proto = detect_protocol_badge(&srv.vless);
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "edit-bal-add-{}",
+                                                    srv.id
+                                                )))
+                                                .w_full()
+                                                .px(px(8.0))
+                                                .py(px(5.0))
+                                                .rounded(px(6.0))
+                                                .bg(t.bg_card)
+                                                .border_1()
+                                                .border_color(t.border)
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(t.bg_hover))
+                                                .flex()
+                                                .items_center()
+                                                .justify_between()
+                                                .gap(px(6.0))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    if !this
+                                                        .edit_bal_members
+                                                        .iter()
+                                                        .any(|m| m.vless == add_mem.vless)
+                                                    {
+                                                        this.edit_bal_members.push(add_mem.clone());
+                                                        this.edit_bal_selected_remove.clear();
+                                                    }
+                                                    cx.notify();
+                                                }))
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w(px(0.0))
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap(px(6.0))
+                                                        .child(render_flag_badge(
+                                                            &srv.country,
+                                                            16.0,
+                                                            t,
+                                                        ))
+                                                        .child(
+                                                            div()
+                                                                .flex_1()
+                                                                .min_w(px(0.0))
+                                                                .truncate()
+                                                                .text_size(px(11.0))
+                                                                .text_color(t.text)
+                                                                .child(srv.name.clone()),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_shrink_0()
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap(px(6.0))
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(9.5))
+                                                                .text_color(t.text_dim)
+                                                                .child(proto),
+                                                        )
+                                                        .child(
+                                                            svg()
+                                                                .path("icons/plus.svg")
+                                                                .size(px(12.0))
+                                                                .text_color(t.accent),
+                                                        ),
+                                                )
+                                        }))
+                                    }),
                             ),
                     )
                     .child(
@@ -13444,10 +13984,14 @@ impl TachyonApp {
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(t.on_accent)
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        let Some(bal_id) = this.editing_balancer_id.clone() else {
-                                            this.modal = ModalKind::None;
+                                        let members = this.edit_bal_members.clone();
+                                        if members.len() < 2 {
+                                            this.show_error_toast(this.tr(
+                                                "Для балансировщика требуется минимум 2 узла",
+                                                "At least 2 nodes are required for a balancer",
+                                            ));
                                             return;
-                                        };
+                                        }
                                         let typed_name = this
                                             .edit_bal_name_input
                                             .read(cx)
@@ -13458,65 +14002,128 @@ impl TachyonApp {
                                         let interval = this.edit_bal_interval.clone();
                                         let tolerance = this.edit_bal_tolerance;
                                         let pool = this.edit_bal_pool;
-                                        let members = this.edit_bal_members.clone();
-                                        let mut updated_active = false;
-                                        if let Some(srv) =
-                                            this.state.servers.iter_mut().find(|s| s.id == bal_id)
-                                        {
-                                            let old = decode_balancer_uri(&srv.vless);
+                                        if let Some(bal_id) = this.editing_balancer_id.clone() {
+                                            let mut updated_active = false;
+                                            if let Some(srv) = this
+                                                .state
+                                                .servers
+                                                .iter_mut()
+                                                .find(|s| s.id == bal_id)
+                                            {
+                                                let old = decode_balancer_uri(&srv.vless);
+                                                let final_name = if typed_name.is_empty() {
+                                                    srv.name.clone()
+                                                } else {
+                                                    typed_name
+                                                };
+                                                let payload = BalancerPayload {
+                                                    name: final_name.clone(),
+                                                    mode: mode.clone(),
+                                                    url: old
+                                                        .as_ref()
+                                                        .map(|o| o.url.clone())
+                                                        .unwrap_or_else(|| {
+                                                            this.state
+                                                                .vpn_prefs
+                                                                .balancer_url
+                                                                .clone()
+                                                        }),
+                                                    interval,
+                                                    tolerance,
+                                                    pool,
+                                                    pool_tolerance: old
+                                                        .as_ref()
+                                                        .map(|o| o.pool_tolerance)
+                                                        .unwrap_or(tolerance),
+                                                    sticky_hash: old
+                                                        .as_ref()
+                                                        .map(|o| o.sticky_hash.clone())
+                                                        .unwrap_or_else(|| {
+                                                            this.state
+                                                                .vpn_prefs
+                                                                .balancer_sticky_hash
+                                                                .clone()
+                                                        }),
+                                                    quota_mib: old
+                                                        .as_ref()
+                                                        .map(|o| o.quota_mib)
+                                                        .unwrap_or(
+                                                            this.state.vpn_prefs.balancer_quota_mib,
+                                                        ),
+                                                    members: members.clone(),
+                                                };
+                                                srv.name = final_name;
+                                                srv.vless = encode_balancer_uri(&payload);
+                                                srv.balancer_mode = Some(mode);
+                                                srv.member_count = Some(members.len());
+                                                updated_active = this.state.active_id == bal_id;
+                                            }
+                                            if updated_active {
+                                                this.reconnect_if_active();
+                                            } else {
+                                                this.state.save();
+                                            }
+                                            this.show_toast(this.tr(
+                                                "Балансировщик обновлён",
+                                                "Balancer updated",
+                                            ));
+                                        } else {
                                             let final_name = if typed_name.is_empty() {
-                                                srv.name.clone()
+                                                if this.is_en() {
+                                                    format!(
+                                                        "Smart Balancer ({mode}, {} nodes)",
+                                                        members.len()
+                                                    )
+                                                } else {
+                                                    format!(
+                                                        "Балансировщик ({mode}, {} узлов)",
+                                                        members.len()
+                                                    )
+                                                }
                                             } else {
                                                 typed_name
                                             };
                                             let payload = BalancerPayload {
                                                 name: final_name.clone(),
                                                 mode: mode.clone(),
-                                                url: old
-                                                    .as_ref()
-                                                    .map(|o| o.url.clone())
-                                                    .unwrap_or_else(|| {
-                                                        this.state.vpn_prefs.balancer_url.clone()
-                                                    }),
+                                                url: this.state.vpn_prefs.balancer_url.clone(),
                                                 interval,
                                                 tolerance,
                                                 pool,
-                                                pool_tolerance: old
-                                                    .as_ref()
-                                                    .map(|o| o.pool_tolerance)
-                                                    .unwrap_or(tolerance),
-                                                sticky_hash: old
-                                                    .as_ref()
-                                                    .map(|o| o.sticky_hash.clone())
-                                                    .unwrap_or_else(|| {
-                                                        this.state
-                                                            .vpn_prefs
-                                                            .balancer_sticky_hash
-                                                            .clone()
-                                                    }),
-                                                quota_mib: old
-                                                    .as_ref()
-                                                    .map(|o| o.quota_mib)
-                                                    .unwrap_or(
-                                                        this.state.vpn_prefs.balancer_quota_mib,
-                                                    ),
+                                                pool_tolerance: tolerance,
+                                                sticky_hash: this
+                                                    .state
+                                                    .vpn_prefs
+                                                    .balancer_sticky_hash
+                                                    .clone(),
+                                                quota_mib: this.state.vpn_prefs.balancer_quota_mib,
                                                 members: members.clone(),
                                             };
-                                            srv.name = final_name;
-                                            srv.vless = encode_balancer_uri(&payload);
-                                            srv.balancer_mode = Some(mode);
-                                            srv.member_count = Some(members.len());
-                                            updated_active = this.state.active_id == bal_id;
-                                        }
-                                        if updated_active {
+                                            let id = gen_unique_id("bal");
+                                            this.state.servers.insert(
+                                                0,
+                                                ServerNode {
+                                                    id: id.clone(),
+                                                    name: final_name,
+                                                    vless: encode_balancer_uri(&payload),
+                                                    country: "xx".to_string(),
+                                                    sub_id: None,
+                                                    is_balancer: true,
+                                                    balancer_mode: Some(mode),
+                                                    member_count: Some(members.len()),
+                                                    ping_ms: None,
+                                                    ping_at: None,
+                                                    alive: Some(true),
+                                                },
+                                            );
+                                            this.state.active_id = id;
                                             this.reconnect_if_active();
-                                        } else {
-                                            this.state.save();
+                                            this.show_toast(this.tr(
+                                                "Балансировщик создан",
+                                                "Balancer created",
+                                            ));
                                         }
                                         this.modal = ModalKind::None;
-                                        this.show_toast(
-                                            this.tr("Балансировщик обновлён", "Balancer updated"),
-                                        );
                                         cx.notify();
                                     }))
                                     .child(self.tr("Сохранить", "Save")),
@@ -13755,6 +14362,128 @@ impl TachyonApp {
             .into_any_element()
     }
 
+    fn render_rename_node_modal(
+        &self,
+        m: LayoutMetrics,
+        t: Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .id("modal-backdrop-rename-node")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .p(px(12.0))
+            .occlude()
+            .bg(gpui::rgba(0x000000A6))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.modal = ModalKind::None;
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .w(px((m.width - 32.0).clamp(280.0, 420.0)))
+                    .p(px(16.0))
+                    .rounded(px(14.0))
+                    .bg(t.bg_card)
+                    .border_1()
+                    .border_color(t.border_hi)
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.0))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        div()
+                            .text_size(px(14.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(t.text)
+                            .child(self.tr("Переименовать узел", "Rename Node")),
+                    )
+                    .child(div().w_full().h(px(32.0)).child(styled_input(
+                        &self.rename_node_input,
+                        px(32.0),
+                        12.0,
+                        t,
+                    )))
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .id("btn-cancel-rename-node")
+                                    .px(px(10.0))
+                                    .py(px(6.0))
+                                    .rounded(px(6.0))
+                                    .bg(t.bg_elev)
+                                    .border_1()
+                                    .border_color(t.border)
+                                    .cursor_pointer()
+                                    .text_size(px(11.0))
+                                    .text_color(t.text_dim)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.modal = ModalKind::None;
+                                        cx.notify();
+                                    }))
+                                    .child(self.tr("Отмена", "Cancel")),
+                            )
+                            .child(
+                                div()
+                                    .id("btn-save-rename-node")
+                                    .px(px(12.0))
+                                    .py(px(6.0))
+                                    .rounded(px(6.0))
+                                    .bg(t.accent)
+                                    .cursor_pointer()
+                                    .text_size(px(11.0))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(t.on_accent)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let new_name = this
+                                            .rename_node_input
+                                            .read(cx)
+                                            .value()
+                                            .trim()
+                                            .to_string();
+                                        if !new_name.is_empty()
+                                            && let Some(nid) = this.renaming_node_id.clone()
+                                            && let Some(srv) =
+                                                this.state.servers.iter_mut().find(|s| s.id == nid)
+                                        {
+                                            srv.name = new_name.clone();
+                                            if matches!(srv.country.as_str(), "xx" | "auto" | "") {
+                                                let cc = detect_country_code(&new_name);
+                                                if cc != "xx" {
+                                                    srv.country = cc;
+                                                }
+                                            }
+                                            this.state.save();
+                                            this.show_toast(
+                                                this.tr("Узел переименован", "Node renamed"),
+                                            );
+                                        }
+                                        this.modal = ModalKind::None;
+                                        cx.notify();
+                                    }))
+                                    .child(self.tr("Сохранить", "Save")),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_modal_overlay(
         &self,
         m: LayoutMetrics,
@@ -13772,6 +14501,7 @@ impl TachyonApp {
                 Some(self.render_edit_balancer_modal(m, t, modal_max_h, cx))
             }
             ModalKind::NodePicker => Some(self.render_node_picker_modal(m, t, modal_max_h, cx)),
+            ModalKind::RenameNode => Some(self.render_rename_node_modal(m, t, cx)),
             ModalKind::Subscriptions => Some(
                 div()
                     .id("modal-backdrop-subs")
@@ -14472,24 +15202,67 @@ impl Render for TachyonApp {
     }
 }
 
+pub fn decode_text_bytes_smart(raw: &[u8]) -> String {
+    if raw.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return String::from_utf8_lossy(&raw[3..]).into_owned();
+    }
+    if raw.starts_with(&[0xFF, 0xFE]) && raw.len() >= 2 {
+        let units: Vec<u16> = raw[2..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
+            .collect();
+        return String::from_utf16_lossy(&units);
+    }
+    if raw.starts_with(&[0xFE, 0xFF]) && raw.len() >= 2 {
+        let units: Vec<u16> = raw[2..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_be_bytes(*c))
+            .collect();
+        return String::from_utf16_lossy(&units);
+    }
+    String::from_utf8_lossy(raw).into_owned()
+}
+
+fn read_text_file_smart(path: &std::path::Path) -> Result<String, String> {
+    let raw = fs::read(path).map_err(|e| e.to_string())?;
+    Ok(decode_text_bytes_smart(&raw))
+}
+
+pub fn parse_picked_paths_output(raw: &str) -> Vec<PathBuf> {
+    raw.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            if let Some(b64_payload) = trimmed.strip_prefix("B64:") {
+                let bytes = B64.decode(b64_payload.trim()).ok()?;
+                let decoded = String::from_utf8(bytes).ok()?;
+                let p = decoded.trim();
+                return (!p.is_empty()).then(|| PathBuf::from(p));
+            }
+            Some(PathBuf::from(trimmed))
+        })
+        .collect()
+}
+
 fn pick_conf_files_native() -> Vec<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let ps = r#"Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.OpenFileDialog; $d.Filter = 'Tachyon Profiles (*.conf;*.ovpn;*.json;*.txt)|*.conf;*.ovpn;*.json;*.txt|All files (*.*)|*.*'; $d.Multiselect = $true; if ($d.ShowDialog() -eq 'OK') { $d.FileNames -join "`n" }"#;
+        let ps = r#"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.OpenFileDialog; $d.Filter = 'Tachyon Profiles (*.conf;*.ovpn;*.json;*.txt)|*.conf;*.ovpn;*.json;*.txt|All files (*.*)|*.*'; $d.Multiselect = $true; $d.RestoreDirectory = $true; if ($d.ShowDialog() -eq 'OK') { foreach ($f in $d.FileNames) { [Console]::WriteLine('B64:' + [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($f))) } }"#;
         if let Ok(out) = Command::new("powershell")
             .args(["-NoProfile", "-Sta", "-Command", ps])
             .creation_flags(CREATE_NO_WINDOW)
             .output()
         {
             let text = String::from_utf8_lossy(&out.stdout);
-            return text
-                .lines()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(PathBuf::from)
-                .collect();
+            return parse_picked_paths_output(&text);
         }
     }
     #[cfg(target_os = "linux")]
@@ -14499,25 +15272,20 @@ fn pick_conf_files_native() -> Vec<PathBuf> {
             .output()
         {
             let text = String::from_utf8_lossy(&out.stdout);
-            return text
-                .lines()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(PathBuf::from)
-                .collect();
+            return parse_picked_paths_output(&text);
         }
     }
     #[cfg(target_os = "macos")]
     {
-        let script = r#"POSIX path of (choose file with prompt "Выберите файл .conf")"#;
+        let script = r#"set chosen to choose file with prompt "Выберите файл конфигурации (.conf)" with multiple selections allowed
+set outText to ""
+repeat with f in chosen
+    set outText to outText & POSIX path of f & linefeed
+end repeat
+return outText"#;
         if let Ok(out) = Command::new("osascript").args(["-e", script]).output() {
             let text = String::from_utf8_lossy(&out.stdout);
-            return text
-                .lines()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(PathBuf::from)
-                .collect();
+            return parse_picked_paths_output(&text);
         }
     }
     Vec::new()
@@ -14530,8 +15298,9 @@ fn this_log_filter_eq(cur: &str, candidate: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        adaptive_card_width, balancer_mode_short_label, connect_stage_label, format_bytes_human,
-        is_valid_time_window, mask_secret, parse_custom_rule_entries, parse_duration_secs,
+        adaptive_card_width, balancer_mode_short_label, connect_stage_label,
+        decode_text_bytes_smart, format_bytes_human, is_valid_time_window, mask_secret,
+        parse_custom_rule_entries, parse_duration_secs, parse_picked_paths_output,
     };
 
     #[test]
@@ -14653,5 +15422,23 @@ mod tests {
 
         assert!(!connect_stage_label("rulesets", false).is_empty());
         assert!(!connect_stage_label("tun", true).is_empty());
+    }
+
+    #[test]
+    fn test_conf_file_picker_and_bom_decoders() {
+        use super::B64;
+        use base64::Engine as _;
+        let p1 = r"C:\Users\Тест Пользователь\Desktop\Нидерланды wg0.conf";
+        let p2 = "/tmp/my config.conf";
+        let raw = format!("B64:{}\n{p2}\n", B64.encode(p1.as_bytes()));
+        let parsed = parse_picked_paths_output(&raw);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].to_string_lossy(), p1);
+        assert_eq!(parsed[1].to_string_lossy(), p2);
+
+        let utf8_bom = [0xEF, 0xBB, 0xBF, b'[', b'I', b']'];
+        assert_eq!(decode_text_bytes_smart(&utf8_bom), "[I]");
+        let utf16_le = [0xFF, 0xFE, b'[', 0, b'I', 0, b']', 0];
+        assert_eq!(decode_text_bytes_smart(&utf16_le), "[I]");
     }
 }
