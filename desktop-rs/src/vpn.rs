@@ -2319,6 +2319,129 @@ impl VpnManager {
         Ok((ep_list, ob_list, hosts))
     }
 
+    fn parse_tdns_dns_server(raw: &str, dns_detour: &str) -> Option<Value> {
+        let clean = raw.trim().split('#').next()?.trim();
+        let lower = clean.to_ascii_lowercase();
+        if !lower.starts_with("tdns://") {
+            return None;
+        }
+        let rest = &clean["tdns://".len()..];
+        let (userinfo, after_at) = rest.split_once('@')?;
+        let (key_id, psk) = userinfo.split_once(':')?;
+        let key_id = key_id.trim();
+        let psk = psk.trim();
+        if key_id.len() != 16 || !key_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        if psk.len() != 43
+            || !psk
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return None;
+        }
+
+        let (base_part, query_part) = after_at
+            .split_once('?')
+            .map_or((after_at, ""), |(a, b)| (a, b));
+        let (authority, path_raw) = base_part
+            .split_once('/')
+            .map_or((base_part, ""), |(a, p)| (a, p));
+        let (host, port) = if let Some(v6_tail) = authority.strip_prefix('[') {
+            let (h, tail) = v6_tail.split_once(']')?;
+            let p = tail
+                .strip_prefix(':')
+                .and_then(|s| s.parse::<u16>().ok())
+                .filter(|&p| p > 0)
+                .unwrap_or(443);
+            (h.trim(), p)
+        } else if authority.matches(':').count() == 1 {
+            let (h, p_str) = authority.split_once(':')?;
+            let p = p_str.parse::<u16>().ok().filter(|&p| p > 0)?;
+            (h.trim(), p)
+        } else {
+            (authority.trim(), 443)
+        };
+        if host.is_empty() {
+            return None;
+        }
+        let path = if path_raw.trim().is_empty() {
+            "/api/v2/telemetry/collect".to_string()
+        } else {
+            format!("/{}", path_raw.trim().trim_start_matches('/'))
+        };
+
+        let mut mode = "h2".to_string();
+        let mut codec = "json".to_string();
+        let mut sni = host.to_string();
+        let mut fp = "chrome".to_string();
+        let mut padding: u64 = 512;
+        let mut batch_ms: u64 = 6;
+        for pair in query_part.split('&') {
+            let Some((k, v)) = pair.split_once('=') else {
+                continue;
+            };
+            let val = v.trim();
+            if val.is_empty() {
+                continue;
+            }
+            match k.trim().to_ascii_lowercase().as_str() {
+                "mode" => mode = val.to_ascii_lowercase(),
+                "codec" => {
+                    codec = if matches!(val.to_ascii_lowercase().as_str(), "bin" | "binary" | "raw")
+                    {
+                        "bin".to_string()
+                    } else {
+                        "json".to_string()
+                    };
+                }
+                "sni" => sni = val.to_string(),
+                "fp" | "fingerprint" => fp = val.to_string(),
+                "pad" | "padding" => {
+                    if let Ok(n) = val.parse::<u64>() {
+                        padding = n.min(4096);
+                    }
+                }
+                "batch" | "batch_ms" => {
+                    if let Ok(n) = val.parse::<u64>() {
+                        batch_ms = n.min(50);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if mode != "h2" {
+            return None;
+        }
+
+        let mut obj = json!({
+            "type": "tdns",
+            "tag": "dns_remote",
+            "server": host,
+            "server_port": port,
+            "path": path,
+            "mode": "h2",
+            "codec": codec,
+            "key_id": key_id,
+            "psk": psk,
+            "padding": padding,
+            "batch_ms": batch_ms,
+            "detour": dns_detour,
+            "tls": {
+                "enabled": true,
+                "server_name": sni,
+                "utls": {
+                    "enabled": true,
+                    "fingerprint": fp
+                }
+            }
+        });
+        if host.parse::<IpAddr>().is_err() {
+            obj["domain_resolver"] = json!("dns_direct");
+        }
+        Some(obj)
+    }
+
     fn build_remote_dns_server(dns_raw: &str, transport: &str, dns_detour: &str) -> Value {
         let make = |ty: &str, server: &str, port: Option<u16>, path: Option<&str>, detour: &str| {
             let t = ty.trim().to_ascii_lowercase();
@@ -2349,6 +2472,11 @@ impl VpnManager {
         };
 
         let trimmed = dns_raw.trim();
+        if trimmed.to_ascii_lowercase().starts_with("tdns://")
+            && let Some(tdns) = Self::parse_tdns_dns_server(trimmed, dns_detour)
+        {
+            return tdns;
+        }
         if let Some((scheme, rest)) = trimmed.split_once("://") {
             let low_scheme = scheme.trim().to_ascii_lowercase();
             if matches!(low_scheme.as_str(), "https" | "h3" | "quic" | "tls" | "udp") {
@@ -2507,6 +2635,7 @@ impl VpnManager {
             "direct"
         };
         let remote_dns = Self::build_remote_dns_server(&opts.dns, &opts.dns_transport, dns_detour);
+        let remote_is_tdns = remote_dns.get("type").and_then(Value::as_str) == Some("tdns");
         dns_servers.push(remote_dns);
 
         let fake_ip_enabled = opts.fake_ip && !opts.proxy_mode && !suppress_fake_ip;
@@ -2550,11 +2679,12 @@ impl VpnManager {
             }));
         }
 
-        let final_dns_tag = if opts.dns_route_mode == "direct" || main_parsed.is_none() {
-            "dns_direct"
-        } else {
-            "dns_remote"
-        };
+        let final_dns_tag =
+            if opts.dns_route_mode == "direct" || (main_parsed.is_none() && !remote_is_tdns) {
+                "dns_direct"
+            } else {
+                "dns_remote"
+            };
 
         let dns_obj = json!({
             "servers": dns_servers,
@@ -10861,6 +10991,39 @@ mod tests {
         assert_eq!(ag["type"], "quic");
         assert_eq!(ag["server"], "94.140.14.14");
         assert_eq!(ag["server_port"], 853);
+    }
+
+    #[test]
+    fn remote_dns_parses_tdns_uri() {
+        let psk = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let kid = "0123456789abcdef";
+        let uri = format!(
+            "tdns://{kid}:{psk}@dns.example.com:8443/api/v2/telemetry/collect?mode=h2&codec=json&sni=cdn.example.com&fp=chrome&pad=512&batch=6#TDNS"
+        );
+        let tdns = VpnManager::build_remote_dns_server(&uri, "https", "GLOBAL");
+        assert_eq!(tdns["type"], "tdns");
+        assert_eq!(tdns["server"], "dns.example.com");
+        assert_eq!(tdns["server_port"], 8443);
+        assert_eq!(tdns["path"], "/api/v2/telemetry/collect");
+        assert_eq!(tdns["mode"], "h2");
+        assert_eq!(tdns["codec"], "json");
+        assert_eq!(tdns["key_id"], kid);
+        assert_eq!(tdns["psk"], psk);
+        assert_eq!(tdns["padding"], 512);
+        assert_eq!(tdns["batch_ms"], 6);
+        assert_eq!(tdns["domain_resolver"], "dns_direct");
+        assert_eq!(tdns["tls"]["server_name"], "cdn.example.com");
+        assert_eq!(tdns["tls"]["utls"]["fingerprint"], "chrome");
+
+        let mgr = VpnManager::new(Arc::new(|_| {}));
+        let mut st = crate::state::PersistedState::default();
+        st.vpn_prefs.dns = "custom".to_string();
+        st.vpn_prefs.custom_dns = uri;
+        st.vpn_prefs.route = "desync".to_string();
+        let opts = ConnectOptions::parse(&st.build_connect_payload(None)).unwrap();
+        let (cfg, _) = mgr.build_config(&opts).expect("build_config tdns");
+        core_config::check_str(&cfg.to_string()).expect("check_str tdns");
+        assert_eq!(cfg["dns"]["final"], "dns_remote");
     }
 
     #[test]

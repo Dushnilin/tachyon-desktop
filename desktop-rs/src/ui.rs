@@ -3705,12 +3705,26 @@ impl TachyonApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let core_ver = option_env!("TACHYON_CORE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
-        let dns_label = if self.state.vpn_prefs.dns == "custom"
+        let dns_raw = if self.state.vpn_prefs.dns == "custom"
             && !self.state.vpn_prefs.custom_dns.is_empty()
         {
             self.state.vpn_prefs.custom_dns.as_str()
         } else {
             self.state.vpn_prefs.dns.as_str()
+        };
+        let dns_label_owned;
+        let dns_label = if dns_raw.trim().to_ascii_lowercase().starts_with("tdns://") {
+            let clean = dns_raw.trim().split('#').next().unwrap_or("");
+            let after_at = clean.split_once('@').map(|(_, r)| r).unwrap_or("");
+            let host_part = after_at.split(['/', '?']).next().unwrap_or("");
+            dns_label_owned = if host_part.is_empty() {
+                "tdns://***".to_string()
+            } else {
+                format!("tdns://{host_part}")
+            };
+            dns_label_owned.as_str()
+        } else {
+            dns_raw
         };
 
         div()
